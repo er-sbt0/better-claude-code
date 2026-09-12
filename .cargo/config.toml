@@ -1,0 +1,4 @@
+# ts-rs writes generated TypeScript here (workspace-relative). §22: Rust is the
+# single source of truth for wire types; the TS is generated, never hand-edited.
+[env]
+TS_RS_EXPORT_DIR = { value = "packages/shared-types", relative = true }

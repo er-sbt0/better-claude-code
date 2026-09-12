@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Replays every recorded stream in fixtures/ through the normalizer.
+      # Design §16: this is the only defense against a provider changing its
+      # format, and it is also the real definition of the adapter contract.
+      - name: Test
+        run: cargo test --all
+
+      # packages/shared-types is generated from the Rust types and committed.
+      # `cargo test` regenerates it, so a diff here means someone changed a wire
+      # type without committing the regenerated TypeScript (§22).
+      - name: Generated TypeScript is current
+        run: |
+          git diff --exit-code -- packages/shared-types \
+            || { echo "::error::packages/shared-types is stale — run 'cargo test' and commit the result"; exit 1; }
