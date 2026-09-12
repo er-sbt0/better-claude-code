@@ -3,6 +3,11 @@
 > **Status:** design draft. Vendor CLI flags, SDK surfaces, and protocol names in
 > this document were accurate as of early 2026 and change without semver
 > guarantees. Verify every one against the current tool before building on it.
+>
+> **Claude Code's surface was verified on 2026-09-12 against 2.1.269** — flags in
+> `docs/verification/claude-code-cli-2.1.269.md`, real event streams in
+> `fixtures/claude-code/2.1.269/`. Everything said here about Claude Code is
+> evidence now. Everything said about Codex, Gemini and ACP is still assertion.
 
 ## 1. Product thesis
 
@@ -297,31 +302,74 @@ change them without semver. Record what you verified as fixtures (§16).
 
 **Claude Code**
 
+Verified against 2.1.269 and recorded; see the status header for where.
+
 ```bash
 claude -p "<prompt>" \
-  --output-format stream-json --verbose \
-  --input-format stream-json \        # keeps stdin open for follow-up turns
-  --mcp-config <generated.json> \     # our workspace server (§6)
+  --output-format stream-json --verbose \   # --verbose is hard-required with stream-json
+  --input-format stream-json \              # keeps stdin open for follow-up turns
+  --replay-user-messages \                  # stdout acks our stdin writes
+  --include-partial-messages \              # token-level streaming; see the caveat below
+  --session-id <uuid we generate> \         # we assign it; see §14
+  --mcp-config <generated.json> \           # our workspace server (§6)
   --permission-prompt-tool mcp__workspace__request_permission \
   --append-system-prompt "<the workspace MCP tools exist; when to use them>" \
-  --resume <providerSessionId>        # on resume, see §14
+  --system-prompt-snapshot off \            # or the appended prompt is frozen; see below
+  --thinking-display summarized \           # or thinking blocks arrive empty
+  --max-budget-usd <n> --max-turns <n> \    # bound an unattended run
+  --resume <sessionId>                      # on continuation, see §14
 ```
 
 `--input-format stream-json` is the piece that turns a one-shot `-p` into a live
-session. `--permission-prompt-tool` is a real callback: the agent calls a tool on
-*our* MCP server, our runtime renders the §12 dialog, we return the decision.
-Same server as §6 — one more tool on it.
+session, and the `multi-turn` fixture proves it: two user turns, one process.
+It requires `--print` and `--output-format stream-json` together.
+`--permission-prompt-tool` is a real callback: the agent calls a tool on *our*
+MCP server, our runtime renders the §12 dialog, we return the decision. Same
+server as §6 — one more tool on it. It is no longer listed in `--help`, so treat
+it as semi-public and pin the version.
 
-Event mapping into §8's raw vocabulary:
+Three flags above exist to defuse silent failures, each found by recording:
+
+- **`--system-prompt-snapshot off`.** The default (`on`) records the system
+  prompt on a conversation's first request and replays it verbatim forever. A
+  resume that passes different `--append-system-prompt` text is silently
+  ignored. §6's whole premise is an appended prompt telling the agent our tools
+  exist; if that text ever changes, the change does not land.
+- **`--thinking-display summarized`.** Without it thinking blocks still arrive,
+  with `thinking: ""` and a signature. Raw chain-of-thought never reaches the
+  wire under any setting; `summarized` and `omitted` are the only values.
+- **`--permission-prompts none`** is the zero-MCP alternative to
+  `--permission-prompt-tool`: anything that would prompt is denied outright.
+  Useful for derived runs (§9.1), which must not prompt at all.
+
+Event mapping into §8's raw vocabulary. Rows marked ⚠ are where the obvious
+mapping is wrong — each was caught by a fixture, not by reading:
 
 | stream-json | raw event |
 |---|---|
-| `system` / `subtype: init` | `run.started`; persist `session_id` as `providerSessionId` |
+| `system` / `subtype: init` | ⚠ **not** `run.started` — re-emitted at the start of *every* turn on a streamed stdin, same `session_id`, new `uuid`. Start the run on the first one only |
 | `assistant`, text block | `assistant.message` |
-| `assistant`, thinking block | `assistant.thinking` |
+| `assistant`, thinking block | `assistant.thinking` — empty without `--thinking-display` |
 | `assistant`, `tool_use` block | `tool.started` — typed args, §6 source 1 |
 | `user`, `tool_result` | `tool.completed` |
-| `result` | `run.finished` / `run.failed`; usage → `run.metrics` |
+| `result` | ⚠ per **turn**, not per run: `result_index` 0,1,… each with `num_turns: 1`. `run.finished` only when the process exits |
+| `result`, `subtype != "success"` | `run.failed` — ⚠ key on `subtype`; a wholly permission-blocked run still reports `is_error: false` |
+| `result.modelUsage` | `run.metrics` — ⚠ not `result.usage`; see §14 |
+| `system` / `permission_denied` | `permission.resolved` (denied) — carries `tool_use_id`, `decision_reason_type` |
+| `system` / `hook_started`, `hook_response` | ignore, or `process.output` |
+| `system` / `status`, `thinking_tokens` | progress only; never persist as raw events |
+| `rate_limit_event` | run state, not conversation content; position in the stream is not stable |
+| `stream_event` | raw Anthropic SSE passthrough under `--include-partial-messages` |
+
+Two normalizer hazards the table cannot express:
+
+- **One API message fans out into N `assistant` lines**, one per content block,
+  sharing `message.id` and each repeating an *identical* `message.usage`.
+  Summing usage across lines double-counts. Dedupe on `message.id`.
+- **`--include-partial-messages` delivers the same text twice.** The aggregated
+  `assistant` message is still emitted, interleaved *between* the final
+  `content_block_delta` and `content_block_stop`. The aggregate arrives before
+  the block it aggregates closes. A naive appender renders everything twice.
 
 **Codex**
 
@@ -341,21 +389,32 @@ begin/end, patch application, token usage on turn completion. Treat the event
 Streaming is the easy half and both vendors have nearly solved it. Control is
 where they separate, and it is what should shape the V2 interface:
 
+The Claude Code column is verified; the Codex column is not.
+
 | Axis | Claude Code | Codex |
 |---|---|---|
-| Permissions | interactive callback via `--permission-prompt-tool` | launch-time policy + sandbox; no mid-run ask |
-| MCP injection | `--mcp-config`, per launch, no global state touched | `~/.codex/config.toml` or `-c`; must be generated, never mutating the user's file (§14) |
-| Sandbox | none of its own; permission-based | ships its own sandbox modes |
+| Permissions | interactive callback via `--permission-prompt-tool`, or `--permission-prompts none`; six `--permission-mode` values | launch-time policy + sandbox; no mid-run ask |
+| MCP injection | `--mcp-config`, per launch, file *or* inline JSON, variadic; `--strict-mcp-config` to exclude the user's own | `~/.codex/config.toml` or `-c`; must be generated, never mutating the user's file (§14) |
+| Sandbox | **ships its own** — filesystem confinement and network egress control, configured via `--settings`, not argv | ships its own sandbox modes |
+| Session id | we can *assign* it with `--session-id` | captured from the stream |
+| Supervision | ships its own: `--bg`, `claude agents --json`, `attach`/`logs`/`stop` | — |
 
 Consequences:
 
 - §12 option A is not one feature. For Claude Code it is an interactive dialog;
   for Codex it is "choose the posture at launch, show what it did afterwards."
   The UI must label which one the user is getting.
-- Codex shipping its own sandbox is worth studying before committing to §12
-  option B — it may partly moot that build, or serve as a reference for it.
+- **Both agents now ship a sandbox**, which is the single biggest change to this
+  document since it was written. §12 option B was sized as the thing that makes
+  the policy panel truthful where vendors offer nothing. That premise is gone on
+  both of the agents we intend to support first. Re-read §12 with that in mind.
 - Per-run MCP injection is clean on one and awkward on the other, and MCP
   injection is the spine of §6. Budget for it.
+- Claude Code has grown a background-session supervisor and a `--worktree` flag
+  of its own. §13 and §17 assume we build both. Decide deliberately whether to
+  use the vendor's or own the mechanism — owning it is defensible on
+  agent-neutrality grounds (Codex has neither), but it should be a decision, not
+  an oversight.
 
 ### Decision: CLI subprocess, not an SDK sidecar
 
@@ -469,14 +528,25 @@ There are exactly three sources, in ascending order of value:
 
 From a structured stream you get, for free and without heuristics:
 
-- turn boundaries, message text, thinking (where exposed)
-- tool calls with **typed arguments** — `Edit{file_path, old_string, new_string}` gives you changed files exactly
-- tool results, exit codes, durations
+- turn boundaries, message text, thinking (where exposed, and see §5 — Claude
+  Code sends empty thinking blocks unless asked otherwise)
+- tool calls with **typed arguments** — verified: Claude Code's `Edit` gives
+  `{replace_all, file_path, old_string, new_string}` with an *absolute*
+  `file_path`, so changed files are exact and need no inference
+- tool results and durations
 - token usage and cost
 - session/run lifecycle and errors
 
 This alone powers the review surface and the parallel-run triage view — i.e.
 both of the wedge features in §1. **Ship this first; it carries the product.**
+
+One thing this list used to claim and should not: **exit codes are not on the
+wire.** Claude Code returns `tool_use_result` as an object
+`{stdout, stderr, interrupted, isImage, noOutputExpected}` on success and as a
+bare *string* `"Error: Exit code 1"` on failure — the type itself varies, and
+the code only exists inside prose. Treat `is_error` as the signal and the exit
+code as source 2 work (below), not as free metadata. The `tool-bash-fail`
+fixture is the evidence.
 
 ### Source 2 — Tool-call introspection (brittle, per-ecosystem, optional)
 
@@ -758,6 +828,27 @@ run.metrics         ← derived from usage in the raw stream
 
 > **Rule: if you cannot recompute it from the raw log, it is a raw event. If you
 > can, it is a projection and must not be the source of truth.**
+
+### A third kind: transient progress
+
+The recorded streams (§16) force a category the original two do not cover. One
+52-line fixture contains 45 `system/thinking_tokens` messages, each an updated
+running estimate. `system/status` and the `stream_event` SSE passthrough are the
+same: they describe the *present moment* of a turn and carry nothing once it
+ends.
+
+These are observed facts, so §7's invariant argues for keeping them, and the
+storage cost argues loudly against — a long run would bury its own log in
+progress ticks.
+
+> **Rule: transient progress drives the UI and is never written to the log.**
+> It is not dropped information, because it is not information — it is the same
+> fact restated. The terminal value of every counter survives in `result`.
+
+The test is whether replaying the log without the message loses anything. For
+`thinking_tokens` and `status`, nothing. For a partial `content_block_delta`
+whose aggregate `assistant` message is also emitted (§5), nothing. For anything
+where the answer is unclear, persist it — the invariant wins ties.
 
 ### Envelope
 
@@ -1044,14 +1135,31 @@ Linux; `sandbox-exec` on macOS. This is substantial work, but it is
 **agent-neutral by construction** — it works for agents that expose no
 permission API at all, including tier 3 — and it makes the policy panel truthful.
 
-Ubuntu-first makes B unusually tractable, and it is the one capability in this
-document that a competitor cannot trivially copy. Treat it as a deliberate V2/V3
-bet, not an accident.
+Ubuntu-first makes B unusually tractable. It was written down as the one
+capability a competitor cannot trivially copy.
 
-Study Codex's sandbox before building ours (§5). A shipping implementation of
-roughly this idea, in an agent we intend to support anyway, is either a partial
-substitute or the best available reference — and either answer changes the size
-of the bet.
+**That claim has weakened and the section should not be read without this.**
+Verification (§5) found Claude Code 2.1.269 shipping its own Bash sandbox —
+filesystem read/write confinement, network egress control, per-path and
+per-env-var deny/mask modes — reachable from a subprocess driver through
+`--settings`, with no work from us. Codex already shipped one. Both of the
+agents we intend to support first now enforce policy themselves.
+
+What survives of option B, honestly:
+
+- a *uniform* policy across agents that each express policy differently, and a
+  single panel that means the same thing in both columns
+- coverage for tier 3 and for agents that ship nothing
+- enforcement the user's own agent config cannot silently relax
+
+What does not survive is "nobody else offers this." Option B is now an
+integration-and-uniformity argument, not a moat argument. That is a much smaller
+prize for the same large build, and it should be re-priced before anyone commits
+to it. The cheap move — surface and drive the vendor sandboxes through
+`--settings` and Codex's `--sandbox`, and label which engine is enforcing — gets
+most of the user-visible value for a fraction of the work, at the cost of
+claiming only what each vendor actually enforces. Which §12's own rule requires
+anyway.
 
 **V1 ships Option A and shows only what it can enforce.**
 
@@ -1143,6 +1251,19 @@ Consequences to accept:
 - on resume we reconcile by `seq`/idempotency key and backfill any events we missed
 - we never mutate provider state files
 
+Two refinements from the recorded streams:
+
+- **We can assign the id rather than capture it.** Claude Code's `--session-id`
+  takes a UUID we generate, so a run row has its `providerSessionId` before the
+  process starts. That closes the window where a run exists, has crashed, and
+  cannot be resumed because the init event never arrived. Prefer assigning; fall
+  back to capturing for agents that only report.
+- **A resumed stream does not announce itself.** The `resume-2` fixture's `init`
+  is structurally identical to a fresh run's — correct `session_id`, no
+  resumption marker, no replayed history, `num_turns` back to 1. The provider
+  will not tell us; the run row must remember. Anything keyed on "is this the
+  first init" has to come from our state, not the stream.
+
 ### Core entities
 
 ```text
@@ -1184,6 +1305,22 @@ Run {
 
 Cost and token accounting come free from the provider's usage data, and they
 are the columns users check first. A run entity without them is incomplete.
+
+**Read them from the right field.** Claude Code's `result` message carries usage
+in three places that do not agree:
+
+| Field | What it is |
+|---|---|
+| `total_cost_usd` | authoritative cost **for that turn** — sum across turns for the run |
+| `usage` | snake_case, detailed, **main model only** |
+| `modelUsage` | camelCase, keyed by full model id, **every model the turn used** |
+
+Every recorded run spends on a side model that appears only in `modelUsage`, and
+`sum(modelUsage[*].costUSD)` reconciles exactly to `total_cost_usd` while
+`usage` does not. Fed from `usage`, the token columns above under-report
+systematically and silently — the kind of error nobody notices until a user adds
+the numbers up. Sum `modelUsage`, and store cost per turn rather than per run so
+`result_index` (§5) does not overwrite it.
 
 Store raw events separately from derived projections, and treat the raw log as
 the only durable truth.
@@ -1240,6 +1377,31 @@ a deprecation window. Unmanaged, every upstream release is an outage for us.
 runs costs an afternoon, is the only defense against drift, and having both
 streams side by side is what lets the V2 abstraction (§5) fall out of evidence
 rather than out of a guess.
+
+**Half of that is now done.** `fixtures/claude-code/2.1.269/` holds 13 recorded
+scenarios with a `record.sh` that regenerates the set against whatever `claude`
+is on `PATH`, and a `MANIFEST.md` describing each. It cost an afternoon exactly
+as predicted, and it corrected six rows of §5's event-mapping table, one claim
+in §6, and the token columns in §14 — all before a line of normalizer existed.
+This is the argument for the rule, not an anecdote about it.
+
+Two things the recording exposed about the method itself:
+
+- **Fixtures capture the recording machine.** Hook events, plugin lists and
+  skill inventories from the recorder's own config are in every file.
+  `--strict-mcp-config` does not suppress them; `--setting-sources` or `--bare`
+  would. Left in deliberately — a real driver sees this noise too — but a
+  fixture is a recording of an environment, not just of a version.
+- **Negative results are fixtures too.** `Bash("echo hello")` is auto-allowed by
+  Claude Code's own safe-command classification even under
+  `--permission-prompts none`, so the first attempt at a denial fixture recorded
+  no denial. Write to a file if you want a permission decision.
+
+Still owed: Codex, and the two event classes that need a workspace MCP server
+that does not exist yet — `permission.requested` via `--permission-prompt-tool`,
+and `workspace.report` (§6 source 3). Subagent traffic is a third gap worth
+closing early: `parent_tool_use_id` is present but null in every current
+fixture, which is exactly the shape that hides a normalizer bug.
 
 ---
 
@@ -1305,8 +1467,10 @@ version that does.
 
 ### V1 features
 
-**Agent** — Claude Code only, via `stream-json`. Detect, launch, prompt,
-interrupt, resume via provider session id. **No adapter abstraction yet** (§5).
+**Agent** — Claude Code only, via `stream-json`, using the verified launch shape
+in §5. Detect, launch, prompt, interrupt, resume via a session id we assign.
+**No adapter abstraction yet** (§5). Pin the tested version and replay the
+fixtures in CI from the first commit (§16) — they exist already, so this is free.
 
 **Worktrees** — run-per-worktree from day one (§13). Create, list, clean up.
 
@@ -1463,13 +1627,16 @@ agent-workspace/
 │   └── shared-types/              ← GENERATED from crates/ (ts-rs / typeshare)
 │
 ├── fixtures/                      ← recorded event streams per agent version (§16)
+│   └── claude-code/2.1.269/       ← exists: 13 scenarios + record.sh + MANIFEST
 │
 └── docs/
     ├── architecture.md
     ├── agent-adapters.md
     ├── document-model.md
     ├── event-log.md
-    └── security.md
+    ├── security.md
+    └── verification/              ← exists: what was checked, against which version
+        └── claude-code-cli-2.1.269.md
 ```
 
 **One source of truth for types.** Hand-written TypeScript types alongside Rust
@@ -1501,6 +1668,10 @@ Schema. Do not maintain two copies.
 17. **Derived work runs on the user's agent, with no tools.** We add no
     inference of our own, and a summarizer holding tools is a confused
     deputy (§9.1, §15).
+18. **Record before you model.** Every claim about a vendor's wire format is an
+    assertion until a fixture proves it. The first recording session corrected
+    six rows of §5, a claim in §6, and the metrics in §14 — none of which looked
+    wrong on paper (§16).
 
 ---
 
