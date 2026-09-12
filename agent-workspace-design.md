@@ -881,6 +881,22 @@ payloads. Pick it once and enforce it in the schema — mixed `file.changed` /
 `file_changed` conventions are the kind of drift that survives into the log
 forever.
 
+**Correction, from building the log: `seq` gives ordering, not gap detection.**
+The two do not survive together. A resumed stream replays events we already
+hold; each one consumes a `seq` from the writer and then deduplicates away on
+its idempotency key, so the stored sequence has holes wherever a resume
+happened. Holes are the normal result of resuming, not evidence of loss, and
+anything that alerts on them will cry wolf every time. Ordering is what `seq` is
+actually for.
+
+Related, and load-bearing: **the writer assigns `seq`, not the store.** An event
+has to be addressable (§7) the moment the normalizer produces it, before it is
+durable, or the UI cannot render a run as it streams. The consequence is that a
+resumed run must seed its normalizer from the log's last `seq` — a fresh
+normalizer restarts at 1 and silently interleaves with history. The log rejects
+a non-advancing `seq` rather than storing it, so that mistake is a loud failure
+instead of a corrupted order.
+
 ### Example
 
 ```ts
