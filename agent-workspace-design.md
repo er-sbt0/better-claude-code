@@ -824,10 +824,20 @@ test.result         ← derived from a configured test command, or reported
 finding             ← reported via workspace MCP, or absent
 git.state           ← derived from the worktree
 run.metrics         ← derived from usage in the raw stream
+hunk.attribution    ← blame against the run's shadow history (§13.1)
 ```
 
 > **Rule: if you cannot recompute it from the raw log, it is a raw event. If you
 > can, it is a projection and must not be the source of truth.**
+
+**The log is not the only durable artifact.** `hunk.attribution` is recomputable
+— but only against the run's shadow history (§13.1), which is itself *not*
+recomputable from the log. File content after a `Bash` mutation cannot be
+reconstructed from tool arguments; that is the whole reason the shadow history
+exists. So a run has two durable records, the event log and its shadow ref, and
+neither derives from the other. Deleting the ref does not corrupt the log, it
+just makes Review's attribution unavailable for that run forever — which must be
+shown rather than hidden, exactly as §14 requires for a deleted provider session.
 
 ### A third kind: transient progress
 
@@ -1060,7 +1070,8 @@ Tests        124 passed
 
 The surface that justifies the product. A run's diff, hunk by hunk, with the
 agent's reasoning and tool calls attached to the hunk that they produced —
-something no terminal and no `git diff` can offer. Accept, reject, comment,
+something no terminal and no `git diff` can offer. The attachment is real, not
+heuristic: it is blame against the run's shadow history (§13.1). Accept, reject, comment,
 request changes, hand back to the agent.
 
 #### Agent
@@ -1224,6 +1235,51 @@ Rules:
 This also makes run forking, run comparison, and background runs (§17) nearly
 free later, because isolation already exists.
 
+### 13.1 Shadow history: how Review attributes a hunk
+
+§1, §7 and §10 all promise that Review shows each hunk beside the reasoning and
+tool calls that produced it. That promise needs a mechanism, and the obvious one
+does not work: matching hunks to `Edit` calls by comparing `old_string` /
+`new_string` fails on a file edited three times, a `Write` later edited, a
+formatter, and any `Bash` mutation — which is to say, it fails precisely where
+Review earns its keep. A tool call records an *intention*; Review needs the
+*outcome*.
+
+> **Decision: attribution is blame against a per-run shadow history.**
+>
+> After every mutating tool call, the runtime snapshots the run's worktree into
+> a commit on a private ref, `refs/agent-workspace/runs/<run_id>`, using a
+> separate `GIT_INDEX_FILE` and `git commit-tree` so that HEAD, the user's index
+> and the working tree are never touched. Each commit carries `run`, `seq`,
+> `tool` and `tool-use-id` trailers. A hunk is then attributed by blaming the
+> shadow tip: line → shadow commit → `seq` → the events at that `seq` → blocks.
+
+It records outcomes rather than intentions, so it catches formatter runs and
+`Bash` mutations for free, and it gives §20.5's run replay — the worktree at any
+`seq` — as a checkout rather than as a feature.
+
+Verified against git 2.48.1 before being adopted, per §16:
+`docs/verification/git-shadow-attribution.md`, with an executable spike beside
+it. Incremental snapshots cost 25–40 ms and are near-flat in repo size; only the
+first snapshot of a run scales with the worktree. What the verification changed:
+
+- **Root the ref at a `seq 0` snapshot taken after the post-create hook and
+  before the first tool call.** Rooted at the base commit instead, every file the
+  hook wrote is attributed to the first `Edit`.
+- **Never commit an unchanged tree.** Most tool calls mutate nothing; empty
+  commits make blame attribute to the wrong `seq`.
+- **Deleted lines need the pickaxe, not blame** — blame only sees survivors.
+  Review must run a second query for removed hunks or silently show nothing for
+  them.
+- **Snapshots serialize per worktree.** The shadow index is not
+  concurrency-safe, and parallel subagent tool calls degrade attribution to "one
+  of these calls" — untested, since no recorded fixture has subagent traffic.
+
+> **Consequence for the process driver: "snapshot after every mutating tool
+> call" is a requirement of the driver, not a later addition.** The driver is the
+> only component that knows a tool completed and can act before the next one
+> starts. This is why the decision had to be made before the driver was written.
+
 ---
 
 ## 14. Local-first persistence and state ownership
@@ -1285,6 +1341,7 @@ Run {
   agentId
   providerSessionId?
   branch
+  shadowRef            // refs/agent-workspace/runs/<id> — §13.1
   prompt
   status
   startedAt
@@ -1620,7 +1677,9 @@ agent-workspace/
 │           └── tauri.conf.json
 │
 ├── crates/
-│   ├── agent-protocol/            ← Rust is the source of truth for types
+│   ├── agent-protocol/            ← exists: Rust is the source of truth for types
+│   ├── normalizer/                ← exists: provider streams in, raw events out
+│   ├── event-log/                 ← exists: SQLite; the append-only log (§8)
 │   └── document-model/
 │
 ├── packages/
@@ -1636,7 +1695,9 @@ agent-workspace/
     ├── event-log.md
     ├── security.md
     └── verification/              ← exists: what was checked, against which version
-        └── claude-code-cli-2.1.269.md
+        ├── claude-code-cli-2.1.269.md
+        ├── git-shadow-attribution.md     ← §13.1, with an executable spike beside it
+        └── shadow-attribution-spike.sh
 ```
 
 **One source of truth for types.** Hand-written TypeScript types alongside Rust
