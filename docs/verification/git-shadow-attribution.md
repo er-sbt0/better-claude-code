@@ -55,7 +55,9 @@ history: hunk line → shadow commit → `seq` trailer → the events at that `s
 ## What the spike proves
 
 `bash docs/verification/shadow-attribution-spike.sh` — 15 assertions, all
-passing at git 2.48.1:
+passing at git 2.48.1. `crates/worktree` implements the mechanism and carries
+the same assertions into CI, so a git upgrade that changes this breaks a test
+rather than Review:
 
 **The user's own state is untouched.** HEAD unmoved, staged content
 byte-identical, `.git/index` never written (mtime unchanged), `.gitignore`d
@@ -94,8 +96,8 @@ Five things, each of which would have been a defect found later:
    §13 — asserted in the spike so a future change to worktree setup breaks a
    test rather than the attribution.
 3. **A snapshot whose tree is unchanged must not commit.** Read-only and failed
-   tool calls are most calls. Empty commits in the history make blame attribute
-   to the wrong `seq`.
+   tool calls are most calls. `ShadowHistory::snapshot` returns `None` for them;
+   empty commits in the history make blame attribute to the wrong `seq`.
 4. **All trailers must be in one `-m` paragraph.** git parses only the last
    paragraph of a message as trailers, so `-m "seq: 4" -m "tool: Edit"` yields
    *silently empty* `%(trailers:key=seq)` — the first version of the spike read

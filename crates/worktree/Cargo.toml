@@ -1,0 +1,12 @@
+[package]
+name = "worktree"
+description = "Worktree-per-run and its shadow history (design §13, §13.1)."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+agent-protocol = { workspace = true }
+thiserror = { workspace = true }

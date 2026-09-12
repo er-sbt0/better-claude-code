@@ -1696,6 +1696,7 @@ agent-workspace/
 │   ├── agent-protocol/            ← exists: Rust is the source of truth for types
 │   ├── normalizer/                ← exists: provider streams in, raw events out
 │   ├── event-log/                 ← exists: SQLite; the append-only log (§8)
+│   ├── worktree/                  ← exists: worktree-per-run and its shadow history
 │   └── document-model/
 │
 ├── packages/
