@@ -198,6 +198,8 @@ The app should not become tightly coupled to any single agent vendor.
 | Run feed | **Plain React + virtualized list** | *not* Lexical — see §9 |
 | Code / diff viewer | **CodeMirror 6** | Monaco only if we become an IDE |
 | Rich editable documents | **Lexical** | composer, plans, notes only |
+| Diagrams | **Mermaid / Graphviz**, rendered read-only | agent-reported, see §6.1 |
+| Canvas editor | *(post-V1)* tldraw or excalidraw | only if the canvas is bidirectional |
 | Terminal | **xterm.js + native PTY** | fallback agents and user shells |
 | State | **Zustand** or equivalent lightweight state store | |
 | Persistence | **SQLite** | |
@@ -228,6 +230,8 @@ Mitigations, adopted deliberately:
 - virtualize the run feed from day one, not as a later optimization
 - prefer CodeMirror over Monaco (dramatically lighter; we need a viewer, not an IDE)
 - keep the DOM per feed block small; no editor instance per block
+- prototype any canvas or diagram surface on WebKitGTK **before** committing to
+  it (§6.1) — canvas and media are precisely where that engine is weakest
 
 If these mitigations start failing, Electron remains a viable fallback and the
 Rust runtime boundary survives the switch — which is itself a reason to keep
@@ -286,6 +290,93 @@ Every adapter declares which tier it achieves, and the UI degrades honestly.
 Tier 3 is a real, supported, honest product state. We render a terminal and say
 so. We do not fake a semantic feed out of scraped text.
 
+### The two harnesses, concretely
+
+Every flag below must be verified against the installed version; both tools
+change them without semver. Record what you verified as fixtures (§16).
+
+**Claude Code**
+
+```bash
+claude -p "<prompt>" \
+  --output-format stream-json --verbose \
+  --input-format stream-json \        # keeps stdin open for follow-up turns
+  --mcp-config <generated.json> \     # our workspace server (§6)
+  --permission-prompt-tool mcp__workspace__request_permission \
+  --append-system-prompt "<the workspace MCP tools exist; when to use them>" \
+  --resume <providerSessionId>        # on resume, see §14
+```
+
+`--input-format stream-json` is the piece that turns a one-shot `-p` into a live
+session. `--permission-prompt-tool` is a real callback: the agent calls a tool on
+*our* MCP server, our runtime renders the §12 dialog, we return the decision.
+Same server as §6 — one more tool on it.
+
+Event mapping into §8's raw vocabulary:
+
+| stream-json | raw event |
+|---|---|
+| `system` / `subtype: init` | `run.started`; persist `session_id` as `providerSessionId` |
+| `assistant`, text block | `assistant.message` |
+| `assistant`, thinking block | `assistant.thinking` |
+| `assistant`, `tool_use` block | `tool.started` — typed args, §6 source 1 |
+| `user`, `tool_result` | `tool.completed` |
+| `result` | `run.finished` / `run.failed`; usage → `run.metrics` |
+
+**Codex**
+
+```bash
+codex exec --json "<prompt>" \
+  --sandbox workspace-write \
+  -c <config overrides, including our MCP server>
+# resume: codex exec resume <session_id>
+```
+
+A comparable stream: thread/turn lifecycle, agent messages, command execution
+begin/end, patch application, token usage on turn completion. Treat the event
+*shapes* as reliable and the *key names* as not.
+
+### Where the two agents diverge
+
+Streaming is the easy half and both vendors have nearly solved it. Control is
+where they separate, and it is what should shape the V2 interface:
+
+| Axis | Claude Code | Codex |
+|---|---|---|
+| Permissions | interactive callback via `--permission-prompt-tool` | launch-time policy + sandbox; no mid-run ask |
+| MCP injection | `--mcp-config`, per launch, no global state touched | `~/.codex/config.toml` or `-c`; must be generated, never mutating the user's file (§14) |
+| Sandbox | none of its own; permission-based | ships its own sandbox modes |
+
+Consequences:
+
+- §12 option A is not one feature. For Claude Code it is an interactive dialog;
+  for Codex it is "choose the posture at launch, show what it did afterwards."
+  The UI must label which one the user is getting.
+- Codex shipping its own sandbox is worth studying before committing to §12
+  option B — it may partly moot that build, or serve as a reference for it.
+- Per-run MCP injection is clean on one and awkward on the other, and MCP
+  injection is the spine of §6. Budget for it.
+
+### Decision: CLI subprocess, not an SDK sidecar
+
+§3 puts the Agent Manager in the Rust runtime, but Claude Code's richest surface
+is the Agent SDK (TypeScript/Python), which Rust cannot use in-process. Two
+coherent options:
+
+- **Rust spawns the CLI and parses NDJSON.** One process, no sidecar. Because
+  `--permission-prompt-tool` is an MCP tool, Rust hosts the permission hook
+  itself. The bet is on the CLI flag contract.
+- **A Node sidecar running the SDK**, speaking an internal protocol back to
+  Rust. Typed messages and a `canUseTool` callback instead of an MCP round-trip
+  — at the cost of shipping Node inside a Tauri app, which is much of the weight
+  Tauri was chosen to avoid.
+
+> **Decision: CLI subprocess.** Golden fixtures (§16) absorb the drift risk, and
+> a sidecar adopted for the first adapter would exist for the lifetime of every
+> adapter after it.
+
+Revisit only if the CLI contract proves measurably less stable than the SDK's.
+
 ### Consider ACP before inventing an interface
 
 Zed's **Agent Client Protocol** (JSON-RPC over stdio) exists to standardize
@@ -325,6 +416,25 @@ interface CodingAgent {
 interface designed against one agent encodes that agent's assumptions as
 universal truth. Build Claude Code concretely, build Codex concretely, then let
 the shared shape fall out of the diff between them.
+
+The divergence table above is that exercise done on paper, and it already shows
+the sketch is wrong: it has no permission surface, no MCP-injection strategy,
+and no capability declaration beyond a tier number. The genuinely shared shape
+is narrower, and the differences want to be *data* rather than methods:
+
+```ts
+interface AgentCapabilities {
+  permissions: 'interactive' | 'launch-policy' | 'none'
+  mcpInjection: 'flag' | 'config-file' | 'none'
+  sandbox: 'own' | 'none'
+  thinking: boolean
+  resume: 'session-id' | 'none'
+}
+```
+
+Shared: detect, launch, stream to normalized events, session id, usage,
+interrupt, resume. Per-vendor: everything in the divergence table. A uniform
+method set that pretends otherwise lies about half the agents.
 
 ### What users keep
 
@@ -398,6 +508,7 @@ workspace MCP server — tools exposed to the agent
   attach_artifact(kind, path, title)
   request_permission(action, detail, risk)     # see §12
   note_decision(title, rationale)
+  attach_diagram(format, source, title, references[])   # see §6.1
 ```
 
 Paired with a short system-prompt append telling the agent these tools exist and
@@ -410,6 +521,53 @@ Caveats to design around, not ignore:
 - the agent may simply not call them — every semantic block must be optional
 - an agent that calls them is a **tier 2** integration; tier 1 still works, with less
 - these tools are *reporting*, not control — they never let the agent mutate workspace policy
+
+### 6.1 Visual reporting — diagrams and canvas
+
+An agent can illustrate, and the channel already exists: it is one more
+reporting tool on the same MCP server. No vendor cooperation is needed beyond
+MCP support, which makes this tier 2 and agent-neutral by construction.
+
+**Emit a declarative spec, not code.**
+
+```text
+attach_diagram(format: "mermaid" | "dot" | "state", source, title, references[])
+```
+
+Text in, we render. No code execution, round-trips through JSON losslessly (§7),
+diffs well in the event log, and agents emit mermaid competently. That covers
+most of what "illustrate this" means in practice: architecture, state machines,
+sequence, call graphs, data flow.
+
+Two harder transports, and the rules for them:
+
+- **SVG artifact written to the worktree.** Nearly free — it is just an artifact
+  (§10). But agent-produced SVG carries `<script>`, `<foreignObject>`, event
+  handlers and external references. **Never inline it into the app DOM.** A
+  sanitizer allowlist is an arms race; an iframe is a boundary.
+- **Executable illustration** — the agent emits HTML/JS and we run it. The only
+  route to genuinely *interactive* illustrations, and a direct collision with
+  §15. Defensible only inside the hard boundary described in §15's table. A
+  deliberate later bet, never a convenience.
+
+**The direction question, which is the real fork.** Read-only illustration fits
+the current contract: the agent draws, the user looks, nothing is mutated. A
+*bidirectional* canvas — the user edits the diagram and the agent responds to
+the edit — requires the workspace MCP server to expose a read tool:
+
+```text
+read_canvas(id)     # an extension of the reporting-only contract
+```
+
+A read cannot mutate policy, spawn runs, or escape the worktree, so it is
+compatible with the spirit of that rule — but it *is* an extension, and it is
+recorded here rather than discovered later. Bidirectional is where the feature
+becomes genuinely interesting (sketch a box-and-arrow architecture, hand it to
+the agent, have it implement it) and it is several times the work of read-only.
+
+**The agent may simply never call the tool** — §6's standing caveat applies. So
+"illustrate this" must also exist as a user-initiated block-range action (§9.1),
+which makes the capability reliable rather than opportunistic.
 
 ### The resulting pipeline
 
@@ -485,6 +643,25 @@ can populate it. Likely next: `Finding`, `Plan`, `TestResult`, `PermissionReques
 rows in the database. A block *references* them by id; it is never one of them.
 Collapsing the two is an easy mistake and an expensive one — it puts mutable
 entity state inside an immutable document.
+
+### Blocks are addressable
+
+Every block carries the provenance of the raw events it was derived from:
+
+```ts
+{ runId: string, seqStart: number, seqEnd: number }
+```
+
+This costs almost nothing — §8's envelope already carries `seq` — but it has to
+be plumbed through the normalizer into the block, and it is painful to retrofit.
+It is what makes two separate things possible:
+
+- **Review** can attach reasoning and tool calls to the hunk that they produced,
+  which is the surface that justifies the product (§10).
+- **Block-range actions** (§9.1) — selecting "that response" is selecting a
+  contiguous `seq` range, and every derived capability is a function of it.
+
+Treat addressability as a V1 foundation, not a feature.
 
 ### Extensibility rules
 
@@ -679,6 +856,79 @@ types can also target:
 
 Keep the application's canonical domain model above Lexical, always.
 
+## 9.1 Block-range actions and derived runs
+
+A recurring class of product request — "summarize this response", "explain this
+hunk", "illustrate that", "write the commit message" — looks like a set of
+buttons and is really one mechanism:
+
+```text
+(runId, seqRange, actionId) → artifact
+```
+
+Nothing in that signature mentions an editor. These features do **not** need
+Lexical, and they must not become the excuse that puts Lexical in the feed (§9).
+
+### The mechanism
+
+1. **Select a range.** Blocks are addressable (§7), so "a response" is a
+   contiguous `seq` range — one `assistant.message` plus the `tool.*` events
+   beneath it.
+2. **Extract the slice as block JSON**, not as rendered text and not as scraped
+   Markdown. This is the concrete payoff of §7: a model handed
+   `{type: "diff", files: [...], stats: {+42,-12}}` writes a better summary than
+   one handed a prose transcript, for fewer tokens.
+3. **Spawn a derived run.** BYO-agent (§2) means we hold no credential and earn
+   no inference margin, so the work runs on *the user's own agent* — a
+   non-interactive invocation with the slice as input.
+4. **Attach the result** to the source range.
+
+### Derived run rules
+
+- a derived run is a `Run` with `parentRunId` set and a `kind` discriminator, so
+  its cost lands in the existing metrics columns (§14) instead of vanishing
+- **zero tools, no MCP servers, no filesystem write.** Its input is untrusted
+  agent output (§15) that may contain injected instructions; a summarizer with
+  tools is a confused deputy waiting to happen
+- output renders as escaped text, never HTML
+- the result is a **projection, not truth** (§8). It carries the `seqRange` it
+  covers and is invalidated when the run continues past it — otherwise the
+  product ships confidently stale summaries
+- it degrades honestly: a tier 3 agent cannot do this, and neither can an agent
+  that is not installed. The action is capability-gated like everything else
+
+### The family
+
+```text
+tl;dr this range          → summary document
+explain this hunk         → annotation attached to the diff
+illustrate this           → attach_diagram (§6.1)
+write the commit message  → text, pre-filled into the merge action
+review this run           → findings, from a second agent
+make this a task          → task entity (post-V1)
+```
+
+One selection model, one derived-run mechanism, one side panel. Shipping tl;dr
+as a one-off button and then rebuilding it four times is the failure mode.
+
+### Where Lexical actually enters
+
+At exactly one moment: when the user can **edit** the result.
+
+- read-only summary in a side panel → plain React over the block model
+- the user edits it, pins it to the run, turns it into a task description,
+  pastes a hunk reference into it → now it is an editable document, and Lexical
+  with custom nodes is correct
+
+The §7 separation holds, and it is the rule most likely to be violated here:
+Lexical's `EditorState` is **not** the storage format. A `DiffRefNode` holds
+`{runId, seqRange}` and serializes back to a block; the document persists as
+block JSON and Lexical is a view over it.
+
+An editable *canvas* is a second editor technology (tldraw, excalidraw) with the
+same rule and none of the same code — unbudgeted work, and subject to the
+WebKitGTK caveat in §4.
+
 ---
 
 ## 10. UI model
@@ -797,6 +1047,11 @@ permission API at all, including tier 3 — and it makes the policy panel truthf
 Ubuntu-first makes B unusually tractable, and it is the one capability in this
 document that a competitor cannot trivially copy. Treat it as a deliberate V2/V3
 bet, not an accident.
+
+Study Codex's sandbox before building ours (§5). A shipping implementation of
+roughly this idea, in an agent we intend to support anyway, is either a partial
+substitute or the best available reference — and either answer changes the size
+of the bet.
 
 **V1 ships Option A and shows only what it can enforce.**
 
@@ -953,6 +1208,9 @@ Threat model, minimum viable:
 | Injected permission approval | permission requests come from the runtime's own channel, never from parsed message text |
 | Secret leakage into the event log | redact known env/credential patterns before persisting; the log is long-lived |
 | Malicious MCP server config | workspace-surfaced MCP servers require explicit user approval before injection |
+| Agent-produced SVG inlined into the app DOM | never inline; render inside the sandboxed frame below (§6.1) |
+| Executable illustration escaping the page | `iframe sandbox="allow-scripts"` with **no** `allow-same-origin`; CSP `default-src 'none'`; no network; no parent DOM access; `postMessage` only, schema-validated at the boundary (§6.1) |
+| Derived run turned into a confused deputy | derived runs (§9.1) get zero tools, no MCP servers, and no filesystem write |
 
 The workspace MCP server (§6) is a *reporting* interface. It must expose no tool
 that changes policy, approves permissions, spawns runs, or writes outside the
@@ -976,6 +1234,12 @@ a deprecation window. Unmanaged, every upstream release is an outage for us.
   per adapter per version; a spike is the early warning that a format changed.
 - **Contract tests per tier.** A tier-1 adapter must satisfy a shared test suite;
   that suite is the real definition of the interface, more than the TypeScript is.
+
+**Record fixtures before writing the normalizer, not after.** Capturing real
+`stream-json` and `codex exec --json` streams from a handful of representative
+runs costs an afternoon, is the only defense against drift, and having both
+streams side by side is what lets the V2 abstraction (§5) fall out of evidence
+rather than out of a guess.
 
 ---
 
@@ -1046,7 +1310,8 @@ interrupt, resume via provider session id. **No adapter abstraction yet** (§5).
 
 **Worktrees** — run-per-worktree from day one (§13). Create, list, clean up.
 
-**Run feed** — six block types plus `Raw` (§7), plain React, virtualized.
+**Run feed** — six block types plus `Raw` (§7), plain React, virtualized. Every
+block carries `(runId, seqRange)` provenance (§7) — cheap now, painful later.
 
 **Review** — the diff surface with reasoning attached to hunks. The one screen
 that must be excellent.
@@ -1065,6 +1330,8 @@ Small, but it proves source 3 works and it is cheap to build.
 
 - Lexical (nothing is editable yet)
 - Monaco (CodeMirror read-only viewer instead)
+- block-range actions and derived runs (§9.1)
+- diagram and canvas rendering (§6.1)
 - Tasks, Artifacts as first-class surfaces
 - the adapter abstraction, and any second agent
 - MCP server management UI
@@ -1082,6 +1349,8 @@ Small, but it proves source 3 works and it is cheap to build.
 - **Second adapter (Codex)** — and only now, extract the interface from the diff
   between two real implementations (§5)
 - ACP support, if evaluation favors it
+- block-range actions (§9.1), starting with tl;dr and commit-message generation
+- read-only diagram rendering via `attach_diagram` (§6.1)
 - tier-3 PTY fallback agents
 - persistent tasks spanning runs
 - run forking and run comparison (cheap, given §13)
@@ -1089,6 +1358,52 @@ Small, but it proves source 3 works and it is cheap to build.
 - richer artifact handling
 - GitHub integration
 - richer MCP integration, inbound and outbound
+
+---
+
+## 20.5 Capability surface enabled by the foundations
+
+This is not a roadmap. It is the argument for why V1's unglamorous foundations —
+the event log, worktree-per-run, block addressability — are worth more than they
+look. Each capability is priced by the foundation it rides on, and almost none
+of it should be built early.
+
+**From the append-only event log (§8)**
+
+| Capability | Cost |
+|---|---|
+| Run replay — scrub to any `seq` | free |
+| Cross-run file history — every time any agent touched a file, and why | free |
+| Run comparison — same prompt, two runs, diff the diffs | cheap |
+| Cost and token analytics per workspace, agent, prompt shape | free |
+| Audit export — what ran, what it touched, what it cost | cheap |
+| "What happened while I was away" | cheap |
+
+Cross-run file history is the underrated one: a `SELECT` over data already
+stored, and nothing in §2's competitive table can answer it.
+
+**From worktree-per-run (§13)**
+
+- **run forking** — branch a run at `seq` N with a different instruction *(cheap)*
+- **racing** — the same prompt to three agents or three phrasings, review all
+  three, keep one *(cheap, and the concrete payoff of agent-neutrality)*
+- **background and scheduled runs** *(real work — needs a supervisor)*
+- **safe discard** *(free, and the reason a user tolerates an unattended agent)*
+
+**From derived runs (§9.1)** — the block-range action family: roughly a day each
+once the first one exists.
+
+**From owning process launch**
+
+- version-drift detection (§16) *(real work)*
+- environment and secret control *(cheap)*
+- the sandbox policy engine (§12 option B) *(the bet)*
+
+**What we deliberately do not offer.** No inference of our own, no model, no
+cloud storage, no credential, no code egress. Every capability above is a
+consequence of *observing and isolating* the user's own agents. That constraint
+is what makes the product defensible, and it is the same constraint that leaves
+the business model in §2 unresolved.
 
 ---
 
@@ -1181,6 +1496,11 @@ Schema. Do not maintain two copies.
 13. **Lexical and Monaco are implementation details** — and neither belongs in the run feed (§9).
 14. **Runs are first-class.** A run is a durable unit of work, not a conversation.
 15. **Design for orchestration, ship a focused V1.**
+16. **Blocks are addressable.** `(runId, seqRange)` provenance on every block is
+    a V1 foundation; Review and every derived action depend on it (§7, §9.1).
+17. **Derived work runs on the user's agent, with no tools.** We add no
+    inference of our own, and a summarizer holding tools is a confused
+    deputy (§9.1, §15).
 
 ---
 
