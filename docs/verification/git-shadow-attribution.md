@@ -1,7 +1,7 @@
 <!--
 Verification record. Discharges the "Review attribution mechanism is asserted in
-§1, §7 and §10 and specified nowhere" debt in HANDOFF.md, and settles the
-question the handoff said had to be answered before the process driver exists.
+§1, §7 and §10 and specified nowhere" debt in docs/roadmap.md, and settles the
+question that had to be answered before the process driver existed.
 
 Verified: 2026-09-12 · git 2.48.1 · Ubuntu, x86-64
 Method: an executable spike, docs/verification/shadow-attribution-spike.sh,
@@ -135,7 +135,7 @@ hundreds of milliseconds to seconds, is affordable.
   tool completes, so concurrent calls — subagents, per `parent_tool_use_id` —
   can land in one snapshot, and attribution is then "one of these calls". Not
   reproduced here: every recorded fixture has `parent_tool_use_id` null
-  (HANDOFF.md), so this is untested against real subagent traffic. Snapshots
+  (docs/roadmap.md), so this is untested against real subagent traffic. Snapshots
   must in any case be serialized per worktree; the shadow index is not
   concurrency-safe.
 - **`git add -A` sweeps untracked build output that is not `.gitignore`d.** A

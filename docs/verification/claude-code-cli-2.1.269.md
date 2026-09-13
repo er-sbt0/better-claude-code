@@ -1,6 +1,6 @@
 <!--
 Verification record. Discharges part of the "every CLI flag in §5" debt in
-HANDOFF.md. Re-run against each new Claude Code version; these flags change
+docs/roadmap.md. Re-run against each new Claude Code version; these flags change
 without semver (agent-workspace-design.md §16).
 
 Verified: 2026-09-12 · Claude Code 2.1.269 · Ubuntu, x86-64
