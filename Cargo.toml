@@ -30,3 +30,12 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[profile.dev]
+# Keep file/line info for backtraces in our own crates, but skip full debug
+# info: `target/debug` was dominated by dependency symbols.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Dependencies get no debug info at all — we don't step into them.
+debug = false

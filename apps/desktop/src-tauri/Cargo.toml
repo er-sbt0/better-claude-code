@@ -9,9 +9,10 @@ publish.workspace = true
 
 [lib]
 # Tauri builds the app as a library so the same code can back a mobile target
-# later; `main.rs` is a thin shim over it.
+# later; `main.rs` is a thin shim over it. `staticlib` (iOS only) is omitted —
+# it produced a ~650MB archive per build; add it back when targeting iOS.
 name = "desktop_lib"
-crate-type = ["lib", "cdylib", "staticlib"]
+crate-type = ["lib", "cdylib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
