@@ -12,7 +12,7 @@ use std::process::Command;
 
 use agent_protocol::{Event, RunId};
 use driver::{LaunchSpec, Permission, Pipeline, RunSpec, Thinking};
-use event_log::{EventLog, Run, RunStatus};
+use event_log::{EventLog, LaunchFlags, Run, RunStatus};
 use worktree::{ShadowHistory, Worktree};
 
 // ------------------------------------------------------------------ helpers --
@@ -524,6 +524,7 @@ fn every_recorded_fixture_survives_the_pipeline() {
             shadow_ref: None,
             prompt: None,
             model: None,
+            launch_flags: LaunchFlags::default(),
             status: RunStatus::Running,
             started_at: "2026-09-13T09:00:00.000Z".to_owned(),
             finished_at: None,
@@ -702,8 +703,13 @@ fn parent_that_edited_twice(db: &Path, repo: &Path, run: &RunId) -> (PathBuf, Ev
         branch: Some(format!("agent/{}", run.0)),
         shadow_ref: Some(tree.shadow.ref_name().to_owned()),
         prompt: Some("make it retry".to_owned()),
-        // The fork below inherits this, and asserts it.
+        // The fork below inherits both of these, and asserts it.
         model: Some("claude-opus-4-6".to_owned()),
+        launch_flags: LaunchFlags {
+            allowed_tools: vec!["Read".to_owned(), "Edit".to_owned()],
+            max_turns: Some(12),
+            ..LaunchFlags::default()
+        },
         status: RunStatus::Finished,
         started_at: "2026-09-13T09:00:00.000Z".to_owned(),
         finished_at: Some("2026-09-13T09:01:00.000Z".to_owned()),
@@ -879,6 +885,20 @@ fn a_fork_gets_its_own_tree_holding_the_parent_as_of_the_branch_point() {
         pair("--session-id", &child_session.0),
         "the child is named by us, not read back off the stream (§14): {argv:?}"
     );
+    // **The child runs under the parent's policy.** Not because the caller
+    // passed one — the `LaunchSpec` above names no tools at all — but because
+    // the parent's row stored what it was launched with (schema V4) and
+    // `driver::fork` reads it back. Before that column, a fork's allow-list was
+    // whatever the *window* happened to remember launching the parent with, so
+    // a branch off a run from a previous session was refused the `Read` its
+    // parent had, silently: §12's posture is `DenyPrompts`, and a tool that is
+    // not pre-granted is not prompted for, it is denied.
+    assert!(pair("--allowed-tools", "Read"), "{argv:?}");
+    assert!(
+        argv.contains(&"Edit"),
+        "the whole allow-list is inherited, not its first entry: {argv:?}"
+    );
+    assert!(pair("--max-turns", "12"), "{argv:?}");
 
     // The row: the whole graph edge, and git state of its own.
     let row = log.run(&child).unwrap().unwrap();
@@ -902,6 +922,16 @@ fn a_fork_gets_its_own_tree_holding_the_parent_as_of_the_branch_point() {
         Some("claude-opus-4-6"),
         "`branching-surface.md`: a fork inherits its parent's model, and it is \
          copied onto the child's own row rather than read back through the edge"
+    );
+    assert_eq!(
+        row.launch_flags,
+        LaunchFlags {
+            allowed_tools: vec!["Read".to_owned(), "Edit".to_owned()],
+            max_turns: Some(12),
+            ..LaunchFlags::default()
+        },
+        "and the rest of the launch with it, copied onto the child's own row for \
+         the same reason: a fork of this fork inherits what *this* run ran with"
     );
 
     // §13.1 on the fork: its edit is attributable to the tool call that made it,
@@ -1078,6 +1108,7 @@ fn a_fork_of_a_run_with_no_shadow_ref_is_refused_and_writes_nothing() {
         shadow_ref: None,
         prompt: None,
         model: None,
+        launch_flags: LaunchFlags::default(),
         status: RunStatus::Finished,
         started_at: "2026-09-13T09:00:00.000Z".to_owned(),
         finished_at: Some("2026-09-13T09:01:00.000Z".to_owned()),
@@ -1166,6 +1197,7 @@ fn in_memory_run(run: &RunId) -> EventLog {
         shadow_ref: None,
         prompt: None,
         model: None,
+        launch_flags: LaunchFlags::default(),
         status: RunStatus::Running,
         started_at: "2026-09-13T09:00:00.000Z".to_owned(),
         finished_at: None,
@@ -1313,4 +1345,277 @@ fn a_permission_tool_without_its_server_is_refused_before_spawning() {
         s.validate().is_err(),
         "a bare tool name parses to nothing: the CLI needs mcp__<server>__<tool>"
     );
+}
+
+// ------------------------------------------------------- what a run launched --
+
+/// A stub that writes its argv out and ends its turn. Enough to assert what the
+/// driver launched with, and deliberately nothing else: these tests are about
+/// the flags, not about what an agent does with them.
+const DUMPS_ARGV: &str = r#"#!/usr/bin/env bash
+printf '%s\n' "$@" > __DUMP__
+cat > /dev/null &
+emit() { printf '%s\n' "$1"; }
+emit '{"type":"system","subtype":"init","uuid":"__TAG__0","session_id":"s","cwd":"'"$PWD"'","tools":[],"mcp_servers":[],"model":"claude-sonnet-5","permissionMode":"default"}'
+emit '{"type":"assistant","uuid":"__TAG__1","message":{"id":"__TAG__m","content":[{"type":"text","text":"ok"}]}}'
+emit '{"type":"result","uuid":"__TAG__2","subtype":"success","result_index":0,"is_error":false,"num_turns":1,"duration_ms":1,"total_cost_usd":0.0,"modelUsage":{},"permission_denials":[]}'
+"#;
+
+fn dumping_agent(home: &Path, name: &str, dump: &Path, tag: &str) -> PathBuf {
+    let script = DUMPS_ARGV
+        .replace("__DUMP__", &dump.display().to_string())
+        .replace("__TAG__", tag);
+    let p = home.join(name);
+    fs::write(&p, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    p
+}
+
+/// The flags a launch is made with are written to the run's row, and they are
+/// the caller's rather than the ones the driver goes on to rewrite.
+///
+/// Nothing reads this back for the run itself — the process already has them.
+/// It is written for the fork or the resume that comes later, which is the only
+/// place they can come from once the process is gone: §8's rule against storing
+/// what is recomputable does not reach this, because the log records what the
+/// agent *did* and never what it was *permitted* to do. A denial arrives as a
+/// refused tool call that does not name the allow-list it failed.
+#[test]
+fn a_run_records_the_flags_it_was_launched_with() {
+    let home = TempDir::new("flags-start");
+    let repo = repo(home.path());
+    let bin = stub_agent(home.path(), EDIT_THEN_REPORT);
+    let run = RunId::from("run_flags");
+    let db = home.path().join("log.sqlite");
+
+    let mut spec = spec(&repo, &bin, &run);
+    spec.launch.model = Some("claude-opus-4-6".to_owned());
+    spec.launch.allowed_tools = vec!["Read".to_owned(), "Edit".to_owned()];
+    spec.launch.disallowed_tools = vec!["Bash".to_owned()];
+    spec.launch.permission_mode = Some("acceptEdits".to_owned());
+    spec.launch.max_turns = Some(7);
+    spec.launch.max_budget_usd = Some(2.5);
+    spec.launch.append_system_prompt = Some("be terse".to_owned());
+
+    let started = driver::start(
+        EventLog::open(&db).unwrap(),
+        spec,
+        "2026-09-14T09:00:00.000Z",
+        None,
+    )
+    .unwrap();
+    let (_outcome, log) = started.session.wait().unwrap();
+
+    let row = log.run(&run).unwrap().unwrap();
+    assert_eq!(row.model.as_deref(), Some("claude-opus-4-6"));
+    assert_eq!(
+        row.launch_flags,
+        LaunchFlags {
+            allowed_tools: vec!["Read".to_owned(), "Edit".to_owned()],
+            disallowed_tools: vec!["Bash".to_owned()],
+            permission_mode: Some("acceptEdits".to_owned()),
+            max_turns: Some(7),
+            max_budget_usd: Some(2.5),
+            append_system_prompt: Some("be terse".to_owned()),
+            extra: Vec::new(),
+        },
+        "the row carries the policy and the bounds, and nothing that is a \
+         property of this machine or this process"
+    );
+}
+
+/// A resumed run is launched with what the run was launched with.
+///
+/// The composer on a run from an earlier session is the ordinary path, not an
+/// error path (`Registry::resume`), and until the row stored this it woke every
+/// such run with an empty allow-list — the same conversation, under a policy it
+/// never agreed to, denied outright whatever it was not handed again.
+#[test]
+fn a_resumed_run_is_launched_with_what_the_run_was_launched_with() {
+    let home = TempDir::new("flags-resume");
+    let repo = repo(home.path());
+    let bin = stub_agent(home.path(), EDIT_THEN_REPORT);
+    let run = RunId::from("run_resumed");
+    let db = home.path().join("log.sqlite");
+
+    let mut spec = spec(&repo, &bin, &run);
+    spec.launch.model = Some("claude-opus-4-6".to_owned());
+    spec.launch.allowed_tools = vec!["Read".to_owned(), "Edit".to_owned()];
+    spec.launch.max_turns = Some(7);
+    let started = driver::start(
+        EventLog::open(&db).unwrap(),
+        spec,
+        "2026-09-14T09:00:00.000Z",
+        None,
+    )
+    .unwrap();
+    let (_outcome, log) = started.session.wait().unwrap();
+    let row = log.run(&run).unwrap().unwrap();
+    drop(log);
+
+    // Everything the shell now passes: a binary, and the session to wake. No
+    // flags — that is the point.
+    let dump = home.path().join("resumed-argv");
+    let mut launch = LaunchSpec::new(
+        "/definitely/not/a/checkout",
+        row.provider_session_id.clone().unwrap(),
+        Permission::DenyPrompts,
+    );
+    launch.binary = dumping_agent(home.path(), "resume-claude", &dump, "r");
+    launch.thinking = Thinking::Off;
+
+    let session = driver::resume(
+        EventLog::open(&db).unwrap(),
+        &row,
+        launch,
+        "and now the second turn",
+        None,
+        None,
+    )
+    .unwrap();
+    let (outcome, _log) = session.wait().unwrap();
+    assert_eq!(outcome.exit_code, Some(0));
+
+    let dumped = fs::read_to_string(&dump).unwrap();
+    let argv: Vec<&str> = dumped.lines().collect();
+    let pair = |flag: &str, value: &str| argv.windows(2).any(|w| w[0] == flag && w[1] == value);
+    assert!(pair("--model", "claude-opus-4-6"), "{argv:?}");
+    assert!(pair("--allowed-tools", "Read"), "{argv:?}");
+    assert!(argv.contains(&"Edit"), "{argv:?}");
+    assert!(pair("--max-turns", "7"), "{argv:?}");
+    assert!(
+        pair("--resume", &row.provider_session_id.as_ref().unwrap().0),
+        "it is still a resume of the same session: {argv:?}"
+    );
+}
+
+/// A run whose row stores no flags still starts.
+///
+/// That is every run recorded before the column existed, and it is also a run
+/// launched with nothing — the two are the same state on disk on purpose, since
+/// there is nothing to tell them apart with and pre-granting tools we cannot
+/// show were granted would be a guess stored as a fact. The empty reading fails
+/// closed, which is exactly the behaviour those rows already had; what must not
+/// happen is an error where there used to be a run.
+#[test]
+fn a_run_whose_row_stores_no_flags_still_starts() {
+    let home = TempDir::new("flags-absent");
+    let repo = repo(home.path());
+    let bin = stub_agent(home.path(), EDIT_THEN_REPORT);
+    let run = RunId::from("run_old");
+    let db = home.path().join("log.sqlite");
+
+    // A run launched with nothing, which is how a V3-era row reads back.
+    let started = driver::start(
+        EventLog::open(&db).unwrap(),
+        spec(&repo, &bin, &run),
+        "2026-09-14T09:00:00.000Z",
+        None,
+    )
+    .unwrap();
+    let (_outcome, log) = started.session.wait().unwrap();
+    let row = log.run(&run).unwrap().unwrap();
+    assert!(
+        row.launch_flags.is_empty(),
+        "the fixture is only meaningful if the row stores nothing"
+    );
+    drop(log);
+
+    let dump = home.path().join("old-argv");
+    let mut launch = LaunchSpec::new(
+        "/definitely/not/a/checkout",
+        row.provider_session_id.clone().unwrap(),
+        Permission::DenyPrompts,
+    );
+    launch.binary = dumping_agent(home.path(), "old-claude", &dump, "o");
+    launch.thinking = Thinking::Off;
+
+    let session = driver::resume(
+        EventLog::open(&db).unwrap(),
+        &row,
+        launch,
+        "wake up",
+        None,
+        None,
+    )
+    .unwrap();
+    let (outcome, _log) = session.wait().unwrap();
+    assert_eq!(
+        outcome.exit_code,
+        Some(0),
+        "it started rather than erroring"
+    );
+
+    let dumped = fs::read_to_string(&dump).unwrap();
+    let argv: Vec<&str> = dumped.lines().collect();
+    assert!(
+        !argv.contains(&"--allowed-tools"),
+        "nothing is invented to fill the gap: {argv:?}"
+    );
+    assert!(!argv.contains(&"--max-turns"), "{argv:?}");
+}
+
+/// A caller that names something wins over what the row stored.
+///
+/// The rule is not new — `driver::fork` already applied it to the model, on the
+/// argument that a caller naming a model is making exactly the change the
+/// branch exists to make. Applied to every field, it is what makes a branch
+/// able to differ from its parent at all, and it is decidable rather than
+/// guessed because `LaunchSpec::new`'s default *is* "unset" for each of them.
+#[test]
+fn a_caller_that_names_a_flag_keeps_it_over_the_row() {
+    let mut row = Run {
+        id: RunId::from("run_row"),
+        agent: "claude-code".to_owned(),
+        agent_version: None,
+        provider_session_id: None,
+        workspace_path: "/tmp".to_owned(),
+        worktree_path: None,
+        branch: None,
+        shadow_ref: None,
+        prompt: None,
+        model: Some("claude-opus-4-6".to_owned()),
+        launch_flags: LaunchFlags {
+            allowed_tools: vec!["Read".to_owned()],
+            max_turns: Some(12),
+            ..LaunchFlags::default()
+        },
+        status: RunStatus::Finished,
+        started_at: "2026-09-14T09:00:00.000Z".to_owned(),
+        finished_at: None,
+        parent_run_id: None,
+        branch_point_seq: None,
+    };
+
+    let mut named = LaunchSpec::new("/wt", driver::new_session_id(), Permission::DenyPrompts);
+    named.model = Some("claude-sonnet-5".to_owned());
+    named.allowed_tools = vec!["Bash".to_owned()];
+    named.inherit_from(&row);
+    assert_eq!(named.model.as_deref(), Some("claude-sonnet-5"));
+    assert_eq!(named.allowed_tools, vec!["Bash".to_owned()]);
+    assert_eq!(
+        named.max_turns,
+        Some(12),
+        "the fields it said nothing about are still inherited"
+    );
+
+    let mut silent = LaunchSpec::new("/wt", driver::new_session_id(), Permission::DenyPrompts);
+    silent.inherit_from(&row);
+    assert_eq!(silent.model.as_deref(), Some("claude-opus-4-6"));
+    assert_eq!(silent.allowed_tools, vec!["Read".to_owned()]);
+    assert_eq!(silent.max_turns, Some(12));
+
+    // And a row that stored nothing leaves the spec exactly as it was built.
+    row.model = None;
+    row.launch_flags = LaunchFlags::default();
+    let mut over_nothing =
+        LaunchSpec::new("/wt", driver::new_session_id(), Permission::DenyPrompts);
+    over_nothing.allowed_tools = vec!["Edit".to_owned()];
+    over_nothing.inherit_from(&row);
+    assert_eq!(over_nothing.allowed_tools, vec!["Edit".to_owned()]);
+    assert_eq!(over_nothing.model, None);
 }

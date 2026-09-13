@@ -9,7 +9,7 @@ use crate::Result;
 
 /// Bump when adding a migration; `migrate` applies everything above the
 /// database's current `user_version`.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Apply every migration the database has not seen.
 pub fn migrate(conn: &Connection) -> Result<()> {
@@ -25,6 +25,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     }
     if current < 3 {
         conn.execute_batch(V3)?;
+    }
+    if current < 4 {
+        conn.execute_batch(V4)?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
@@ -164,4 +167,46 @@ const V3: &str = r#"
 -- through the edge at query time, so a later UI can change one branch's model
 -- without rewriting what the parent was launched with.
 ALTER TABLE runs ADD COLUMN model TEXT;
+"#;
+
+const V4: &str = r#"
+-- The rest of what the run was launched with (`event_log::LaunchFlags`).
+--
+-- V3 stored the model and nothing else, and two features recorded the hole it
+-- left as a known gap before this closed it: `driver::fork` could only
+-- pre-grant what the *shell* remembered launching the parent with, in this
+-- session, so forking a run from an earlier session pre-granted nothing; and
+-- `Registry::resume` woke a run with its model and an empty allow-list. Under
+-- §12's posture — `DenyPrompts`, nothing may prompt — "not pre-granted" is not
+-- "ask the user", it is denied outright, so the visible symptom was a branch
+-- refused the `Read` its parent had for no reason on the screen, working
+-- around it silently.
+--
+-- Not a projection, by the same §8 argument V3 makes for the model and V2
+-- makes for the branch point: the log records what the agent *did*, never what
+-- it was *permitted* to do. A denial arrives as a refused tool call that does
+-- not state the allow-list it failed, so nothing in `raw_events` can
+-- reconstruct this. It is written at launch or it is lost.
+--
+-- **One TEXT column of JSON, not seven columns**, and the reason is what a
+-- column here actually costs. Every `SELECT` in `log.rs` names the whole
+-- column list and `row_to_run` reads it back positionally, so a column is an
+-- edit in five places plus a mis-ordering hazard — which is the price of a
+-- column you can *query*, and nothing will ever ask this table for "runs with
+-- `Edit` pre-granted". Read and written whole, this is the same kind of value
+-- `raw_events.payload` is, for the same reason. §14 wanted `runs` thin and
+-- this keeps it thin: one column for a set that will grow.
+--
+-- The blob survives the struct changing by `#[serde(default)]` on the
+-- container rather than by a version tag: a field added later is absent from
+-- every blob on disk and decodes to its default, a field removed is ignored on
+-- read, and there is one attribute to not forget instead of one per field.
+--
+-- Nullable, and NULL is not a third state. A row written before this column
+-- existed and a run launched with no flags at all read back identically, as
+-- empty. The V3-era row may in truth have had an allow-list nobody recorded;
+-- there is no way to recover it, and pre-granting tools we cannot show were
+-- granted would be a guess stored as a fact. Empty fails closed, which is the
+-- behaviour those rows already have.
+ALTER TABLE runs ADD COLUMN launch_flags TEXT;
 "#;

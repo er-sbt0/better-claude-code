@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 
 use agent_protocol::{RunId, SessionId};
+use event_log::{LaunchFlags, Run};
 
 use crate::error::{Error, Result};
 
@@ -101,6 +102,84 @@ pub struct LaunchSpec {
 }
 
 impl LaunchSpec {
+    /// The half of this that is a fact about the *run*, for the run's row.
+    ///
+    /// Read at the launch seam, before [`crate::wire_workspace_mcp`] has
+    /// rewritten anything: what the caller asked for, not what this process
+    /// arranged. That matters for two of these. `append_system_prompt` gains
+    /// the workspace MCP server's own paragraph when a server is hosted, and
+    /// storing the appended value would append it a second time on every
+    /// resume; `allowed_tools` gains `report_finding` the same way, and it is
+    /// re-added by the same code on the next launch whether or not it is
+    /// stored.
+    ///
+    /// What it leaves behind — the binary, the cwd, the session id, the resume
+    /// and fork addresses, the MCP config and the permission posture — is
+    /// argued field by field on [`LaunchFlags`]. The short version is that each
+    /// of them is a property of this machine, this process or this moment
+    /// rather than of the run, and several are already columns of their own.
+    pub fn flags(&self) -> LaunchFlags {
+        LaunchFlags {
+            allowed_tools: self.allowed_tools.clone(),
+            disallowed_tools: self.disallowed_tools.clone(),
+            permission_mode: self.permission_mode.clone(),
+            max_turns: self.max_turns,
+            max_budget_usd: self.max_budget_usd,
+            append_system_prompt: self.append_system_prompt.clone(),
+            extra: self.extra.clone(),
+        }
+    }
+
+    /// Fill in what `run` was launched with, for everything the caller did not
+    /// name.
+    ///
+    /// The inverse of [`flags`](LaunchSpec::flags), and the reason the `runs`
+    /// row stores any of this: [`crate::fork`] and [`crate::resume`] both start
+    /// from a conversation that already happened, and a continuation that
+    /// quietly holds a different allow-list is not a continuation. Under §12's
+    /// `DenyPrompts` posture the difference is not a prompt, it is a denial —
+    /// so the child of a run that could `Read` could not, for no reason
+    /// anywhere on the screen.
+    ///
+    /// **The caller wins wherever it said anything.** That rule is not new: it
+    /// is what [`crate::fork`] already did for the model, on the argument that
+    /// a caller naming a model is making exactly the change the branch exists
+    /// to make. Applied to every field, it is also what keeps this honest about
+    /// what it does not know — `LaunchSpec::new`'s default *is* "unset" for
+    /// every field here, so "the caller said nothing" is decidable rather than
+    /// guessed.
+    ///
+    /// A run whose row stores nothing — one recorded before the column existed
+    /// — leaves the spec exactly as the caller built it, which is the behaviour
+    /// every such run already had.
+    pub fn inherit_from(&mut self, run: &Run) {
+        if self.model.is_none() {
+            self.model = run.model.clone();
+        }
+        let flags = &run.launch_flags;
+        if self.allowed_tools.is_empty() {
+            self.allowed_tools = flags.allowed_tools.clone();
+        }
+        if self.disallowed_tools.is_empty() {
+            self.disallowed_tools = flags.disallowed_tools.clone();
+        }
+        if self.permission_mode.is_none() {
+            self.permission_mode = flags.permission_mode.clone();
+        }
+        if self.max_turns.is_none() {
+            self.max_turns = flags.max_turns;
+        }
+        if self.max_budget_usd.is_none() {
+            self.max_budget_usd = flags.max_budget_usd;
+        }
+        if self.append_system_prompt.is_none() {
+            self.append_system_prompt = flags.append_system_prompt.clone();
+        }
+        if self.extra.is_empty() {
+            self.extra = flags.extra.clone();
+        }
+    }
+
     /// A spec with the defaults that make a run observable and bounded.
     pub fn new(cwd: impl Into<PathBuf>, session_id: SessionId, permission: Permission) -> Self {
         LaunchSpec {

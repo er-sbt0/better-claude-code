@@ -393,6 +393,28 @@ What this costs is the prototype's most legible image, `planner · opus` forking
 into `coder · sonnet`. Half of it survives, and it is the half that was ever
 ours to make true.
 
+**And the rest of the launch is stored with it.** The Fork config row above says
+a fork inherits the parent's model, and while the model was the only launch fact
+on the row that was also the *limit* of what a fork could inherit — the rest came
+from whatever the window remembered starting the parent with, which for a run
+from any earlier session was nothing. That is not a smaller version of the same
+inheritance, it is a different one: §12's posture is `DenyPrompts`, so a tool the
+child was not handed is not asked about, it is denied, and a branch taken to try
+something was refused the `Read` its parent had with nothing on the screen saying
+so. Schema V4 stores the allow-list, the disallow-list, the permission mode, the
+turn and budget bounds and the appended system prompt as one column beside the
+model, and `driver::fork` inherits all of it the same way it always inherited the
+model — **by copy, onto the child's own row**, so the sentence that argued for the
+model argues unchanged for the rest: changing one branch's policy later changes
+one branch. What the header edits is still the model, because that is the only
+one of these the surface has a control for; the others are inherited and stay
+inherited until something is built to edit them.
+
+The read of Fork config is therefore extended rather than changed: **immediate,
+and it inherits the parent's launch.** A caller that names a field still wins,
+which is what makes "may a branch differ from its parent" answerable at all — and
+the answer is now the same for every launch flag as it was for the model.
+
 ## What this does not decide
 
 - ~~**Whether the stream `uuid` is the fork address.**~~ Settled: it is, for
@@ -457,6 +479,20 @@ ours to make true.
   message-ness rather than around the provider's `type` field. The filter is
   `normalizer::claude_code::is_addressable`; the failure mode it removes stays
   loud for anything that slips past it.
+
+- ~~**Whether a branch may differ from its parent in anything but its model.**~~
+  Settled, and settled the same way the model was. Everything the run row now
+  stores about a launch — allow-list, disallow-list, permission mode, turn and
+  budget bounds, appended system prompt (schema V4) — is inherited by copy onto
+  the child's own row, and a caller that names one wins over what the row said.
+  So a branch *may* differ in any of them, per branch, without rewriting the
+  parent. What is not decided is a narrower and more interesting question: **what
+  the surface lets you change, and when.** The header has a control for the model
+  and nothing else, so today every other difference is reachable only by a caller
+  that is not the window. Whether a fork should be able to tighten its own
+  allow-list at the moment of forking — "branch here, but read-only" — is a real
+  gesture nobody has asked for yet, and it is a question about the fork dialog
+  this record decided not to have, rather than about the plumbing under it.
 
 - **What a fork's worktree is prepared with.** `ForkSpec::post_create_hook` was
   left to the caller, and the first caller is the window, which passes `None`.

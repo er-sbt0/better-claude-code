@@ -134,6 +134,11 @@ pub struct ForkSpec {
     /// — the first because §13 does not leave a working directory to the
     /// caller, the other two because they *are* the fork. `session_id` is the
     /// caller's: it names the child.
+    ///
+    /// Everything else a caller leaves unset is **inherited from the parent's
+    /// row** ([`LaunchSpec::inherit_from`]), so the ordinary way to fork is to
+    /// pass a bare [`LaunchSpec::new`] and say nothing. Naming a field here is
+    /// how a branch comes to differ from the run it came out of.
     pub launch: LaunchSpec,
     pub workspace_mcp: Option<WorkspaceMcp>,
 }
@@ -343,6 +348,14 @@ pub fn start(
                 // launched without `--model` records `None` rather than the
                 // default we would have to guess at (`schema.rs`, V3).
                 model: spec.launch.model.clone(),
+                // And the rest of what we asked for (`schema.rs`, V4), read
+                // here rather than inside `spawn_run` so it is the caller's
+                // launch and not the one `wire_workspace_mcp` is about to
+                // rewrite. Nothing reads this back for *this* run; it is
+                // written for the fork or the resume that comes later, which
+                // is the only place the flags can come from once the process
+                // is gone.
+                launch_flags: spec.launch.flags(),
                 status: RunStatus::Running,
                 started_at: started_at.to_owned(),
                 finished_at: None,
@@ -446,10 +459,20 @@ pub fn ensure_tree(spec: &TreeSpec) -> Result<Tree> {
 /// `branching-surface.md`'s reading of `pipeline.rs` shows would mis-attribute
 /// the *parent's* hunks as well as the child's.
 ///
-/// What it *does* inherit is the model, unless the caller named one — a fork is
-/// a continuation of a conversation, and the conversation was had with a model.
-/// It is copied onto the child's own row rather than read back through the edge,
-/// so changing one branch's model later changes only that branch.
+/// What it *does* inherit is the **launch**: the model, the allow-list, the
+/// disallow-list, the permission mode, the turn and budget bounds, the appended
+/// system prompt, and whatever `extra` argv the parent carried — everything the
+/// child's row will store, and nothing that is a property of this machine or
+/// this process (`event_log::LaunchFlags` argues the split field by field). A
+/// fork is a continuation of a conversation, and the conversation was had under
+/// a policy; a child refused the `Read` its parent had is not a continuation,
+/// and under §12's `DenyPrompts` posture that refusal is silent — nothing may
+/// prompt, so a tool that is not pre-granted is simply denied and the agent
+/// works around it.
+///
+/// A caller that names a field wins, which is how a branch comes to differ from
+/// its parent at all. All of it is copied onto the child's own row rather than
+/// read back through the edge, so changing one branch later changes one branch.
 ///
 /// # A parent with no shadow ref cannot be forked
 ///
@@ -513,14 +536,14 @@ pub fn fork(
     spec.launch.resume = Some(parent_session);
     spec.launch.fork_at = Some(spec.at.address.clone());
 
-    // `branching-surface.md`: a fork inherits its parent's model. Inherited
-    // here rather than read through the edge at query time, so the child gets
-    // its own value in its own column and a surface that changes one branch's
-    // model changes nothing about the parent. A caller that names a model is
-    // making exactly that change, so its choice wins.
-    if spec.launch.model.is_none() {
-        spec.launch.model = parent.model.clone();
-    }
+    // `branching-surface.md`: a fork inherits its parent's launch — the model
+    // it always said, and now the allow-list, the bounds and the appended
+    // prompt with it. Inherited here rather than read through the edge at query
+    // time, so the child gets its own values in its own row and a surface that
+    // changes one branch changes nothing about the parent. A caller that names
+    // something is making exactly that change, so its choice wins
+    // (`LaunchSpec::inherit_from`).
+    spec.launch.inherit_from(&parent);
 
     let session = spawn_run(
         log,
@@ -537,8 +560,13 @@ pub fn fork(
                 branch: Some(spec.branch.clone()),
                 shadow_ref: Some(shadow_ref.clone()),
                 prompt: Some(spec.prompt.clone()),
-                // Inherited above unless the caller named one.
+                // Inherited above unless the caller named one, and copied
+                // onto the child's own row rather than read back through the
+                // edge — so a fork of this fork inherits what *this* run ran
+                // with, and a parent re-launched differently later does not
+                // rewrite its children.
                 model: spec.launch.model.clone(),
+                launch_flags: spec.launch.flags(),
                 status: RunStatus::Running,
                 started_at: started_at.to_owned(),
                 finished_at: None,
@@ -653,6 +681,11 @@ pub fn resume(
     let shadow = ShadowHistory::open(&wt, &run.id)?;
     launch.cwd = wt.path().to_path_buf();
     launch.resume = run.provider_session_id.clone();
+    // The same run, so the same launch: a resumed conversation that pre-granted
+    // a different set of tools than it was having the conversation with is a
+    // different run wearing its row. The row is not rewritten here — it records
+    // what the run was *launched* with, and this is that launch again.
+    launch.inherit_from(run);
     let pipeline = Arc::new(Mutex::new(Pipeline::resuming(
         run.id.clone(),
         log,

@@ -337,7 +337,7 @@ function Composer({
           {live
             ? 'Nothing can prompt: a tool outside the run’s allow-list is denied (§12).'
             : resumable
-              ? 'Asleep. Sending resumes the session in its own worktree, and pre-grants no tools.'
+              ? 'Asleep. Sending resumes the session in its own worktree, with the tools it was launched with.'
               : 'No provider session was ever recorded for this run.'}
         </span>
         <button

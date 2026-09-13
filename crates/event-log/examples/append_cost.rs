@@ -13,7 +13,7 @@
 use std::time::Instant;
 
 use agent_protocol::{Event, RawEvent, RunId, TurnStarted, SCHEMA_VERSION};
-use event_log::{EventLog, Run, RunStatus};
+use event_log::{EventLog, LaunchFlags, Run, RunStatus};
 
 fn main() {
     let dir = match std::env::args().nth(1) {
@@ -57,6 +57,7 @@ fn main() {
                 shadow_ref: None,
                 prompt: None,
                 model: None,
+                launch_flags: LaunchFlags::default(),
                 status: RunStatus::Running,
                 started_at: "2026-09-12T00:00:00.000Z".to_owned(),
                 finished_at: None,

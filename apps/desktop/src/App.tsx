@@ -108,19 +108,6 @@ export default function App() {
   const [starting, setStarting] = useState(false)
   /** A child that has just been forked, until the canvas has landed on it. */
   const [arriving, setArriving] = useState<RunId | null>(null)
-  /**
-   * What this session launched each run with.
-   *
-   * The `runs` row stores what a run *is*, and of what it was *launched with*
-   * only the model (schema V3). A fork therefore cannot inherit its parent's
-   * allowed tools through the log, and storing them to make it possible would
-   * be storing a launch flag to avoid passing one. So the shell remembers what
-   * it asked for — for this session, which is exactly as long as the runs it
-   * can fork from are supervised — and a run started before this window opened
-   * forks with nothing pre-granted, which the toast says out loud.
-   */
-  const [launched, setLaunched] = useState<Record<RunId, StartRunRequest>>({})
-
   const [leftOpen, setLeftOpen] = useState(true)
   const [rightOpen, setRightOpen] = useState(true)
   const [leftWidth, setLeftWidth] = useState(240)
@@ -349,7 +336,6 @@ export default function App() {
     try {
       const started = await startRun(request)
       setDialogOpen(false)
-      setLaunched((prev) => ({ ...prev, [started.run_id]: request }))
       setSelected(started.run_id)
       refreshRuns()
     } catch (e: unknown) {
@@ -390,9 +376,11 @@ export default function App() {
    * ⌘⇧F: branch the conversation at a block, and the worktree with it.
    *
    * Everything that makes this a fork happens below the window. What the shell
-   * contributes is the two things the log cannot answer — which block (the
-   * user's pointer) and what to launch the child with (what this session
-   * started the parent with) — and then it gets out of the way.
+   * contributes is the one thing the log cannot answer — which block, from the
+   * user's pointer — and then it gets out of the way. It used to contribute a
+   * second thing, an allow-list it had to remember per run because the row did
+   * not store one; schema V4 stores it and `driver::fork` inherits it, so a run
+   * from any session forks with what it was actually launched with.
    *
    * The child is announced to the canvas as `arriving` rather than selected
    * here: selection is what the fork motion *lands* on at ~900ms, and selecting
@@ -400,7 +388,6 @@ export default function App() {
    */
   const fork = useCallback(
     (parent: RunId, seq: number) => {
-      const inherited = launched[parent]
       forkRun({
         parent,
         seq,
@@ -408,30 +395,18 @@ export default function App() {
         // is the user's next turn. Typed into the child's composer, which is
         // where every branch in the prototype begins.
         prompt: 'Continue from here.',
-        // `null` inherits the parent's model, which is what a fork means.
+        // `null` inherits the parent's model, which is what a fork means — and
+        // the same is now true of everything else it was launched with, which
+        // is why nothing else is passed.
         model: null,
-        allowed_tools: inherited?.allowed_tools ?? [],
-        max_turns: inherited?.max_turns ?? null,
-        max_budget_usd: inherited?.max_budget_usd ?? null,
       })
         .then((child) => {
-          if (inherited === undefined) {
-            say(
-              toast(
-                'notice',
-                'Forked with no tools pre-granted',
-                `${parent} was not started by this session, so there is no allow-list to inherit — the branch can think and answer but not edit.`,
-              ),
-            )
-          } else {
-            setLaunched((prev) => ({ ...prev, [child.run_id]: inherited }))
-          }
           setArriving(child.run_id)
           refreshRuns()
         })
         .catch(fail('The fork did not happen'))
     },
-    [launched, refreshRuns, say, fail],
+    [refreshRuns, fail],
   )
 
   /** ⌘⇧F with nothing addressable under the pointer. Said, never rounded off. */

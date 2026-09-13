@@ -10,14 +10,16 @@ import type { RunId } from "./RunId";
  * `--resume-session-at` takes, refusing rather than snapping to a neighbour if
  * that block carries no address.
  *
- * **Why the launch flags are here rather than inherited.** The `runs` row
- * records what a run *is*, and of what it was *launched with* it stores only
- * the model (schema V3) — there is no `allowed_tools` column, and inventing
- * one for this would be storing a launch flag to avoid passing it. So the
- * caller passes what it knows: for a run this session started, what it started
- * it with; for a run from an earlier session, nothing, and a child with no
- * pre-granted tool can still think and answer but cannot edit. That is stated
- * on the surface rather than papered over with a default nobody chose.
+ * **Why the launch flags are not here.** They used to be, and the reason was a
+ * hole in the schema rather than a decision: the `runs` row stored only the
+ * model, so a fork could pre-grant nothing the caller did not pass, and this
+ * struct carried an allow-list the window had to remember for itself — which
+ * it could only do for runs *this session* started. Schema V4 stores what a
+ * run was launched with, `driver::fork` inherits it, and so the fields are
+ * gone rather than left as a second way to say the same thing. A fork inherits
+ * the parent's policy and bounds; the model stays, because
+ * `docs/branching-surface.md` gives the header a model to edit and that is the
+ * one thing a branch is meant to differ in.
  */
 export type ForkRunRequest = { 
 /**
@@ -37,8 +39,4 @@ prompt: string,
  * `None` inherits the parent's, which is what a fork means; naming one is
  * how a branch comes to differ from its parent (`driver::fork`).
  */
-model: string | null, 
-/**
- * Pre-granted tools, as on [`StartRunRequest`]. Anything absent is denied.
- */
-allowed_tools: Array<string>, max_turns: number | null, max_budget_usd: number | null, };
+model: string | null, };

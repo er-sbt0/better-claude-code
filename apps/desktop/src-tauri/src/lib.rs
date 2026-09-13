@@ -97,14 +97,16 @@ pub struct StartRunRequest {
 /// `--resume-session-at` takes, refusing rather than snapping to a neighbour if
 /// that block carries no address.
 ///
-/// **Why the launch flags are here rather than inherited.** The `runs` row
-/// records what a run *is*, and of what it was *launched with* it stores only
-/// the model (schema V3) — there is no `allowed_tools` column, and inventing
-/// one for this would be storing a launch flag to avoid passing it. So the
-/// caller passes what it knows: for a run this session started, what it started
-/// it with; for a run from an earlier session, nothing, and a child with no
-/// pre-granted tool can still think and answer but cannot edit. That is stated
-/// on the surface rather than papered over with a default nobody chose.
+/// **Why the launch flags are not here.** They used to be, and the reason was a
+/// hole in the schema rather than a decision: the `runs` row stored only the
+/// model, so a fork could pre-grant nothing the caller did not pass, and this
+/// struct carried an allow-list the window had to remember for itself — which
+/// it could only do for runs *this session* started. Schema V4 stores what a
+/// run was launched with, `driver::fork` inherits it, and so the fields are
+/// gone rather than left as a second way to say the same thing. A fork inherits
+/// the parent's policy and bounds; the model stays, because
+/// `docs/branching-surface.md` gives the header a model to edit and that is the
+/// one thing a branch is meant to differ in.
 #[derive(Debug, Clone, Deserialize, TS)]
 #[ts(export)]
 pub struct ForkRunRequest {
@@ -119,10 +121,6 @@ pub struct ForkRunRequest {
     /// `None` inherits the parent's, which is what a fork means; naming one is
     /// how a branch comes to differ from its parent (`driver::fork`).
     pub model: Option<String>,
-    /// Pre-granted tools, as on [`StartRunRequest`]. Anything absent is denied.
-    pub allowed_tools: Vec<String>,
-    pub max_turns: Option<u32>,
-    pub max_budget_usd: Option<f64>,
 }
 
 /// Where a started run landed.
@@ -421,15 +419,18 @@ fn fork_run(
     // the first because §13 does not leave a working directory to a caller, the
     // other two because they *are* the fork. The repo path here is a
     // placeholder for that reason; the fork reads the real one off the parent.
+    //
+    // Everything else is left unset, and that is the whole of the change: the
+    // parent's row now carries what it was launched with, so `driver::fork`
+    // fills in the allow-list and the bounds from there rather than from
+    // whatever this window happened to remember. A model is passed only when
+    // the caller named one.
     let mut launch = LaunchSpec::new(
         PathBuf::from(&request.parent.0),
         driver::new_session_id(),
         Permission::DenyPrompts,
     );
     launch.model = request.model;
-    launch.allowed_tools = request.allowed_tools;
-    launch.max_turns = request.max_turns;
-    launch.max_budget_usd = request.max_budget_usd;
 
     let spec = ForkSpec {
         run_id: run_id.clone(),
@@ -497,17 +498,15 @@ fn send_turn(
         .provider_session_id
         .clone()
         .ok_or_else(|| format!("{} has no provider session to resume", run_id.0))?;
-    let mut launch = LaunchSpec::new(
+    // Nothing but the session id: `driver::resume` takes the cwd, the model and
+    // the rest of the launch off the row, which is where schema V4 put them. A
+    // woken run is the run it was, under the policy it was having the
+    // conversation under.
+    let launch = LaunchSpec::new(
         PathBuf::from(run.worktree_path.as_deref().unwrap_or(&run.workspace_path)),
         session_id,
         Permission::DenyPrompts,
     );
-    // The model is on the row, so a resumed run is the same model it was. The
-    // allow-list is not: the row stores no launch flags beyond the model, so a
-    // resumed run pre-grants nothing and is refused whatever it is not given —
-    // the same gap `fork_run` has, and the same one a launch-flags column would
-    // close for both.
-    launch.model = run.model.clone();
 
     state
         .runs

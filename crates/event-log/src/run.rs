@@ -33,6 +33,11 @@ pub struct Run {
     /// per-run and a later surface can change one branch's without touching
     /// what the parent was launched with.
     pub model: Option<String>,
+    /// The rest of what the run was launched with, so a fork or a resume can
+    /// restore it (`schema.rs`, V4). Empty for a run recorded before the
+    /// column existed, and for one launched with nothing — the same state,
+    /// deliberately.
+    pub launch_flags: LaunchFlags,
     pub status: RunStatus,
     pub started_at: String,
     pub finished_at: Option<String>,
@@ -81,6 +86,106 @@ impl Run {
                 branch_point_seq: self.branch_point_seq,
             }),
         }
+    }
+}
+
+/// What a run was launched with, beyond [`Run::model`]: the policy it runs
+/// under and the bounds it runs inside.
+///
+/// **Why this is stored at all.** §8's rule is that anything recomputable from
+/// the log is a projection and must not be the source of truth. None of this is
+/// recomputable: the log records what the agent *did*, never what it was
+/// *permitted* to do, and a denial reaches the log as a refused tool call with
+/// no statement of the allow-list it failed. So this is the same exception
+/// [`Run::branch_point_seq`] is — written once, at launch, or lost — and the
+/// consequence of losing it is concrete: a fork or a resume that pre-grants
+/// nothing is refused whatever its parent had, under §12's `DenyPrompts`
+/// posture where nothing may prompt and anything not pre-granted is denied
+/// outright. The agent then works around it silently.
+///
+/// **Why one column of JSON rather than seven columns.** §14 keeps `runs`
+/// deliberately thin, and the cost of a column here is not the column: every
+/// query in `log.rs` names the whole column list and `row_to_run` reads it
+/// back *positionally*, so each new column is an edit in five places and a
+/// mis-ordering hazard the V2→V3 migration test exists to catch. That is the
+/// price of a column that is *queried*, and none of these ever will be — nobody
+/// asks the log for "runs with `Edit` pre-granted". This is one opaque value
+/// read and written whole, which is what `raw_events.payload` already is and
+/// for the same reason.
+///
+/// **The blob is a wire format, and this is how it survives the struct
+/// changing.** `#[serde(default)]` on the container, not on each field: a field
+/// added later is absent from every blob already on disk and decodes to its
+/// default without a line of migration, and there is one attribute to not
+/// forget rather than one per field. A field *removed* later is ignored on
+/// read, which serde does by default. There is deliberately no version tag —
+/// a tag is only worth its weight when a reader has to branch on it, and a
+/// defaulted field is the same migration that a version bump would have had to
+/// spell out anyway.
+///
+/// **What is not here, and why.** The excluded half of `driver::LaunchSpec` is
+/// not an oversight; each field is excluded for a reason of its own:
+///
+/// - **`model`** is already [`Run::model`] (V3). Storing it twice is the one
+///   thing §8 forbids more firmly than storing a projection.
+/// - **`binary`** is a property of *this machine*. A run resumed next year
+///   against a path that no longer exists is worse than one resumed against
+///   whatever `claude` is now.
+/// - **`cwd`** is [`Run::worktree_path`], and §13 overwrites it at every launch
+///   anyway: the agent's working directory is the tree its run owns, and that is
+///   not a caller's to choose.
+/// - **`session_id`** is [`Run::provider_session_id`] (§14: we assign it).
+/// - **`resume` and `fork_at`** are not properties of the run — they *are* the
+///   resume and the fork, computed by the driver from the row and the branch
+///   point.
+/// - **`mcp_config`** names a socket this process created; it dies with the
+///   process that made it.
+/// - **`permission`** records which of §12's postures *this process* arranged,
+///   and `driver::wire_workspace_mcp` overwrites it at every launch depending
+///   on whether a workspace MCP server is hosted. Storing it would file one
+///   session's hosting arrangement as a fact about the run.
+/// - **`thinking` and `partial_messages`** are how the watcher watches, not what
+///   the run may do. Neither changes what the agent is permitted or how far it
+///   goes, and both are already whatever the driver defaults them to unless a
+///   caller opts out — so inheriting them would mostly be inheriting a default.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[serde(default)]
+#[ts(export)]
+pub struct LaunchFlags {
+    /// Pre-granted tools. Under `DenyPrompts` this is the whole of what the run
+    /// may do, which is why losing it is the bug this record exists to fix.
+    pub allowed_tools: Vec<String>,
+    pub disallowed_tools: Vec<String>,
+    pub permission_mode: Option<String>,
+    #[ts(type = "number | null")]
+    pub max_turns: Option<u32>,
+    pub max_budget_usd: Option<f64>,
+    /// §6: a tool the agent is never told about is a tool it never calls, so
+    /// this is instruction rather than observation — what the run may do, said
+    /// in prose.
+    ///
+    /// Recorded as the *caller* set it, before the driver appends the workspace
+    /// MCP server's own paragraph to it. Storing the appended value would
+    /// append it a second time on every resume.
+    pub append_system_prompt: Option<String>,
+    /// `LaunchSpec::extra`, verbatim.
+    ///
+    /// Kept even though we have no opinion about what is in it, and *because*
+    /// we have none: a flag this struct cannot classify is a flag we cannot
+    /// argue is safe to drop, and dropping it silently is the same class of bug
+    /// as dropping the allow-list.
+    pub extra: Vec<String>,
+}
+
+impl LaunchFlags {
+    /// Nothing was recorded — an old row, or a run launched with no flags.
+    ///
+    /// One predicate for both on purpose. A V3-era row *may* have had an
+    /// allow-list that nothing wrote down, and there is no way to recover it;
+    /// pre-granting tools we cannot show were granted would be a guess stored
+    /// as a fact, and the empty reading is the one that fails closed.
+    pub fn is_empty(&self) -> bool {
+        self == &LaunchFlags::default()
     }
 }
 

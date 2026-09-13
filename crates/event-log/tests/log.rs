@@ -14,7 +14,7 @@ use agent_protocol::{
     ToolUseId, TurnFinished, TurnStarted, Unclassified, UnclassifiedReason, Usage, UserMessage,
     SCHEMA_VERSION,
 };
-use event_log::{Activity, Appended, Error, EventLog, Run, RunStatus};
+use event_log::{Activity, Appended, Error, EventLog, LaunchFlags, Run, RunStatus};
 use normalizer::{ClaudeCodeNormalizer, FixedClock};
 
 fn fixture_dir() -> PathBuf {
@@ -46,6 +46,7 @@ fn run_row(id: &str) -> Run {
         shadow_ref: Some(format!("refs/agent-workspace/runs/{id}")),
         prompt: Some("add refresh-token support".to_owned()),
         model: Some("claude-sonnet-5".to_owned()),
+        launch_flags: LaunchFlags::default(),
         status: RunStatus::Running,
         started_at: "2026-09-12T14:22:00.000Z".to_owned(),
         finished_at: None,
@@ -1415,6 +1416,179 @@ fn an_append_waits_out_another_connections_write_instead_of_failing() {
         .unwrap()
         .expect("the append should have waited for the lock, not failed");
     assert_eq!(a.events(&RunId::from("r")).unwrap().len(), 1);
+}
+
+/// The V4 column lands on a database written by the build before it, too.
+///
+/// The V1 fixture above is frozen and stays frozen; V3 is that schema plus the
+/// two `ALTER`s V2 and V3 shipped, which is the only honest way to build "what
+/// the previous release left on disk" without freezing a copy of the whole
+/// thing per version. Every other test in this file opens a fresh file, which
+/// runs every migration in order and exercises the upgrade path not at all —
+/// and the upgrade is the one that runs on a user's existing log.
+#[test]
+fn an_existing_v3_database_migrates_and_keeps_its_runs() {
+    use rusqlite::Connection;
+
+    let dir = tempdir();
+    let path = dir.join("log.sqlite");
+
+    {
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(V1_AS_SHIPPED).unwrap();
+        old.execute_batch("ALTER TABLE runs ADD COLUMN branch_point_seq INTEGER;")
+            .unwrap();
+        old.execute_batch("ALTER TABLE runs ADD COLUMN model TEXT;")
+            .unwrap();
+        old.pragma_update(None, "user_version", 3u32).unwrap();
+        old.execute(
+            "INSERT INTO runs (id, agent, workspace_path, branch, model, status, started_at)
+             VALUES ('before', 'claude-code', '/home/u/my-app', 'feat/oauth',
+                     'claude-opus-4-6', 'finished', '2026-09-12T14:22:00.000Z')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            old.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name = 'launch_flags'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0,
+            "the fixture is only meaningful if the old schema lacks the column"
+        );
+    }
+
+    let mut log = EventLog::open(&path).unwrap();
+
+    let before = log.run(&RunId::from("before")).unwrap().expect("kept");
+    assert_eq!(before.status, RunStatus::Finished);
+    assert_eq!(
+        before.model.as_deref(),
+        Some("claude-opus-4-6"),
+        "V3's column survives V4's ALTER"
+    );
+    assert!(
+        before.launch_flags.is_empty(),
+        "a run recorded before the column existed stores no flags, and that reads \
+         back as the same empty value a run launched with none does — there is \
+         nothing to tell them apart with, and inventing an allow-list for it \
+         would pre-grant tools nobody can show were granted"
+    );
+
+    // The migrated database is the same database a fresh one would have been:
+    // flags written after the upgrade round-trip.
+    let flags = LaunchFlags {
+        allowed_tools: vec!["Read".to_owned(), "Edit".to_owned()],
+        disallowed_tools: vec!["Bash".to_owned()],
+        permission_mode: Some("acceptEdits".to_owned()),
+        max_turns: Some(7),
+        max_budget_usd: Some(2.5),
+        append_system_prompt: Some("be terse".to_owned()),
+        extra: vec!["--some-flag".to_owned()],
+    };
+    log.create_run(&Run {
+        launch_flags: flags.clone(),
+        ..run_row("after")
+    })
+    .unwrap();
+    assert_eq!(
+        log.run(&RunId::from("after"))
+            .unwrap()
+            .unwrap()
+            .launch_flags,
+        flags
+    );
+
+    // And the rest of the row still reads back. This ALTER lands in the middle
+    // of the column list every query names and shifts every index after it in
+    // `row_to_run`, so a mis-ordered `SELECT` shows up here as a status or a
+    // timestamp in the wrong field — which is what the V3 test caught for the
+    // column before this one.
+    let after = log.run(&RunId::from("after")).unwrap().unwrap();
+    assert_eq!(after.status, RunStatus::Running);
+    assert_eq!(after.started_at, "2026-09-12T14:22:00.000Z");
+    assert_eq!(after.branch.as_deref(), Some("feat/oauth"));
+    assert_eq!(after.model.as_deref(), Some("claude-sonnet-5"));
+    assert_eq!(
+        log.recent_runs(10).unwrap().len(),
+        2,
+        "the list query names the same columns and must have moved with it"
+    );
+
+    log.append(&ev(
+        "after",
+        1,
+        None,
+        Event::TurnStarted(TurnStarted { index: 0 }),
+    ))
+    .unwrap();
+    assert_eq!(log.events(&RunId::from("after")).unwrap().len(), 1);
+
+    drop(log);
+    let reopened = EventLog::open(&path).unwrap();
+    assert!(reopened.run(&RunId::from("after")).unwrap().is_some());
+}
+
+/// A blob written by an older build decodes, and so does one written by a newer.
+///
+/// This is the price of choosing one JSON column over seven columns, and the
+/// reason `LaunchFlags` carries `#[serde(default)]` on the container rather than
+/// a version tag: a field this build does not know about is dropped, and a field
+/// it knows and the blob lacks takes its default. Both directions are the
+/// migration, written once, and neither needs a reader that branches on a
+/// version.
+#[test]
+fn a_launch_flags_blob_survives_the_struct_changing_in_either_direction() {
+    use rusqlite::Connection;
+
+    let dir = tempdir();
+    let path = dir.join("log.sqlite");
+    {
+        let mut log = EventLog::open(&path).unwrap();
+        log.create_run(&run_row("r")).unwrap();
+    }
+    let write = |json: &str| {
+        let c = Connection::open(&path).unwrap();
+        c.execute("UPDATE runs SET launch_flags = ?1 WHERE id = 'r'", [json])
+            .unwrap();
+    };
+
+    // An older build's blob: written before `extra` existed.
+    write(r#"{"allowed_tools":["Read"],"max_turns":3}"#);
+    let row = EventLog::open(&path)
+        .unwrap()
+        .run(&RunId::from("r"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.launch_flags.allowed_tools, vec!["Read".to_owned()]);
+    assert_eq!(row.launch_flags.max_turns, Some(3));
+    assert!(row.launch_flags.extra.is_empty());
+
+    // A newer build's: a field this one has never heard of.
+    write(r#"{"allowed_tools":["Edit"],"sandbox_profile":"strict"}"#);
+    let row = EventLog::open(&path)
+        .unwrap()
+        .run(&RunId::from("r"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.launch_flags.allowed_tools,
+        vec!["Edit".to_owned()],
+        "the fields this build knows still decode around the one it does not"
+    );
+
+    // An empty object is the same state as NULL, which is the same state as a
+    // run launched with nothing.
+    write("{}");
+    assert!(EventLog::open(&path)
+        .unwrap()
+        .run(&RunId::from("r"))
+        .unwrap()
+        .unwrap()
+        .launch_flags
+        .is_empty());
 }
 
 fn tempdir() -> PathBuf {

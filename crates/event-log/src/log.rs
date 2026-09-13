@@ -17,7 +17,9 @@ fn from_i64(seq: i64) -> u64 {
 }
 
 use crate::error::{Error, Result};
-use crate::run::{Activity, ForkBlock, ForkPoints, Run, RunActivity, RunMetrics, RunStatus};
+use crate::run::{
+    Activity, ForkBlock, ForkPoints, LaunchFlags, Run, RunActivity, RunMetrics, RunStatus,
+};
 use crate::schema;
 
 /// What happened to an appended event.
@@ -152,9 +154,9 @@ impl EventLog {
         run.check_fork_pairing()?;
         self.conn.execute(
             "INSERT INTO runs (id, agent, agent_version, provider_session_id, workspace_path,
-                               worktree_path, branch, shadow_ref, prompt, model, status,
-                               started_at, finished_at, parent_run_id, branch_point_seq)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                               worktree_path, branch, shadow_ref, prompt, model, launch_flags,
+                               status, started_at, finished_at, parent_run_id, branch_point_seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 run.id.0,
                 run.agent,
@@ -166,6 +168,7 @@ impl EventLog {
                 run.shadow_ref,
                 run.prompt,
                 run.model,
+                encode_launch_flags(&run.launch_flags)?,
                 run.status.as_str(),
                 run.started_at,
                 run.finished_at,
@@ -180,8 +183,8 @@ impl EventLog {
         self.conn
             .query_row(
                 "SELECT id, agent, agent_version, provider_session_id, workspace_path,
-                        worktree_path, branch, shadow_ref, prompt, model, status,
-                        started_at, finished_at, parent_run_id, branch_point_seq
+                        worktree_path, branch, shadow_ref, prompt, model, launch_flags,
+                        status, started_at, finished_at, parent_run_id, branch_point_seq
                  FROM runs WHERE id = ?1",
                 params![id.0],
                 row_to_run,
@@ -223,8 +226,8 @@ impl EventLog {
     pub fn running_runs(&self) -> Result<Vec<Run>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, agent, agent_version, provider_session_id, workspace_path,
-                    worktree_path, branch, shadow_ref, prompt, model, status,
-                    started_at, finished_at, parent_run_id, branch_point_seq
+                    worktree_path, branch, shadow_ref, prompt, model, launch_flags,
+                    status, started_at, finished_at, parent_run_id, branch_point_seq
              FROM runs WHERE status = 'running' ORDER BY started_at",
         )?;
         let rows = stmt.query_map([], row_to_run)?;
@@ -247,8 +250,8 @@ impl EventLog {
     pub fn recent_runs(&self, limit: u32) -> Result<Vec<Run>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, agent, agent_version, provider_session_id, workspace_path,
-                    worktree_path, branch, shadow_ref, prompt, model, status,
-                    started_at, finished_at, parent_run_id, branch_point_seq
+                    worktree_path, branch, shadow_ref, prompt, model, launch_flags,
+                    status, started_at, finished_at, parent_run_id, branch_point_seq
              FROM runs ORDER BY started_at DESC, id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], row_to_run)?;
@@ -706,22 +709,49 @@ fn row_to_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         shadow_ref: r.get(7)?,
         prompt: r.get(8)?,
         model: r.get(9)?,
+        // NULL is a row written before V4, and it decodes to the same empty
+        // value a run launched with no flags does — deliberately, since there
+        // is nothing to tell them apart with and empty is the reading that
+        // fails closed (`LaunchFlags::is_empty`).
+        launch_flags: match r.get::<_, Option<String>>(10)? {
+            Some(json) => serde_json::from_str(&json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    10,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?,
+            None => LaunchFlags::default(),
+        },
         // A status we do not recognize is a database written by a newer build.
         // Guessing at it would quietly relabel someone's run; refusing to read
         // the row says so.
         status: {
-            let raw: String = r.get(10)?;
+            let raw: String = r.get(11)?;
             RunStatus::parse(&raw).ok_or_else(|| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    10,
+                    11,
                     rusqlite::types::Type::Text,
                     Box::new(crate::Error::UnknownRunStatus(raw)),
                 )
             })?
         },
-        started_at: r.get(11)?,
-        finished_at: r.get(12)?,
-        parent_run_id: r.get::<_, Option<String>>(13)?.map(RunId),
-        branch_point_seq: r.get::<_, Option<i64>>(14)?.map(from_i64),
+        started_at: r.get(12)?,
+        finished_at: r.get(13)?,
+        parent_run_id: r.get::<_, Option<String>>(14)?.map(RunId),
+        branch_point_seq: r.get::<_, Option<i64>>(15)?.map(from_i64),
     })
+}
+
+/// Empty flags are stored as NULL rather than as `{}`.
+///
+/// So that "nothing was recorded" looks the same on disk as "nothing was
+/// launched with", which is the reading `row_to_run` gives them anyway — and so
+/// that a log full of ordinary runs does not carry a JSON object per row saying
+/// nothing.
+fn encode_launch_flags(flags: &LaunchFlags) -> Result<Option<String>> {
+    if flags.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_string(flags)?))
 }

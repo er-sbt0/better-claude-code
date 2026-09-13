@@ -450,6 +450,7 @@ fn run(id: &RunId) -> event_log::Run {
         shadow_ref: None,
         prompt: None,
         model: None,
+        launch_flags: event_log::LaunchFlags::default(),
         status: event_log::RunStatus::Running,
         started_at: "2026-09-13T14:00:00Z".to_owned(),
         finished_at: None,

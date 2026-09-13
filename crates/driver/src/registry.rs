@@ -256,8 +256,14 @@ impl Registry {
     ///
     /// The run row is the input rather than a spec, because everything this
     /// needs was written down when the run was created: its worktree, its
-    /// shadow ref, its branch, and the provider session to resume. A caller
-    /// that had to reconstruct those would be guessing at three of them.
+    /// shadow ref, its branch, the provider session to resume, and — since
+    /// schema V4 — what the run was launched with. A caller that had to
+    /// reconstruct those would be guessing at all of them, and for a while it
+    /// did: the allow-list was not on the row, so a resumed run pre-granted
+    /// nothing and was denied outright whatever it was not handed again. `launch`
+    /// is now a bare [`LaunchSpec`](crate::LaunchSpec) unless the caller means
+    /// to change something; [`resume`](crate::resume) fills in the rest from
+    /// `run`.
     ///
     /// Refuses a run with no provider session id — there is nothing to resume,
     /// and starting a fresh session under an old run's row would silently
