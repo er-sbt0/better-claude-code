@@ -42,9 +42,14 @@ pub enum Error {
 
     /// A fork anchored at a block that has no provider address.
     ///
-    /// Not every block has one: out-of-band events carry no key, and the user's
-    /// own prompt entries never reach stdout. Refused rather than rounded to a
-    /// neighbouring block that does have one — see [`crate::ForkPoint::resolve`].
+    /// Not every block has one, and there are two ways to lack one. Out-of-band
+    /// events carry no key at all. And a block can be **keyed and still
+    /// unaddressable**: the normalizer keys every uuid-bearing stdout line, but
+    /// only the events off an `assistant` or `user` line are chain entries the
+    /// provider will resolve (`normalizer::claude_code::is_addressable`,
+    /// `docs/verification/claude-code-fork-anchor-types.md`). Either way this is
+    /// refused rather than rounded to a neighbouring block that does have one —
+    /// see [`crate::ForkPoint::resolve`].
     #[error(
         "the {event} at run {run} seq {seq} has no chain-entry uuid, so it cannot be \
          a branch point"

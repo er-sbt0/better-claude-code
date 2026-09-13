@@ -926,12 +926,15 @@ fn the_message_count_counts_messages() {
 ///
 /// The rule is `normalizer::claude_code::fork_address` and this is the
 /// projection over it: the hover toolbar appears on a block if and only if the
-/// block is in this answer. Three things it has to get right, and all three are
+/// block is in this answer. Four things it has to get right, and all four are
 /// live findings rather than opinions
-/// (`docs/verification/claude-code-fork-address.md`):
+/// (`docs/verification/claude-code-fork-address.md`,
+/// `docs/verification/claude-code-fork-anchor-types.md`):
 /// a fanned-out `{uuid}#{i}` block is still forkable at its bare uuid, an event
-/// with no key is not forkable at all and must not round to a neighbour, and
-/// the inherited message count is the count *at* the block.
+/// with no key is not forkable at all and must not round to a neighbour, a
+/// **keyed** block whose event did not come off an `assistant` or `user` line
+/// is not forkable either, and the inherited message count is the count *at*
+/// the block.
 #[test]
 fn fork_points_are_the_blocks_that_carry_a_provider_address() {
     let mut log = open_with_run("branchy");
@@ -961,7 +964,38 @@ fn fork_points_are_the_blocks_that_carry_a_provider_address() {
                 input: serde_json::json!({}),
             }),
         ),
-        ev("branchy", 5, Some("u2"), assistant("msg_02", 0)),
+        // Keyed, and refused by the provider. The normalizer keys every
+        // uuid-bearing stdout line, so a `system`/`hook_started` line arrives
+        // here with an address-shaped key that resolves nowhere — which is the
+        // counter-example the built surface found on its first day.
+        ev(
+            "branchy",
+            5,
+            Some("u2"),
+            Event::Unclassified(Unclassified {
+                source_type: Some("system".to_owned()),
+                source_subtype: Some("hook_started".to_owned()),
+                reason: UnclassifiedReason::NotModeled,
+                line: "{}".to_owned(),
+            }),
+        ),
+        // Keyed and refused for the same reason: `result` lines carry uuids
+        // that are not chain entries, on both of their subtypes.
+        ev(
+            "branchy",
+            6,
+            Some("u3"),
+            Event::TurnFinished(TurnFinished {
+                index: 0,
+                subtype: "success".to_owned(),
+                ok: true,
+                usage: Usage::from_models(0.0, Vec::new()),
+                duration_ms: None,
+                text: None,
+                permission_denials: 0,
+            }),
+        ),
+        ev("branchy", 7, Some("u4"), assistant("msg_02", 0)),
     ])
     .unwrap();
 
@@ -970,9 +1004,10 @@ fn fork_points_are_the_blocks_that_carry_a_provider_address() {
     let blocks = &points[0].blocks;
     assert_eq!(
         blocks.iter().map(|b| b.seq).collect::<Vec<_>>(),
-        vec![2, 3, 5],
-        "every keyed block is forkable, and nothing else is — the unkeyed \
-         prompt and permission request must not round to a neighbour"
+        vec![2, 3, 7],
+        "a keyed block off a message line is forkable and nothing else is — \
+         neither the unkeyed prompt and permission request nor the keyed hook \
+         and result lines, and none of them may round to a neighbour"
     );
     assert_eq!(
         blocks

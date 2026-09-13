@@ -9,6 +9,14 @@ Verified: 2026-09-13 · Claude Code 2.1.270 · claude-sonnet-5 · Ubuntu, x86-64
 Method: an executable spike, docs/verification/fork-address-spike.sh, which
         asserts rather than prints and exits non-zero on failure. Eight live
         runs in a throwaway git sandbox, $0.074 total.
+
+Superseded in part, 2026-09-13, by claude-code-fork-anchor-types.md. Every
+observation here stands; one generalisation drawn from them does not. "Every
+keyed block is forkable" was inferred from a text-only trunk whose only keyed
+message lines were `assistant` ones, and it is false: the provider keys all
+twelve of its type/subtype combinations and refuses a fork at nine of the fifteen
+kinds. The corrections are marked below where they occur, and nothing is deleted
+— the wrong generalisation is the one that will be re-proposed.
 -->
 
 # The fork address — is the stdout `uuid` the thing the flag takes?
@@ -165,6 +173,16 @@ A future surface that wanted to fork at "just before I asked that" would be
 addressing an entry we have no key for, and would be back to reading provider
 files.
 
+> **Corrected.** Both halves of that are wrong, and
+> `claude-code-fork-anchor-types.md` measured how. *Every keyed block is
+> forkable* is false — a `system`/`hook_started` line carries a uuid, is keyed
+> here, and the provider refuses a fork at it; only `assistant` and `user` lines
+> resolve. And "just before I asked that" is reachable after all: the driver
+> passes `--replay-user-messages`, under which the user's own prompt **does**
+> reach stdout with a uuid of its own, and forking at it works. The paragraph
+> above is true of a `-p` run, which is what this spike used and not what the
+> product does.
+
 Unchecked, and deliberately: whether a `user` line that *does* reach stdout —
 a tool result — carries a uuid the flag accepts. The trunk here was text-only on
 purpose, to keep the truncation signal clean. Tool-bearing runs are already a
@@ -172,9 +190,9 @@ separate debt (a fork of a run that edited files), and this belongs with it.
 
 ## What this does not prove
 
-- **Tool-bearing conversations.** Text-only trunk, three turns. A fork anchored
-  at an assistant message that requested a tool, with the `user` tool-result
-  entry after it, is untested — and that is the common case in real work.
+- ~~**Tool-bearing conversations.**~~ Closed by
+  `claude-code-fork-anchor-types.md`: both halves of a tool call are addressable,
+  and a fork anchored mid-tool-call resumes with the prefix and not the suffix.
 - **Long transcripts.** Three assistant entries. Nothing here says the provider
   resolves an address in a conversation with hundreds.
 - **Concurrency.** Still. Every run in this spike was sequential, same as the

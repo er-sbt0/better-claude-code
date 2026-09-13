@@ -238,19 +238,87 @@ fn an_address_is_the_part_before_the_hash_and_may_not_exist() {
     use normalizer::claude_code::fork_address;
 
     let bare = "93e6a054-0e51-4425-a90b-b46f7e28dc1c";
-    assert_eq!(fork_address(Some(bare)), Some(bare));
+    assert_eq!(fork_address("assistant.message", Some(bare)), Some(bare));
     assert_eq!(
-        fork_address(Some(&format!("{bare}#0"))),
+        fork_address("assistant.message", Some(&format!("{bare}#0"))),
         Some(bare),
         "one provider line fanned into several events is still one chain entry"
     );
-    assert_eq!(fork_address(Some(&format!("{bare}#11"))), Some(bare));
+    assert_eq!(
+        fork_address("assistant.message", Some(&format!("{bare}#11"))),
+        Some(bare)
+    );
 
     // No key means no address, and nothing else. Not the run's first block, not
     // the nearest keyed neighbour: `branching-surface.md` rejected snapping.
-    assert_eq!(fork_address(None), None);
-    assert_eq!(fork_address(Some("")), None);
-    assert_eq!(fork_address(Some("#0")), None);
+    assert_eq!(fork_address("assistant.message", None), None);
+    assert_eq!(fork_address("assistant.message", Some("")), None);
+    assert_eq!(fork_address("assistant.message", Some("#0")), None);
+}
+
+/// A key is necessary and **not sufficient**: the event type decides.
+///
+/// Bought live in `claude-code-fork-anchor-types.md`, which anchored a fork at
+/// one uuid of every `type`/`subtype` combination the provider emits. Only the
+/// events that come off an `assistant` or `user` line resolve; a
+/// `system`/`hook_started` line carries a uuid, is therefore keyed, and is
+/// refused by the provider — which is exactly what the built surface tripped
+/// over before this rule existed.
+#[test]
+fn a_key_is_not_an_address_unless_the_event_came_off_a_message_line() {
+    use normalizer::claude_code::{fork_address, is_addressable};
+
+    let bare = "93e6a054-0e51-4425-a90b-b46f7e28dc1c";
+
+    // Accepted, live, one anchor each. `tool.started` and `tool.completed` are
+    // the two halves of a tool call and are the case the address spike left
+    // explicitly unproven.
+    for ty in [
+        "assistant.message",
+        "assistant.thinking",
+        "tool.started",
+        "workspace.report",
+        "user.message",
+        "tool.completed",
+    ] {
+        assert!(is_addressable(ty), "{ty} is a chain entry and resolves");
+        assert_eq!(fork_address(ty, Some(bare)), Some(bare), "{ty}");
+    }
+
+    // Refused, live, by name — and every one of them is keyed, which is why
+    // stripping the `#` was never enough on its own.
+    for ty in [
+        "run.started",         // system/init
+        "turn.started",        // system/init, on a later turn
+        "turn.finished",       // result/success and result/error_max_turns alike
+        "run.rate_limited",    // rate_limit_event
+        "permission.resolved", // system/permission_denied
+        "raw.unclassified",    // system/hook_started, hook_response, status
+    ] {
+        assert!(
+            !is_addressable(ty),
+            "{ty} is keyed but the provider refuses it"
+        );
+        assert_eq!(
+            fork_address(ty, Some(bare)),
+            None,
+            "{ty} must not offer an address it cannot honour"
+        );
+    }
+
+    // Never on stdout, so never keyed — stated rather than left to fall out.
+    for ty in [
+        "permission.requested",
+        "run.finished",
+        "run.failed",
+        "process.output",
+    ] {
+        assert!(!is_addressable(ty));
+    }
+
+    // A vocabulary we have not met fails closed.
+    assert!(!is_addressable("something.new"));
+    assert_eq!(fork_address("something.new", Some(bare)), None);
 }
 
 /// The whole spine: worktree, shadow root, run row, spawn, stream, log,

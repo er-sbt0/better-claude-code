@@ -45,16 +45,87 @@ fn is_transient(msg_type: &str, subtype: Option<&str>) -> bool {
     }
 }
 
+/// Whether an event of this type can be a branch point at all.
+///
+/// **Not every keyed block is forkable.** The normalizer keys every
+/// uuid-bearing stdout line, and the provider puts a `uuid` on all twelve of
+/// its `type`/`subtype` combinations — but only the ones that are *chain
+/// entries* resolve. `docs/verification/claude-code-fork-anchor-types.md`
+/// anchored a live fork at one uuid of every combination and read the answer
+/// off the result `subtype`:
+///
+/// | provider line | accepted | our event types |
+/// |---|---|---|
+/// | `assistant` (`text`, `thinking`, `tool_use`) | **yes** | `assistant.message`, `assistant.thinking`, `tool.started`, `workspace.report` |
+/// | `user` (`text`, `tool_result`) | **yes** | `user.message`, `tool.completed` |
+/// | `system/init` | no | `run.started`, `turn.started` |
+/// | `system/permission_denied` | no | `permission.resolved` |
+/// | `system/hook_started`, `hook_response`, `status`, `thinking_tokens` | no | `raw.unclassified` (or dropped as transient) |
+/// | `result/success`, `result/error_max_turns` | no | `turn.finished` |
+/// | `rate_limit_event` | no | `run.rate_limited` |
+/// | `stream_event` | no | dropped as transient |
+///
+/// Acceptance turned out to be a function of the provider's `type` alone —
+/// both `result` subtypes behaved identically, as did all four `system` ones —
+/// which is why this is a list of *our* event types rather than a pair lookup:
+/// every arm of the match above maps back to exactly one provider `type`.
+///
+/// Two arms are deliberate rather than measured, and both fail closed:
+///
+/// - **`raw.unclassified` is not addressable**, even though it is *usually*
+///   keyed. Every unclassified event the spike produced came from a `system`
+///   line and every one was refused. It can also come from an `assistant` or
+///   `user` line whose content block the normalizer could not read — a
+///   normalizer bug — and such a block would in principle resolve. Offering
+///   nothing there costs a fork point nobody can reach today; offering a
+///   toolbar that fails costs a user a gesture. The cheaper mistake wins, and
+///   the payload keeps `source_type` if this ever needs to be split.
+/// - **Out-of-band events** (`permission.requested`, `run.finished`,
+///   `run.failed`, `process.output`) are listed as unaddressable rather than
+///   left to fall out of having no key. They never reach stdout, so they never
+///   have one — but saying so here means the rule reads as a statement about
+///   the vocabulary rather than as an accident of `wrap_external`.
+///
+/// A second agent will need its own table. This one is named for Claude Code
+/// and lives in Claude Code's module, per §5's "no trait until the second
+/// adapter".
+pub fn is_addressable(event_type: &str) -> bool {
+    match event_type {
+        // Provider `assistant` lines: proved accepted at all three content
+        // block kinds, including a `tool_use` block mid-call.
+        "assistant.message" | "assistant.thinking" | "tool.started" | "workspace.report" => true,
+        // Provider `user` lines: proved accepted at a `tool_result` block and
+        // at the prompt echoed back by `--replay-user-messages`, which the
+        // driver passes on every run.
+        "user.message" | "tool.completed" => true,
+        // Keyed and refused, every one of them, by name.
+        "run.started"
+        | "turn.started"
+        | "turn.finished"
+        | "run.rate_limited"
+        | "permission.resolved"
+        | "raw.unclassified" => false,
+        // Never on stdout, so never keyed either.
+        "permission.requested" | "run.finished" | "run.failed" | "process.output" => false,
+        // A type this table has not heard of is a vocabulary change, and the
+        // safe answer to "can this be forked" is no: an unoffered fork is a
+        // missing affordance, an offered one that cannot work is a broken
+        // promise. `Health` (§16) is where an unexpected type shows up.
+        _ => false,
+    }
+}
+
 /// The provider address of a stored block: the chain-entry uuid
 /// `--resume-session-at` accepts, or `None` if the block has none.
 ///
-/// The argument is a `raw_events.idempotency_key`, and this function is the
-/// only reader of the format [`ClaudeCodeNormalizer::ingest`] mints a few lines
-/// below — which is why it lives next to it rather than in the driver that
-/// calls it.
+/// The arguments are a `RawEvent::type_name` and a
+/// `raw_events.idempotency_key`, and this function is the only reader of the
+/// format [`ClaudeCodeNormalizer::ingest`] mints a few lines below — which is
+/// why it lives next to it rather than in the driver that calls it.
 ///
-/// Two of its three behaviours were bought with live runs
-/// (`docs/verification/claude-code-fork-address.md`):
+/// Three behaviours, all three bought with live runs
+/// (`docs/verification/claude-code-fork-address.md`,
+/// `docs/verification/claude-code-fork-anchor-types.md`):
 ///
 /// - **The address is the part before the `#`.** One provider line can fan out
 ///   into several events, and those are keyed `{uuid}#{i}` — our suffix, not
@@ -62,13 +133,18 @@ fn is_transient(msg_type: &str, subtype: Option<&str>) -> bool {
 ///   (`No message found with message.uuid of: <uuid>#0`), so passing the key
 ///   through unstripped would burn a live run per fork.
 /// - **`None` means no address, and nothing else.** Out-of-band events carry no
-///   key — `wrap_external` says so — and neither do the user's own prompt
-///   entries, which never reach stdout at all. So *every keyed block is
-///   forkable* is true while *every block is forkable* is false, and a caller
-///   has to be able to hear "not this one". It must not round to a neighbour:
-///   the branching surface rejected snapping because the inherited-context
-///   strip states a message count out loud.
-pub fn fork_address(idempotency_key: Option<&str>) -> Option<&str> {
+///   key — `wrap_external` says so. A caller has to be able to hear "not this
+///   one", and must not round to a neighbour: the branching surface rejected
+///   snapping because the inherited-context strip states a message count out
+///   loud.
+/// - **A key is necessary and not sufficient.** [`is_addressable`] is the other
+///   half, and it is the half that was missing: a `system`/`hook_started` line
+///   carries a uuid, so the surface offered a fork at it and the provider
+///   refused. The event type decides; the key only supplies the digits.
+pub fn fork_address<'a>(event_type: &str, idempotency_key: Option<&'a str>) -> Option<&'a str> {
+    if !is_addressable(event_type) {
+        return None;
+    }
     let key = idempotency_key?;
     let uuid = key.split('#').next().unwrap_or("");
     (!uuid.is_empty()).then_some(uuid)

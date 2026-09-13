@@ -157,12 +157,17 @@ impl ForkPoint {
     ///
     /// Fallible on purpose, and in two distinguishable ways: there may be no
     /// event at that `seq`, or the event may have no address. The second is not
-    /// a corner case. Out-of-band events carry no `idempotency_key` at all —
-    /// permission decisions reach us over the MCP channel and `run.finished` is
-    /// made at process exit — and the user's own prompt entries never reach
-    /// stdout either, so they are unaddressable even though they are chain
-    /// entries (`docs/verification/claude-code-fork-address.md`). *Every keyed
-    /// block is forkable* is true; *every block is forkable* is false.
+    /// a corner case, and it has two causes of its own. Out-of-band events carry
+    /// no `idempotency_key` at all — permission decisions reach us over the MCP
+    /// channel and `run.finished` is made at process exit. And an event can be
+    /// keyed and still unaddressable: the provider puts a `uuid` on every line
+    /// it emits, but only the `assistant` and `user` ones are chain entries
+    /// `--resume-session-at` resolves, so `turn.finished`, `run.rate_limited`
+    /// and a hook line's `raw.unclassified` are all keyed and all refused
+    /// (`docs/verification/claude-code-fork-anchor-types.md`). *Every keyed
+    /// block is forkable* was the first phrasing of this and it is **false**;
+    /// the rule is `normalizer::claude_code::fork_address`, which is why this
+    /// hands it the event type as well as the key.
     ///
     /// It does **not** fall back to a nearby block that does have an address.
     /// `branching-surface.md` rejected snapping, and the reason is on the
@@ -184,12 +189,15 @@ impl ForkPoint {
                 seq,
             })?;
 
-        let address = normalizer::claude_code::fork_address(found.idempotency_key.as_deref())
-            .ok_or_else(|| Error::NotAddressable {
-                run: parent.0.clone(),
-                seq,
-                event: found.type_name().to_owned(),
-            })?;
+        let address = normalizer::claude_code::fork_address(
+            found.type_name(),
+            found.idempotency_key.as_deref(),
+        )
+        .ok_or_else(|| Error::NotAddressable {
+            run: parent.0.clone(),
+            seq,
+            event: found.type_name().to_owned(),
+        })?;
 
         Ok(ForkPoint {
             parent: parent.clone(),

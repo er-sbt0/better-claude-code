@@ -21,6 +21,13 @@ Amended again 2026-09-13, on the commit that built the column: the open question
 about the model is closed, and `role` is dropped with it. Argued under "The
 model is a column; `role` is not a thing", which is where the bullet that used
 to sit under "What this does not decide" went.
+
+Amended again 2026-09-13: "a block whose `idempotency_key` is a bare uuid has an
+address" was wrong, and a spike says by how much
+(`docs/verification/claude-code-fork-anchor-types.md`). The sentence is corrected
+in place under "Fork is anchored to a message" and the observation that produced
+it is closed under "What this does not decide". §8's decision table gets a new
+row rather than an edited one.
 -->
 
 # The branching surface — what the run graph actually is
@@ -71,13 +78,19 @@ is protected by ⌘\ rather than by a chevron.
 
 `--resume-session-at` takes a **chain-entry uuid**, not our `seq`. The mapping we
 need therefore already exists, by accident and at no cost:
-`normalizer/src/claude_code.rs:177` lifts the provider's `uuid` off each stdout
+`normalizer/src/claude_code.rs:254` lifts the provider's `uuid` off each stdout
 line and stores it as `raw_events.idempotency_key`. It was put there to make a
 replayed resume deduplicate (§14); it turns out to be the fork address.
 
 Which makes "forkable" a computable property of a block rather than a policy:
 
-- A block whose `idempotency_key` is a bare uuid has an address.
+- A block has an address when it carries a key **and** its event came off a
+  provider `assistant` or `user` line. A key is necessary and not sufficient:
+  the provider puts a `uuid` on all twelve of its `type`/`subtype` combinations
+  and we key every one of them, but only the message lines are chain entries
+  `--resume-session-at` resolves. This sentence used to read "a block whose
+  `idempotency_key` is a bare uuid has an address", which is the thing the
+  built surface tripped over — see below.
 - One provider line can fan out into several events, and those are keyed
   `{uuid}#{i}` — the same chain entry, so the address is the part before the `#`.
 - Out-of-band events have no key at all (`wrap_external`, deliberately: "there is
@@ -125,26 +138,47 @@ now encoded in the driver:
   — and never off having received a result or a session id. The spike's own
   first draft made that mistake.
 
-What it still costs us is smaller, and is about phrasing. The match is exact in
-one direction only: every stdout message uuid is a chain entry, but 31 of that
-trunk's 34 chain entries never reached stdout, and the ones that matter are the
-user's own prompt entries. So **every keyed block is forkable** stays true while
-*every chain entry is keyed* is false — the distinction the hover toolbar above
-is already drawn against. A surface that wanted to fork at "just before I asked
-that" would be addressing an entry we hold no key for, and would be back to
-reading provider files.
+What it still costs us is a sentence, and the sentence was **wrong**. The address
+spike settled on "every keyed block is forkable", reasoning from a text-only
+trunk on which the only keyed message lines were `assistant` ones. The built
+surface produced the counter-example within a day, and a second spike then
+measured it properly
+(`docs/verification/claude-code-fork-anchor-types.md`, twenty-one live runs): a
+fork was anchored at one uuid of **every** combination the provider emits, and
+**only `assistant` and `user` lines resolve**. Nine of the fifteen anchor kinds
+are keyed and refused — `system/init`, all three other `system` subtypes, both
+`result` subtypes, `rate_limit_event` and `stream_event`. Acceptance turned out
+to be a function of the provider's `type` alone, which is why the rule encodes as
+a list of our event types rather than a pair lookup. It lives in
+`normalizer::claude_code::is_addressable`, behind the same
+`fork_address(event_type, key)` both the projection and `ForkPoint::resolve` go
+through.
 
-Three things the spike did not prove, and none of them blocks the fork path:
+That spike also closed the two things this one left open, and both came back
+better than feared:
 
-- **Tool-bearing conversations as anchors.** The trunk was text-only on purpose,
-  to keep the truncation signal clean. Nothing has forked at an assistant
-  message that requested a tool, with the `user` tool-result entry after it —
-  which is what a branch point looks like in real work.
+- **Tool-bearing conversations fork.** An `assistant` line whose content is a
+  `tool_use` block is accepted, and so is the `user` line carrying the matching
+  `tool_result`. A fork anchored *mid-tool-call* resumed and answered, with the
+  prefix and not the suffix.
+- **The replayed user prompt is addressable**, and it is the case that actually
+  ships: the driver always passes `--replay-user-messages`, so a run's
+  `user.message` events are both the user's own prompt echoed back and the text
+  half of a tool result. The address spike's "the user's own prompt entries never
+  reach stdout" was true of a `-p` run and is not true of ours. They reach it,
+  they are keyed, and they fork.
+
+What remains unproven after both spikes, and none of it blocks the fork path:
+
 - **Stability of an address across a long conversation or a compaction.** Three
-  assistant entries, one sitting. Nothing checked that a uuid observed in turn
-  one is still resolvable twenty turns later, in a file the provider owns and
-  rewrites.
-- **Concurrency**, still, and for the fourth time. Every run in the spike was
+  assistant entries in one spike, five turns in the other. Nothing checked that a
+  uuid observed in turn one is still resolvable twenty turns later, in a file the
+  provider owns and rewrites.
+- **Subagent lines.** `parent_tool_use_id` was null on every line of both spikes,
+  as it is in every fixture. Whether an `assistant` line emitted inside a
+  subagent is a chain entry of the parent session is the one case where "came off
+  an `assistant` line" might not be enough.
+- **Concurrency**, still, and for the fifth time. Every run in both spikes was
   sequential.
 
 ## The worktree is forked with the conversation
@@ -308,12 +342,16 @@ ours to make true.
 
 - ~~**Whether the stream `uuid` is the fork address.**~~ Settled: it is, for
   assistant entries included
-  (`docs/verification/claude-code-fork-address.md`). What survives it is
-  narrower. **Tool-bearing conversations as anchors** are untested, and they are
-  the common case; so is **whether an address outlives a long conversation or a
-  compaction**, since the provider owns the file the chain lives in. Neither
-  gates the fork path — both are things that would show up as a fork failing
-  loudly, which the same spike proved is how forks fail.
+  (`docs/verification/claude-code-fork-address.md`). ~~**Tool-bearing
+  conversations as anchors**~~ are settled too, and they work — an `assistant`
+  line carrying a `tool_use` block and the `user` line carrying the matching
+  `tool_result` both resolve
+  (`docs/verification/claude-code-fork-anchor-types.md`). What survives is
+  **whether an address outlives a long conversation or a compaction**, since the
+  provider owns the file the chain lives in, and **whether a line emitted inside
+  a subagent is a chain entry of the parent session**. Neither gates the fork
+  path — both would show up as a fork failing loudly, which the same spikes
+  proved is how forks fail.
 - **Concurrent forks**, still — and the surface has now made the question
   reachable by hand. ⌘⇧F is wired end to end, so two live descendants of one
   trunk are two keystrokes rather than a thought experiment, and the registry
@@ -336,24 +374,24 @@ ours to make true.
   inside each, N live feeds in focus view is still the number to measure, and
   the WebKitGTK item in §2 — already re-priced once for pan/zoom over a DAG —
   is still where it gets paid. Measure before choosing.
-- **Whether every *keyed* block is really forkable.** Recorded as observed
-  rather than decided, because it is the first thing the built surface turned up
-  and it points at a claim above. Two forks of one live run, from the window: at
-  the run's **first** block — a `system` / `hook_started` line, which carries a
-  `uuid`, is therefore keyed, and was therefore offered a toolbar — the provider
-  ran its `SessionStart:fork` hook and then refused with
-  `error_during_execution`, no turns, no cost. At the run's **assistant
-  message** it was accepted, and the branch ran a real turn in its own worktree.
-  So the address resolved in one case and not the other, and *every keyed block
-  is forkable* has a counter-example: the normalizer keys every uuid-bearing
-  stdout line, and the provider's own `system` lines carry uuids that are not
-  transcript chain entries. The spike could not have seen this — its trunk was
-  text-only and it read uuids off `assistant` and `user` messages. Nothing is
-  changed here on one observation: the failure is loud, free and immediate,
-  which is the property the spike bought and it held. What is not yet known is
-  the *rule* — whether "a chain entry" is exactly "a `user` or `assistant`
-  message", or something narrower — and that is a question for a spike rather
-  than for a filter written from one refused fork.
+- ~~**Whether every *keyed* block is really forkable.**~~ It is not, and the
+  rule is now measured rather than guessed. The built surface turned this up on
+  its first day: a fork offered at the run's **first** block — a `system` /
+  `hook_started` line, keyed because the normalizer keys every uuid-bearing
+  stdout line — ran the provider's `SessionStart:fork` hook and then refused with
+  `error_during_execution`, no turns, no cost, while a fork at the run's
+  **assistant message** was accepted and ran a real turn in its own worktree.
+  Nothing was changed on one observation, because the question was the *rule*.
+  The spike that answers it
+  (`docs/verification/claude-code-fork-anchor-types.md`) anchored a live fork at
+  one uuid of every `type`/`subtype` combination the provider emits: **"a chain
+  entry" is exactly "an `assistant` or `user` line"**, both content-block kinds
+  of each, and nothing else — `system/init` included, both `result` subtypes
+  included. It is narrower than the guess in the bullet it replaces, which
+  allowed for "or something narrower" but expected the boundary to sit around
+  message-ness rather than around the provider's `type` field. The filter is
+  `normalizer::claude_code::is_addressable`; the failure mode it removes stays
+  loud for anything that slips past it.
 
 - **What a fork's worktree is prepared with.** `ForkSpec::post_create_hook` was
   left to the caller, and the first caller is the window, which passes `None`.

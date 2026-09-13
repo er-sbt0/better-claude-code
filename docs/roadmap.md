@@ -254,7 +254,7 @@ four that are screens.
 | **Persistence** — SQLite, `runs` + `raw_events` only; projections recomputed on load | §14 | **done** — the whole graph edge is now in the schema: `parent_run_id` plus `branch_point_seq` (migration V2), the only record the graph will ever have, since the provider records no parentage. A root run has neither half and a fork has both; the pairing is enforced in `Run::check_fork_pairing`, not in SQL, so a test reaches it without a database. `driver::fork` writes both halves, and a fork's tree is checked out from the parent's shadow commit at that `seq`. V3 adds `model` — the second thing the log cannot recompute, since what a run was *launched* with is not what the stream reports: `run.started` names one only sometimes and `turn.finished` names what a turn billed. A fork inherits its parent's by copy, so a branch can differ from it. Each migration has a test that an existing database of the previous version keeps its rows |
 | **Workspace MCP server** — `report_finding`, `open_plan`, `record_test_run` | §6 | **done** for `request_permission` + `report_finding`; the other four tools are unbuilt |
 | **Run feed** — six block types plus `Raw`, virtualized, every block carrying `(runId, seqRange)`, **collapse/expand first-class** | §7 | not started — the window's flat event list is bridge scaffolding, not a first draft of this. Second in the slice, built against fork addresses a working fork is already resolving |
-| **The run graph** — the home screen: nodes are runs, edges are `parentRunId` + branch `seq`; generated layout, no drawing library | §10, §19 | **built, against a thin feed** — *the thesis*, and it now answers the gesture it exists for. A node is the conversation column [`branching-surface.md`](branching-surface.md) decided on — 560 wide, header (name · status · message count, then the model), a scrolling body, a composer that sends — and ⌘\ is the same canvas seen the other way: **one camera and one layout pass**, with `sizeOf` answering 560×620 for a column and 560×132 for §10's shape card, so nothing slides sideways under the toggle and the two representations cannot drift apart. ⌘[ / ⌘] walk siblings. ⌘⇧F forks at a message, and only where the provider gave that message an address: forkability is `EventLog::fork_points` over `normalizer::claude_code::fork_address`, never re-derived in TypeScript, and an unaddressable block offers nothing rather than snapping to a neighbour. The fork motion is the record's variant B — the child starts on its parent at `scale(.88)`, peels out over ~900ms while the camera holds both at ≤ .78, and focus lands on the child. The edge leaves the parent at the **measured** y of the forked message, which reaches `layout.ts` through the `sizeOf` seam widened by one function (`anchorOf`) rather than by moving layout into a component. Inherited-context strip, in-parent breadcrumbs and edge slivers are all there. The three-word vocabulary is a projection and not shell logic; the map card adds the run's *outcome* beside it, because attention and outcome are different axes and the map is where branches are compared (§8). Missing: §7's feed inside the body, and inline decision blocks |
+| **The run graph** — the home screen: nodes are runs, edges are `parentRunId` + branch `seq`; generated layout, no drawing library | §10, §19 | **built, against a thin feed** — *the thesis*, and it now answers the gesture it exists for. A node is the conversation column [`branching-surface.md`](branching-surface.md) decided on — 560 wide, header (name · status · message count, then the model), a scrolling body, a composer that sends — and ⌘\ is the same canvas seen the other way: **one camera and one layout pass**, with `sizeOf` answering 560×620 for a column and 560×132 for §10's shape card, so nothing slides sideways under the toggle and the two representations cannot drift apart. ⌘[ / ⌘] walk siblings. ⌘⇧F forks at a message, and only where the provider gave that message an address: forkability is `EventLog::fork_points` over `normalizer::claude_code::fork_address`, never re-derived in TypeScript, and an unaddressable block offers nothing rather than snapping to a neighbour — where "unaddressable" now means *no key, or a key on an event that did not come off an `assistant` or `user` line*, which is nine of the provider's fifteen keyed line kinds (`claude-code-fork-anchor-types.md`). The fork motion is the record's variant B — the child starts on its parent at `scale(.88)`, peels out over ~900ms while the camera holds both at ≤ .78, and focus lands on the child. The edge leaves the parent at the **measured** y of the forked message, which reaches `layout.ts` through the `sizeOf` seam widened by one function (`anchorOf`) rather than by moving layout into a component. Inherited-context strip, in-parent breadcrumbs and edge slivers are all there. The three-word vocabulary is a projection and not shell logic; the map card adds the run's *outcome* beside it, because attention and outcome are different axes and the map is where branches are compared (§8). Missing: §7's feed inside the body, and inline decision blocks |
 | **Review** — the diff surface with reasoning attached to hunks, a branch diffed against its fork point | §13.1 | not started — *the one screen that must be excellent* |
 | **Compare siblings** — two branches off one point, side by side | §19 | not started — last in, first cut if V1 runs long |
 | **Runs list** — a cross-workspace index and launcher, deliberately thin | §10 | not started — demoted from home screen |
@@ -424,7 +424,12 @@ off `subtype` and never off having got a session id. The finding that costs
 something: the match is exact in one direction only. The user's own prompt
 entries never reach stdout, so **every keyed block is forkable** is true while
 *every chain entry is keyed* is false, and forking at a user message would be
-back to reading provider files.
+back to reading provider files. **Both halves of that last sentence were later
+found wrong** — see the anchor-types record below: a keyed `system` line is not
+forkable, and under the driver's own `--replay-user-messages` the user's prompt
+*does* reach stdout and *does* fork. Left standing rather than edited, because
+what a spike concluded from a text-only trunk is the thing the next spike had to
+contradict.
 
 **Also discharged: a fork of a run that already edited files** — §19's pairing of
 the conversation fork with a worktree forked at the same `seq`. Not a live-run
@@ -443,18 +448,44 @@ never commits an unchanged tree — so the rule is the newest snapshot *at or
 before* the `seq`, with a branch point before the parent's first snapshot falling
 out as `seq` 0, the tree as the agent found it.
 
-**Remaining:**
+**Also discharged: which blocks are really addressable**
+(`claude-code-fork-anchor-types.md`), and it corrects the record above rather
+than extending it. The built surface found the counter-example on its first day —
+a fork offered at a `system`/`hook_started` block, keyed because the normalizer
+keys every uuid-bearing stdout line, refused by the provider after its
+`SessionStart:fork` hook had already run. Nothing was changed on one observation,
+because the question was the *rule*. The spike anchored a live fork at one uuid
+of **every** `type`/`subtype` combination the provider emits — all twelve carry a
+uuid — and read acceptance off the result `subtype`. **Only `assistant` and
+`user` lines resolve.** Nine of fifteen anchor kinds are keyed and refused:
+`system/init`, `hook_started`, `hook_response`, `status`, `thinking_tokens`,
+`permission_denied`, both `result` subtypes, `rate_limit_event` and
+`stream_event`. So *every keyed block is forkable* is **false** — the phrasing the
+fork-address record was careful to settle on, and it was careful about the wrong
+half. The true rule is: a key plus an event that came off a message line.
+Acceptance is a function of the provider's `type` alone (both `result` subtypes
+behaved identically, as did all four `system` ones), which is why it encodes as a
+list of our event types in `normalizer::claude_code::is_addressable` rather than
+as a pair lookup, behind the `fork_address(event_type, key)` that both
+`EventLog::fork_points` and `driver::ForkPoint::resolve` go through. Two things
+the fork-address record left unproven came back with it and both work:
+**tool-bearing anchors** — an `assistant` line carrying a `tool_use` block and
+the `user` line carrying the matching `tool_result`, a fork anchored mid-tool-call
+— and **the replayed user prompt**, which is the line the product actually
+produces, since the driver always passes `--replay-user-messages`. That last one
+also corrects the fork-address record's "the user's own prompt entries never
+reach stdout": true of a `-p` run, false of ours.
 
-- **Which blocks are really addressable.** New, and found by the built surface
-  on its first day: a fork offered at a `system` / `hook_started` block — keyed,
-  because the normalizer keys every uuid-bearing stdout line — was refused by
-  the provider (`error_during_execution`, no turns, no cost) after its
-  `SessionStart:fork` hook had already run, while a fork at the run's assistant
-  message was accepted and ran a real turn in its own worktree. *Every keyed
-  block is forkable* therefore has a counter-example, and the surface currently
-  offers a gesture that can fail. It fails loudly and for free, which is what
-  makes this a debt rather than a bug; the rule that replaces it needs a spike,
-  not a guess. Recorded in `branching-surface.md` under what it does not decide.
+**Remaining:**
+- **Whether an address outlives a long conversation or a compaction.** Both fork
+  spikes used short trunks — three assistant entries and five turns. The chain
+  lives in a file the provider owns and rewrites, and nothing has checked that a
+  uuid observed in turn one is still resolvable twenty turns later.
+- **Subagent lines.** Listed again below for attribution, and it has a second
+  consumer now: `parent_tool_use_id` was null on every line of both fork spikes,
+  so whether an `assistant` line emitted *inside* a subagent is a chain entry of
+  the parent session is the one case where "came off an `assistant` line" might
+  not be enough to make a block forkable.
 - **Concurrent forks.** The spike ran branches sequentially; two branches of one
   trunk running at the same time is the actual product case, it is cheap, and it
   would be expensive to discover late. A worktree per fork removes the filesystem
@@ -520,6 +551,7 @@ out as `seq` 0, the tree as the agent found it.
 | A fork's worktree is lazy — created on the child's first write, not at the fork | `branching-surface.md`, §13 | new; the tree buys clean shadow attribution, which is only owed once a run writes. Not a corruption argument: `pipeline.rs:171` snapshots the whole tree and stamps it with one run's `Cause`, so two runs in one tree mis-attribute deterministically — and poison the trunk, not just the fork |
 | **Supersedes the row above: a fork is created with its worktree, checked out from the parent's shadow commit at the branch-point `seq`** | `branching-surface.md`, §13, §19 | new, and it is correctness where the row above was cost. A process's cwd is fixed at spawn, so a worktree made on the first write cannot redirect a child that has already computed paths under its ancestor's root — the write lands there anyway and the new tree is correct and empty. Nor can a treeless child *read* the right tree: an ancestor's tree is that run's tree now, not at the branch point, which is wrong precisely when the parent is still running. The `pipeline.rs:171` argument is unchanged and now argues for the eager tree: two runs must not share one, so the fork gets its own from `ShadowHistory::commit_at` |
 | Fork is offered only where a chain-entry uuid resolves | `branching-surface.md` | new; the inherited-context strip states a message count out loud, so snapping backwards to a nearby address makes the one surface whose job is to say where you came from lie about it |
+| **Refines the row above: a chain entry is an `assistant` or `user` line, and nothing else** | `claude-code-fork-anchor-types.md`, `branching-surface.md` | new, and a correction rather than a reversal — the row above is right about *where* a fork is offered and the record under it was wrong about *which blocks qualify*. All twelve of the provider's `type`/`subtype` combinations carry a `uuid` and the normalizer keys every one, so "a bare uuid is an address" offered a toolbar on `system/init`, the hook lifecycle, `result` and `rate_limit_event` too — and a live fork at one uuid of each was refused nine times out of fifteen. Acceptance is a function of the provider `type` alone, so the rule is a list of our event types in `normalizer::claude_code::is_addressable`, read through `fork_address(event_type, key)` by both the projection and `ForkPoint::resolve`. Tool-bearing anchors and the replayed user prompt both resolve, so the narrowing costs the surface nothing it was using |
 | The shell owns no logic | `apps/desktop` | anything there that starts deciding belongs in a crate, where a test can reach it without a window |
 | The map card states the *outcome* beside the three-word pill | `branching-surface.md`, §10 | new, and an addition rather than a reversal: the three words answer *does this want me now*, so `failed`, `finished` and `abandoned` all collapse to **idle** — which is right, and which leaves a successful branch and a failed one looking identical on the one surface built for comparing branches. Outcome is a second axis, it is still on the row, and `format.ts` still spells all four words. The record propagates three words to "border, pill, sliver and card"; it never said the card shows only them |
 | A fork runs no post-create hook | `apps/desktop/src-tauri/src/lib.rs`, §13 | new, and the first caller had to choose: a shadow commit respects `.gitignore`, so a child's checkout has none of the parent's `node_modules` or `target` even though the parent has them on disk. `None`, because a hook is arbitrary user code and this app has no configuration surface for one — every run the window starts already runs none, and a fork that ran a command its parent never ran would be the shell deciding what builds the user's repository. The consequence is real and is stated on the surface rather than hidden: a fork of a project with a build step starts from a clean tracked checkout. When `StartRunRequest` grows a hook, the fork inherits it |

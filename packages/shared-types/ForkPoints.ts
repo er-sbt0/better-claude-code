@@ -10,10 +10,10 @@ import type { RunId } from "./RunId";
  * §8). The rule itself is not re-implemented here either — it is
  * [`normalizer::claude_code::fork_address`], the one reader of the format the
  * normalizer mints into `raw_events.idempotency_key`, and this walks a run's
- * blocks past that function. A second copy of "strip at the first `#`, null is
- * not an address" in TypeScript would drift from it silently, and the surface
- * that drifted would be the one offering forks at addresses the driver then
- * refuses.
+ * blocks past that function. A second copy of "strip at the first `#`, a key is
+ * only an address on an `assistant` or `user` line, null is not an address at
+ * all" in TypeScript would drift from it silently, and the surface that drifted
+ * would be the one offering forks at addresses the driver then refuses.
  *
  * `RawEvent.idempotency_key` does reach the webview, which makes re-deriving
  * it there look free. It is not free: it is the same rule in a second
@@ -25,7 +25,8 @@ export type ForkPoints = { run_id: RunId,
  *
  * A run with none is a run nothing can be forked from — which is an
  * ordinary state, not an error: out-of-band events carry no key at all,
- * and a run that has only asked for a permission has nothing addressable
- * in it yet.
+ * the provider's own `system`, `result` and `rate_limit_event` lines are
+ * keyed but are not chain entries, and a run that has started, run a hook
+ * and asked for a permission has nothing addressable in it yet.
  */
 blocks: Array<ForkBlock>, };

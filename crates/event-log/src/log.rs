@@ -526,6 +526,13 @@ impl EventLog {
     /// would be a second copy of the rule in a language no test here reaches,
     /// and the copy would drift towards offering forks the driver refuses.
     ///
+    /// Note what the query selects and why: the **type** as well as the key.
+    /// A key is necessary and not sufficient — the provider keys its hook,
+    /// `init`, `result` and `rate_limit_event` lines too, and refuses a fork at
+    /// every one of them — so the projection cannot be written against
+    /// `idempotency_key` alone. It was, once, and the surface offered a fork
+    /// toolbar on a `system`/`hook_started` block that could never work.
+    ///
     /// **Plural, and by name rather than by window.** [`recent_activity`] takes
     /// a limit because every node needs a header; this takes the runs the
     /// caller can actually fork in — the one being read, and the parents of the
@@ -572,7 +579,7 @@ impl EventLog {
                     }
                     _ => {}
                 }
-                if normalizer::claude_code::fork_address(key.as_deref()).is_some() {
+                if normalizer::claude_code::fork_address(&ty, key.as_deref()).is_some() {
                     blocks.push(ForkBlock {
                         seq,
                         inherited_messages: messages,

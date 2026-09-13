@@ -376,9 +376,10 @@ function Body({
           if (e.target instanceof Element && e.target.closest('[data-fork-ui]') !== null) return
           const event = blockAt(e.target)
           const li = e.target instanceof Element ? e.target.closest('li') : null
-          // **No snapping.** A block whose `idempotency_key` resolves to no
-          // address is not forkable, and the surface says so by offering
-          // nothing — never by rounding back to the last block that resolves.
+          // **No snapping.** A block the `fork_points` projection did not offer
+          // is not forkable — it may carry no key at all, or carry one the
+          // provider will not resolve — and the surface says so by offering
+          // nothing, never by rounding back to the last block that is.
           if (event === null || li === null || !forkableAt.has(event.seq)) {
             setHover(null)
             onHoverBlock(null)

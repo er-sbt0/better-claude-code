@@ -86,7 +86,9 @@ pub struct LaunchSpec {
     /// The value is a **bare** chain-entry uuid — what
     /// [`normalizer::claude_code::fork_address`] returns, never a
     /// `raw_events.idempotency_key` straight out of the log, because the
-    /// `{uuid}#{i}` fan-out suffix is ours and the CLI refuses it by name.
+    /// `{uuid}#{i}` fan-out suffix is ours and the CLI refuses it by name. Nor
+    /// is every key a chain entry: the same function refuses to produce one for
+    /// an event that did not come off an `assistant` or `user` line.
     /// [`validate`](LaunchSpec::validate) enforces that here rather than
     /// letting a live run discover it.
     ///
