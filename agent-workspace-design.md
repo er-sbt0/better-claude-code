@@ -25,28 +25,39 @@ The application owns the developer workspace, agent sessions, rich presentation,
 
 ### The wedge
 
-The differentiating *technology* is structured rendering of agent activity. The
-differentiating *pain* is something narrower and more acute:
+Every agent interface in existence — vendor-native, IDE panel, terminal — renders
+agent work as a chat chain. That is a borrowed form. It came from chatbots, where
+the interaction genuinely is a conversation, and it was never re-examined when the
+thing on the other end started editing files, running tests and backtracking.
 
-> **A developer running several agents at once cannot keep track of them, and
-> cannot review what they did without babysitting each terminal.**
+> **Agent work is a tree, and every tool renders it as a scroll.**
 
-That is the wedge. Rich rendering is how the review queue becomes reviewable —
-it is the mechanism, not the pitch. Concretely, the user we are building for:
+That is the wedge. It is a claim about the *form*, not the styling, and it is
+falsifiable: give a developer a surface where the work is a navigable structure
+rather than a transcript, and they should do things they will not attempt in a
+chain.
 
-- runs 2–6 agent sessions concurrently, today, in terminal tabs or tmux panes
-- loses track of which finished, which is blocked, and which is asking for permission
-- reviews the result as a `git diff` in a pager, disconnected from the reasoning that produced it
-- cannot answer "what did that run actually change, and what did it cost?" after the fact
+What the chain costs, concretely:
 
-If the product does not measurably improve *that*, prettier transcripts will not
-save it.
+| What the developer actually wants | What a chat chain forces |
+|---|---|
+| Try an approach, and abandon it cleanly if it fails | Pollute the context with the failure, or start over and lose the prefix that was good |
+| Two approaches to the same problem, compared | Two terminals, no shared prefix, and no way to diff the outcomes |
+| Go back to the point before it went wrong | There is no address for "that point" — only scrollback |
+| See the decision, not the 400-line `grep` output that preceded it | Both have the same visual weight, forever |
+| Understand the *shape* of a run at a glance | Reconstruct it by scrolling |
+
+Running several agents at once makes all five worse, and that is the pain the
+market currently names: tabs, tmux, lost track of which one is blocked. It is
+real and V1 inherits it — but it is a *consequence* of the wedge, not a second
+wedge. A chain is the wrong shape for one agent's work before it is the wrong
+shape for six.
 
 ### Core differentiation
 
 Most coding-agent interfaces flatten agent activity into Markdown/chat.
 
-Agent Workspace should model agent output as **structured, semantic information**:
+Agent Workspace models agent output as **structured, semantic information**:
 
 - files
 - symbols
@@ -62,27 +73,61 @@ Agent Workspace should model agent output as **structured, semantic information*
 - Git objects
 - agent runs
 
-This allows the UI to make agent output interactive rather than treating it as a text blob.
+This is not rendering polish. It is the precondition for everything the wedge
+promises, and none of it can be retrofitted onto Markdown:
 
-The honest version of the payoff, in priority order:
+- **Collapse needs a block.** You cannot fold what has no boundaries.
+- **Fork needs an address.** `(runId, seqRange)` on every block (§7) is what
+  "branch from here" resolves to.
+- **Compare needs a structure.** Two transcripts diff as text and tell you
+  nothing; two block streams diff as work.
+- **Zoom needs a hierarchy.** A run has a shape only if its parts are typed.
+
+The structured model is therefore load-bearing rather than decorative, and it is
+the reason this direction is available to us and not to a wrapper around a
+Markdown pane.
+
+### The payoff, in priority order
 
 ```text
-1. Review surface
-   Run #1842 · 12 files · +482 / -91        [Review changes]
-   Reasoning that produced each hunk is attached to the hunk.
+1. The graph
+   A run is a node. Fork from any block; branches diverge; the trunk survives.
+   Verified against the provider, not assumed — docs/verification/
+   claude-code-session-forking.md.
 
-2. Parallel run triage
-   ● run 1841  Claude Code   feat/oauth      needs permission
-   ● run 1842  Claude Code   feat/billing    testing
-   ○ run 1843  Codex         fix/flaky-e2e   done · 3 findings
+2. Collapse and zoom
+   A run collapses to its shape: goal, five tool calls, three files, one
+   finding. Expand only what is in question.
 
-3. Derived detail (best effort)
+3. Review, attached to a branch
+   Each hunk beside the reasoning and tool calls that produced it (§13.1).
+
+4. Compare siblings
+   Two branches off one point, diffed against each other. The thing a chat
+   chain cannot do at any level of polish.
+
+5. Parallel triage
+   Every run, every workspace, its state — a consequence of (1), not a
+   separate product.
+
+6. Derived detail (best effort)
    42 tests passed   [View report]
 ```
 
-Note the ordering. (1) and (2) are achievable from provider metadata alone and
-are the reason a user opens the app. (3) requires per-ecosystem parsing or agent
-cooperation (see §6) and is enrichment, never a load-bearing promise.
+(1)–(4) are the thesis. (5) is what the foundations give away for free once runs
+are first-class objects. (6) requires per-ecosystem parsing or agent cooperation
+(see §6) and is enrichment, never a load-bearing promise.
+
+If a developer with this surface does not visibly work differently — branching
+speculatively, comparing, rewinding — then the form was not the problem and
+prettier transcripts will not save it.
+
+### The failure mode to guard against
+
+A node graph is easy to make impressive in a screenshot and hard to make worth
+navigating. The guard is that the graph must beat the scroll at a *named* task,
+not in the abstract: find where this went wrong · try two approaches from here ·
+show me only what changed. A surface that is merely spatial has lost.
 
 ---
 
@@ -116,14 +161,18 @@ This space filled up during 2025–26. Any pitch must survive contact with:
 
 | Category | Examples | What they do well | Gap we target |
 |---|---|---|---|
-| Parallel-agent managers | Conductor, Crystal, Vibe Kanban, Sculptor | worktree-per-run, parallel sessions | output is still a transcript; thin review surface |
+| Parallel-agent managers | Conductor, Crystal, Vibe Kanban, Sculptor | worktree-per-run, parallel sessions | *n* chat chains side by side is still *n* chat chains; thin review surface |
 | Cloud agent runners | Terragon and similar | no local setup, background runs | not local-first; your code leaves the machine |
-| IDE agent panels | Cursor, Zed, VS Code Claude Code extension | editing context, deep IDE integration | single-agent, single-session framing |
-| Vendor-native UIs | Claude Code web/desktop surfaces | first-party fidelity | vendor-locked by construction |
+| IDE agent panels | Cursor, Zed, VS Code Claude Code extension | editing context, deep IDE integration | single-agent, single-session, single-thread framing |
+| Vendor-native UIs | Claude Code web/desktop surfaces | first-party fidelity | vendor-locked by construction, and the chain is the house style |
 
-Our defensible position is the intersection: **local-first, agent-neutral,
-parallel, with a real review surface.** No single competitor above holds all
-four. Verify this table before quoting it — the list moves quarterly.
+The common gap is the one §1 names: **every one of them renders agent work as a
+scroll.** Several run agents in parallel; none lets a developer branch the work
+at a point, collapse it to its shape, or compare two attempts.
+
+Our defensible position is that intersection: **local-first, agent-neutral, and
+structured rather than linear — a graph you can fork and review, not a
+transcript.** Verify this table before quoting it — the list moves quarterly.
 
 ### Business model
 
@@ -539,8 +588,10 @@ From a structured stream you get, for free and without heuristics:
 - token usage and cost
 - session/run lifecycle and errors
 
-This alone powers the review surface and the parallel-run triage view — i.e.
-both of the wedge features in §1. **Ship this first; it carries the product.**
+This alone powers the block model, the review surface and the run index — i.e.
+everything §1 promises except the graph's edges, which are ours to store because
+the provider records no parentage (session-forking record). **Ship this first;
+it carries the product.**
 
 One thing this list used to claim and should not: **exit codes are not on the
 wire.** Claude Code returns `tool_use_result` as an object
@@ -1062,28 +1113,45 @@ The app should not be "one big chat window."
 
 ### Primary surfaces
 
-#### Runs (the home screen)
+#### The run graph (the home screen)
 
-Not "Agent." The first thing the user sees is every run, across every workspace,
-with its state — because §1's wedge is losing track of parallel agents.
+Not "Agent", and no longer "Runs". The first thing the user sees for a workspace
+is the shape of the work: every run and every branch, laid out as a DAG, with
+the feed living *inside* the nodes rather than in a separate pane.
 
 ```text
-● run 1841  Claude Code  my-app/feat-oauth     ⏸ needs permission   4m
-● run 1842  Claude Code  my-app/feat-billing   ● testing           8m42s
-○ run 1843  Codex        my-app/fix-flaky-e2e  ✓ done · 3 findings  12m
-○ run 1839  Claude Code  other/refactor        ✗ failed             2m
+        ┌─ 1842·a  "use refresh rotation"   ✓ 8 files  +210/-40   [Review]
+        │
+ 1842 ──┤          fork at block 14
+        │
+        └─ 1842·b  "keep the old scheme"    ● testing   4 files
+                   │
+                   └─ 1842·b1  "…and cache the token"  ⏸ needs permission
 ```
 
-Every agent execution is a first-class object:
+Rules that keep this from becoming decoration:
+
+- **Generated layout, never freehand.** The user forks, collapses and navigates;
+  they do not place nodes. A layout pass plus a pan/zoom transform, no drawing
+  library (§19).
+- **A node collapses to its shape.** Goal, tool-call count, files touched,
+  findings, cost. Expanding is a deliberate act, not the default state.
+- **Every node is addressable** — `(runId, seqRange)` (§7) — because fork,
+  compare and Review all resolve against that address.
+- **Edges are ours.** The provider records no parentage (verified); `parentRunId`
+  plus the branch-point `seq` in our log is the only place the graph exists.
+
+Every agent execution remains a first-class object:
 
 ```text
-Run #1842
+Run #1842·b
 
 Goal         Implement OAuth refresh tokens
+Forked from  #1842 at block 14
 Agent        Claude Code
 Workspace    my-project
-Worktree     .worktrees/feat-oauth-refresh
-Branch       feat/oauth-refresh
+Worktree     .worktrees/feat-oauth-refresh-b
+Branch       feat/oauth-refresh-b
 Cost         $0.84 · 214k in / 12k out
 Status       ✓ Planning ✓ Investigating ✓ Editing ● Testing
 Changes      12 files  +482 / -91
@@ -1098,9 +1166,23 @@ something no terminal and no `git diff` can offer. The attachment is real, not
 heuristic: it is blame against the run's shadow history (§13.1). Accept, reject, comment,
 request changes, hand back to the agent.
 
-#### Agent
+A branch is reviewed **against its fork point**, not against `main`, so what the
+branch is actually responsible for is what the screen shows. Two siblings can be
+reviewed side by side (§19).
 
-The conversational interaction surface for a single run.
+#### Runs (the index)
+
+Every run across every workspace, with its state — the launcher and the
+cross-workspace view. Parallel triage falls out of runs being first-class
+objects; it is not the home screen, because the home screen is where one
+workspace's work is navigated.
+
+```text
+● run 1841  Claude Code  my-app/feat-oauth     ⏸ needs permission   4m
+● run 1842  Claude Code  my-app/feat-billing   ● testing           8m42s
+○ run 1843  Codex        my-app/fix-flaky-e2e  ✓ done · 3 findings  12m
+○ run 1839  Claude Code  other/refactor        ✗ failed             2m
+```
 
 #### Workspace
 
@@ -1234,8 +1316,11 @@ arbitrary commands on the user's machine.
 
 This is a V1 problem, not a V2 feature. The moment a second run starts in the
 same repository, two agents edit the same files, `git status` becomes
-meaningless, and both runs are corrupted. Parallel runs are the wedge (§1), so
-this must be solved before the first release.
+meaningless, and both runs are corrupted. §1's graph makes this unavoidable
+rather than merely likely: **a fork of a conversation is not a fork unless the
+files fork with it.** Two branches off one point that share a working tree are
+one run with extra steps. So worktree-per-run must be solved before the first
+release, and forking a run means forking its worktree at the same `seq` (§13.1).
 
 ```text
 my-app/                          main checkout, user's own work
@@ -1553,8 +1638,25 @@ version that does.
 
 ### V1 goal
 
-> Prove that structured run review plus parallel-run triage is dramatically
-> better than terminal tabs — for one agent, in one workspace.
+> Prove that a forkable, collapsible, structured surface changes *how a
+> developer works with an agent* — for one agent, in one workspace.
+
+The evidence is behavioral, not aesthetic: branches taken that would not have
+been taken in a chain, points returned to, siblings compared. If the surface is
+admired and used exactly like a transcript, the thesis failed.
+
+### The one naming trap
+
+Two different things in this document are called a canvas.
+
+- **The run graph** (this section, §10) — *our* surface. A generated DAG layout
+  of runs and branches, pan/zoom, with a feed inside each node. Not a drawing
+  tool: the user never places anything freehand, so it needs a layout pass and a
+  transform, **not** tldraw or excalidraw. §9.1's warning about "a second editor
+  technology" does not apply here, and must not be used to argue this is
+  unbudgeted.
+- **The diagram canvas** (§6.1) — an *agent-emitted* illustration, `attach_diagram`,
+  read-only. Still out of V1, unchanged.
 
 ### V1 features
 
@@ -1563,30 +1665,59 @@ in §5. Detect, launch, prompt, interrupt, resume via a session id we assign.
 **No adapter abstraction yet** (§5). Pin the tested version and replay the
 fixtures in CI from the first commit (§16) — they exist already, so this is free.
 
-**Worktrees** — run-per-worktree from day one (§13). Create, list, clean up.
+**Forking** — `--fork-session` composed with `--session-id`, and
+`--resume-session-at` for a branch point in the middle rather than at the tip.
+Verified end to end in `docs/verification/claude-code-session-forking.md`. Each
+fork pairs with a worktree forked at the same `seq` (§13, §13.1), because a
+branch of the conversation that shares the parent's files is not a branch.
+
+**Worktrees** — run-per-worktree from day one (§13). Create, list, clean up, and
+fork at `seq`.
 
 **Run feed** — six block types plus `Raw` (§7), plain React, virtualized. Every
-block carries `(runId, seqRange)` provenance (§7) — cheap now, painful later.
+block carries `(runId, seqRange)` provenance (§7) — which is now the address that
+collapse, fork and compare all resolve against, not a nicety. **Collapse and
+expand are first-class**, with a default collapsed shape per block type: a run
+should be legible without expanding anything.
+
+**The run graph** — the primary surface. Nodes are runs, edges are
+`parentRunId` plus the `seq` the branch was taken at. Fork from any block;
+navigate, zoom, collapse a whole branch. The provider stores no parentage
+(verified), so this graph exists only in our event log — which makes it ours to
+get right and impossible to reconstruct later if we do not store it from the
+first run.
 
 **Review** — the diff surface with reasoning attached to hunks. The one screen
-that must be excellent.
+that must be excellent. Under the new thesis it is also *per branch*: a branch's
+diff is against its fork point, not against `main`.
 
-**Runs list** — parallel run triage: status, agent, worktree, duration, cost.
+**Compare siblings** — two branches from one point, side by side. The single
+capability a chat chain cannot reach at any level of polish, and therefore the
+sharpest test of the thesis. It is also the last thing in and the first thing
+cut if V1 is running long; say so now rather than discovering it in month four.
 
 **Persistence** — SQLite with `runs` + `raw_events` only. Projections are
-recomputed on load until that measurably hurts.
+recomputed on load until that measurably hurts. `runs` gains `parentRunId` and
+the branch-point `seq` — the only record anywhere that the graph existed.
 
 **Permissions** — proxied via `--permission-prompt-tool` (§12 option A).
 
 **Workspace MCP server** — `report_finding`, `open_plan`, `record_test_run`.
 Small, but it proves source 3 works and it is cheap to build.
 
+**Runs list** — a cross-workspace index and launcher, not a triage dashboard.
+Parallel triage is a consequence of runs being first-class objects (§1), and the
+graph is where a single workspace is actually navigated. Keep it thin in V1;
+it earns more only if users ask for more.
+
 ### Explicitly out of V1
 
 - Lexical (nothing is editable yet)
 - Monaco (CodeMirror read-only viewer instead)
-- block-range actions and derived runs (§9.1)
-- diagram and canvas rendering (§6.1)
+- block-range actions and derived runs (§9.1) — **except** that the graph now
+  shares their data model, so build `parentRunId` and `kind` correctly the
+  first time
+- the **diagram** canvas (§6.1) — distinct from the run graph, see above
 - Tasks, Artifacts as first-class surfaces
 - the adapter abstraction, and any second agent
 - MCP server management UI
@@ -1597,6 +1728,19 @@ Small, but it proves source 3 works and it is cheap to build.
 - replacing GitHub/GitLab
 - reimplementing any vendor's native agent UI
 
+### What V1 now depends on being true
+
+Recorded here because the thesis rests on them and two are unproven:
+
+| Assumption | State |
+|---|---|
+| A session forks into divergent branches, with ids we assign | **verified** — session-forking record |
+| A branch can start mid-conversation, not only at the tip | **verified** — `--resume-session-at` |
+| Two branches of one trunk can run *concurrently* | **unverified** — sequential only so far, and this is the product case |
+| A fork of a run that already edited files pairs with a worktree fork at the same `seq` | **unverified** — §13.1 makes it possible; nothing has exercised it |
+| WebKitGTK sustains pan/zoom over a graph of virtualized feeds | **unverified** — §4's budget was drawn for one linear feed; the spike must now cover the graph |
+| Codex can fork at all | **unknown** — if not, the graph is a tier-1 capability that must degrade (§5) |
+
 ---
 
 ## 20. V2 direction
@@ -1604,11 +1748,13 @@ Small, but it proves source 3 works and it is cheap to build.
 - **Second adapter (Codex)** — and only now, extract the interface from the diff
   between two real implementations (§5)
 - ACP support, if evaluation favors it
-- block-range actions (§9.1), starting with tl;dr and commit-message generation
+- block-range actions (§9.1) beyond the graph itself — tl;dr, commit-message
+  generation, "explain this hunk" — all riding the derived-run mechanism V1
+  already had to build
 - read-only diagram rendering via `attach_diagram` (§6.1)
 - tier-3 PTY fallback agents
 - persistent tasks spanning runs
-- run forking and run comparison (cheap, given §13)
+- *(run forking and run comparison moved into V1 — they are the thesis, §1)*
 - background runs
 - richer artifact handling
 - GitHub integration
@@ -1758,14 +1904,20 @@ Schema. Do not maintain two copies.
 11. **Local-first.** Code and credentials stay local unless the user opts in.
 12. **Do not generalize from one example.** Write the second adapter before extracting the interface (§5).
 13. **Lexical and Monaco are implementation details** — and neither belongs in the run feed (§9).
-14. **Runs are first-class.** A run is a durable unit of work, not a conversation.
+14. **Runs are first-class.** A run is a durable unit of work, not a
+    conversation — and a *node*, not a line. A run has a parent and a branch
+    point, and only our log records them (§19).
 15. **Design for orchestration, ship a focused V1.**
 16. **Blocks are addressable.** `(runId, seqRange)` provenance on every block is
-    a V1 foundation; Review and every derived action depend on it (§7, §9.1).
-17. **Derived work runs on the user's agent, with no tools.** We add no
+    a V1 foundation; Review, collapse, fork and compare all resolve against it
+    (§7, §9.1, §19).
+17. **The form is the product.** A chain is a rendering decision inherited from
+    chatbots, not a fact about the work. Ask of every feature whether it makes
+    the work navigable as a structure or merely prettier as a scroll (§1).
+18. **Derived work runs on the user's agent, with no tools.** We add no
     inference of our own, and a summarizer holding tools is a confused
     deputy (§9.1, §15).
-18. **Record before you model.** Every claim about a vendor's wire format is an
+19. **Record before you model.** Every claim about a vendor's wire format is an
     assertion until a fixture proves it. The first recording session corrected
     six rows of §5, a claim in §6, and the metrics in §14 — none of which looked
     wrong on paper (§16).
@@ -1774,71 +1926,84 @@ Schema. Do not maintain two copies.
 
 ## 24. The north-star experience
 
-Open the app and see every agent you are running:
+Open a workspace and see the shape of the work, not a scroll:
 
 ```text
-RUNS
+my-app · feat/oauth-refresh
 
-● 1841  Claude Code  feat/oauth     ⏸ needs permission    4m     $0.31
-● 1842  Claude Code  feat/billing   ● testing             8m42s  $0.84
-○ 1843  Codex        fix/flaky-e2e  ✓ ready for review   12m     $0.52
+  ● 1842  Claude Code  "implement refresh tokens"        14 blocks   $0.31
+  │
+  ├─ fork at block 14 ─────────────────────────────────────────────────────
+  │
+  ├── ● 1842·a  "rotate the refresh token"    ✓ ready    8 files  +210/-40
+  │             3 findings · 124 tests passed              [Review] [Compare]
+  │
+  └── ○ 1842·b  "keep the existing scheme"    ⏸ needs permission     4m
+                └── ○ 1842·b1  "…and cache it"   ● testing          1m12s
 
-────────────────────────────────────────────────────────────
+  ────────────────────────────────────────────────────────────────────────
+  1842·a  collapsed
 
-RUN 1843 · Codex · fix/flaky-e2e · ready for review
+  Goal      Rotate the refresh token on every use
+  Did       read 6 files · edited 4 · ran the suite twice
+  Found     ⚠ Refresh race condition      src/auth/refresh.ts:122
+            ⚠ Missing transaction boundary  src/db/user.ts:81
+  Next      → Add integration tests
 
-Findings                                          3
-
-⚠ Refresh race condition          src/auth/refresh.ts:122
-⚠ Missing transaction boundary    src/db/user.ts:81
-✓ Existing token expiry behavior confirmed
-
-Changes                          12 files  +482 / -91
-                                              [Review]
-
-Tests                            124 passed   0 failed
-                                          [View report]
-
-Next                             → Add integration tests
-
-                                  [Continue]  [Merge]  [Discard]
+                            [Expand]  [Review]  [Merge]  [Discard]
 ```
+
+Three things are happening there that a chat chain cannot do at any level of
+polish:
+
+1. **The run is collapsed to its shape.** Six words and three lines, not 14
+   blocks of transcript. Expanding is a choice.
+2. **The work branched at a point, and both branches still exist.** Neither
+   polluted the other's context; the trunk is intact and still forkable.
+3. **The siblings can be compared** — same fork point, two outcomes, diffed
+   against each other rather than against `main`.
 
 Then open Review and see each hunk next to the reasoning and tool calls that
 produced it — the thing no terminal can show you.
 
 The experience should feel less like reading an LLM transcript and more like
-reviewing the work of a capable colleague who kept good notes.
+reviewing the work of a capable colleague who kept good notes, and whose dead
+ends you can inspect instead of only hearing about.
 
 ---
 
 ## 25. Bottom line
 
-> **A local-first desktop workspace that lets developers run several of their own
-> coding agents in parallel, isolated per worktree, and review what each one did
-> through a structured, interactive surface instead of a terminal transcript.**
+> **A local-first desktop workspace that replaces the agent chat chain with a
+> navigable structure: fork the conversation at any point, collapse it to its
+> shape, and review each branch's diff against the reasoning that produced it —
+> for your own agents, isolated per worktree.**
 
 Technical foundation:
 
 **Tauri 2 + Rust + React + TypeScript + CodeMirror + xterm.js + SQLite**, with
 structured provider event streams, an outbound workspace MCP server for
-semantics, an append-only event log, and worktree-per-run isolation. Lexical
-enters when something becomes editable; the adapter abstraction enters with the
-second agent.
+semantics, an append-only event log, worktree-per-run isolation, and provider
+session forking verified against the real CLI. Lexical enters when something
+becomes editable; the adapter abstraction enters with the second agent.
 
 The first milestone is not a perfect desktop app. It is falsifying one claim:
 
 ```text
-several agents, running in parallel
+agent work is a tree
         ↓
 structured event streams + reported semantics
         ↓
-append-only event log
+append-only event log + worktree-per-run + session forking
         ↓
-run triage + hunk-level review with reasoning attached
+a graph you can fork, collapse, navigate and compare
+        ↓
+hunk-level review with reasoning attached
         ↓
 merge, continue, or discard
 ```
 
-Test that against terminal tabs and `git diff`. Do not test it against "42 tests
-passed" — that was never the painful part.
+Test that against a chat chain and `git diff`. Do not test it against "42 tests
+passed" — that was never the painful part. And do not accept "it looks better"
+as the result: the claim is that the *form* changes what a developer does, so
+the evidence is branches taken, points returned to, and siblings compared.

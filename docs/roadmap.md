@@ -11,6 +11,9 @@ relitigated without new information.
 **Code:** six crates plus the desktop shell · CI green · 101 tests.
 **The headless spine is complete, and the semantic channel now exists:** a real
 run has both asked us for permission and reported a finding to us.
+**The thesis was re-aimed on 2026-09-13** (§1): the wedge is that agent work is a
+tree and every tool renders it as a scroll, not that parallel agents are hard to
+track. The foundations did not move; V1's surfaces did.
 
 *No commit hash here on purpose.* The previous version of this file carried one
 and was two commits stale within a day — it cannot be otherwise, since the
@@ -94,23 +97,36 @@ before anything renders (§8) — is done; everything else there is scaffolding.
 
 ## 2. Next
 
-The workspace MCP server was the last three sessions' answer to this question
-and it now exists — one server, two tools, both flags, proven by a run that was
-made to want permission. What that leaves, in rough order:
+**The thesis changed shape.** §1 no longer says the wedge is losing track of
+parallel agents; it says agent work is a tree and every tool renders it as a
+scroll. Parallel triage is now a consequence rather than the pitch, and the
+forkable, collapsible graph is the product. The foundations survive that change
+untouched — structured blocks, `(runId, seqRange)` addressability, replay to any
+`seq`, worktree-per-run — which is the strongest evidence that they were built
+for the right reasons.
 
-- **Install Codex and record its fixtures.** Largest remaining verification
-  debt; unblocks the V2 abstraction. Do not generalize the normalizer, or
-  anything in the driver, until it exists — §5's rule is to write the second
-  adapter before extracting the interface, and the driver is now a second place
-  that rule applies to.
-- **Spike the WebKitGTK performance budget** (5k-block virtualized feed +
-  CodeMirror + xterm) before committing to Tauri, per §4. A day, and it is
-  cheaper now than after the runtime assumes the stack. This is the one item
-  that could invalidate a stack decision rather than add work to it, so it
-  should not drift much further.
+The provider capability it rests on is verified as of 2026-09-13
+(`docs/verification/claude-code-session-forking.md`): sessions fork into
+divergent branches, we assign every branch's id, and a branch can start
+mid-conversation. In rough order:
 
-With the spine and the semantic channel both real, the next *product* work is
-the first surface. Everything in §3 that is not built is a screen.
+- **Spike the WebKitGTK performance budget** — and re-draw it. §4's budget
+  assumed one linear 5k-block feed plus CodeMirror and xterm; the surface is now
+  pan/zoom over a DAG of *several* virtualized feeds. This is the one item that
+  could invalidate a stack decision rather than add work to it, and the thesis
+  just made it heavier. It goes first.
+- **Prove concurrent forks.** Two branches of one trunk running at the same time
+  is the product case and the spike only tested them sequentially. Cheap, and it
+  would be expensive to discover late.
+- **Fork a run that already edited files** — the conversation fork paired with a
+  worktree forked at the same `seq`. §13.1 makes it possible; nothing has
+  exercised the two together.
+- **Then build the surface**: the run feed with collapse, the graph over it, and
+  Review. Everything in §3 that is not built is a screen.
+- **Install Codex and record its fixtures.** Still the largest verification
+  debt, and it now carries a second question: whether Codex can fork at all. If
+  it cannot, the graph is a tier-1 capability that degrades (§5). Do not
+  generalize the normalizer or the driver until it exists.
 
 Also queued:
 
@@ -122,31 +138,45 @@ Also queued:
 
 ## 3. V1 (§19)
 
-> **Goal:** prove that structured run review plus parallel-run triage is
-> dramatically better than terminal tabs — for one agent, in one workspace.
+> **Goal:** prove that a forkable, collapsible, structured surface changes *how a
+> developer works with an agent* — for one agent, in one workspace.
 
-Narrow means narrow. Eight features; four built, one half-built, three are
-screens.
+The evidence is behavioral: branches taken that would not have been taken in a
+chain, points returned to, siblings compared. "It looks better" is not a result.
+
+Eleven features: four built, one verified but unbuilt, one half-built, and
+five that are screens.
 
 | Feature | § | State |
 |---|---|---|
 | **Agent** — Claude Code only via `stream-json`, no adapter abstraction | §5, §16 | **done** — detect, launch, prompt, interrupt, resume; fixtures replay in CI |
-| **Worktrees** — run-per-worktree, create/list/clean up | §13 | **done** |
-| **Persistence** — SQLite, `runs` + `raw_events` only; projections recomputed on load | §14 | **done** |
-| **Run feed** — six block types plus `Raw`, plain React, virtualized, every block carrying `(runId, seqRange)` | §7 | not started |
-| **Review** — the diff surface with reasoning attached to hunks | §13.1 | not started — *the one screen that must be excellent* |
-| **Runs list** — parallel run triage: status, agent, worktree, duration, cost | §10 | not started |
-| **Permissions** — proxied via `--permission-prompt-tool` | §12 option A | **channel done**, no UI — a `Decider` answers, and the only ones are allow-all and deny-all |
+| **Forking** — `--fork-session` + `--session-id`, `--resume-session-at` for a mid-conversation branch point | §19 | **verified, not built** — the record exists; the driver does not do it yet |
+| **Worktrees** — run-per-worktree, create/list/clean up | §13 | **done** — fork-at-`seq` not yet exercised |
+| **Persistence** — SQLite, `runs` + `raw_events` only; projections recomputed on load | §14 | **done** — needs `parentRunId` + branch-point `seq`, the only record the graph ever had |
 | **Workspace MCP server** — `report_finding`, `open_plan`, `record_test_run` | §6 | **done** for `request_permission` + `report_finding`; the other four tools are unbuilt |
+| **Run feed** — six block types plus `Raw`, virtualized, every block carrying `(runId, seqRange)`, **collapse/expand first-class** | §7 | not started |
+| **The run graph** — the home screen: nodes are runs, edges are `parentRunId` + branch `seq`; generated layout, no drawing library | §10, §19 | not started — *the thesis* |
+| **Review** — the diff surface with reasoning attached to hunks, a branch diffed against its fork point | §13.1 | not started — *the one screen that must be excellent* |
+| **Compare siblings** — two branches off one point, side by side | §19 | not started — last in, first cut if V1 runs long |
+| **Runs list** — a cross-workspace index and launcher, deliberately thin | §10 | not started — demoted from home screen |
+| **Permissions** — proxied via `--permission-prompt-tool` | §12 option A | **channel done**, no UI — a `Decider` answers, and the only ones are allow-all and deny-all |
 
 Block provenance is cheap now and painful later: every block carries
-`(runId, seqRange)` from the first render, not once something needs it.
+`(runId, seqRange)` from the first render, not once something needs it. Under the
+new thesis it is not merely cheap insurance — it is the address that collapse,
+fork and compare all resolve against.
+
+**Two things are called a canvas; only one is out of V1.** The *run graph* (§10,
+§19) is ours: a generated DAG layout with pan/zoom, no drawing library, and it is
+the home screen. The *diagram canvas* (§6.1) is agent-emitted illustration and
+stays out. Do not let §9.1's "a second editor technology" warning, which is about
+tldraw-style freehand editing, be quoted against the run graph.
 
 ### Explicitly out of V1
 
 Lexical (nothing is editable yet) · Monaco (CodeMirror read-only viewer
-instead) · block-range actions and derived runs (§9.1) · diagram and canvas
-rendering (§6.1) · Tasks and Artifacts as first-class surfaces · the adapter
+instead) · block-range actions beyond the graph's own derived-run plumbing
+(§9.1) · **diagram** rendering (§6.1) · Tasks and Artifacts as first-class surfaces · the adapter
 abstraction and any second agent · MCP server management UI · the
 policy/sandbox engine · multi-agent orchestration of any kind · a proprietary
 coding model or agent · cloud backend, teams, collaboration · replacing
@@ -159,7 +189,8 @@ GitHub/GitLab · reimplementing any vendor's native agent UI.
 - **Second adapter (Codex)** — and only now, extract the interface from the diff
   between two real implementations (§5)
 - ACP support, if evaluation favors it
-- block-range actions (§9.1), starting with tl;dr and commit-message generation
+- block-range actions (§9.1) beyond the graph — tl;dr, commit-message
+  generation, "explain this hunk" — on the derived-run mechanism V1 already built
 - read-only diagram rendering via `attach_diagram` (§6.1)
 - tier-3 PTY fallback agents
 - persistent tasks spanning runs
@@ -265,8 +296,30 @@ Both version directories are kept and the named regression tests stay pinned to
 2.1.269. What the newer set buys is the diff, which is the only thing §16 ever
 wanted from it.
 
+**Also discharged: session forking** (`claude-code-session-forking.md`). The
+fork-graph thesis rested on a capability nothing had checked, and it holds:
+`--fork-session` yields a new session id, two forks of one trunk diverge without
+seeing each other, the trunk survives, `--fork-session` composes with
+`--session-id` so we name every node, and `--resume-session-at` branches from the
+middle rather than the tip. The finding that costs us something: **the provider
+records no parentage** — a fork's transcript is a full copy re-stamped with its
+own id — so the graph edge exists only in `Run.parentRunId` plus the branch-point
+`seq`, and cannot be reconstructed later if we fail to store it.
+
 **Remaining:**
 
+- **Concurrent forks.** The spike ran branches sequentially; two branches of one
+  trunk running at the same time is the actual product case, and it is the
+  cheapest remaining unknown to close.
+- **A fork of a run that already edited files.** The conversation fork has to
+  pair with a worktree forked at the same `seq`. §13.1 makes it possible and
+  nothing has exercised the two together.
+- **Whether Codex forks at all.** Folded into the Codex debt below, but called
+  out separately because the thesis now depends on it: if it does not, the graph
+  is a tier-1 capability that must degrade (§5).
+- **The WebKitGTK budget for the graph.** §4's number was drawn for one linear
+  feed. Pan/zoom over a DAG of several virtualized feeds is a different question
+  and has never been measured.
 - **Codex, entirely.** Not installed on this machine. `codex exec --json` event
   shapes, `codex exec resume`, the `--sandbox` modes, and the key names in §5's
   mapping table are all still asserted from stale knowledge. Still the largest
@@ -315,6 +368,8 @@ wanted from it.
 | `git` as a subprocess, not libgit2 | `crates/worktree` | the verification observed the binary — one thing to verify, not two |
 | Threads, not an async runtime, in the driver | `crates/driver` | three tasks do not justify the workspace's largest dependency |
 | Snapshot after *every* completed tool call | §13.1 | `tool.completed` cannot say whether it mutated, an unchanged tree costs ~30ms and commits nothing, and it is the only version that catches `Bash` |
+| The graph edge is ours, and stored from the first run | §19, session-forking record | new; the provider re-stamps a forked transcript with its own id and records no parent, so `parentRunId` + branch `seq` in our log is the only place the graph will ever exist |
+| The run graph is generated layout, not a drawing surface | §10, §19 | new; the user forks and navigates but never places a node, so it needs a layout pass and a transform — not tldraw, and not §9.1's "second editor technology" budget |
 | The shell owns no logic | `apps/desktop` | anything there that starts deciding belongs in a crate, where a test can reach it without a window |
 
 ### What building decided that the design had not
