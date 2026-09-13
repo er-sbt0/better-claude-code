@@ -4,7 +4,7 @@
   4  turn.started           index=0
   5  run.rate_limited
   6  tool.started           name=Bash args={command,description}
-  7  tool.completed         is_error=false result=structured non_execution=-
+  7  tool.completed         name=Bash is_error=false result=structured non_execution=-
   8  assistant.message      block=0 len=24
   9  turn.finished          index=0 subtype=success ok=true denials=0 models=2 cost_reconciles=true
  10  run.finished           turns=1

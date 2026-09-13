@@ -1697,6 +1697,7 @@ agent-workspace/
 │   ├── normalizer/                ← exists: provider streams in, raw events out
 │   ├── event-log/                 ← exists: SQLite; the append-only log (§8)
 │   ├── worktree/                  ← exists: worktree-per-run and its shadow history
+│   ├── driver/                    ← exists: spawns the agent; the headless spine
 │   └── document-model/
 │
 ├── packages/

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/agent-protocol", "crates/event-log", "crates/normalizer", "crates/worktree"]
+members = ["crates/agent-protocol", "crates/event-log", "crates/driver", "crates/normalizer", "crates/worktree"]
 
 [workspace.package]
 edition = "2021"
@@ -11,9 +11,12 @@ publish = false
 [workspace.dependencies]
 agent-protocol = { path = "crates/agent-protocol" }
 normalizer = { path = "crates/normalizer" }
+event-log = { path = "crates/event-log" }
+worktree = { path = "crates/worktree" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ts-rs = "12"
 rusqlite = { version = "0.40", features = ["bundled"] }
 thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

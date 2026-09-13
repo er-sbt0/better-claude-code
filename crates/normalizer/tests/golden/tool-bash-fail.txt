@@ -5,10 +5,10 @@
   5  run.rate_limited
   6  tool.started           name=Bash args={command,description}
   7  permission.resolved    tool=Bash allowed=false reason_type=subcommandResults
-  8  tool.completed         is_error=true result=text non_execution=user-rejected
+  8  tool.completed         name=Bash is_error=true result=text non_execution=user-rejected
   9  assistant.thinking     block=0 disclosed=false len=0
  10  tool.started           name=Bash args={command,description}
- 11  tool.completed         is_error=true result=text non_execution=-
+ 11  tool.completed         name=Bash is_error=true result=text non_execution=-
  12  assistant.message      block=0 len=110
  13  turn.finished          index=0 subtype=success ok=true denials=1 models=2 cost_reconciles=true
  14  run.finished           turns=1

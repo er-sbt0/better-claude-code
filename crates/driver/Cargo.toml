@@ -1,0 +1,17 @@
+[package]
+name = "driver"
+description = "Spawns an agent CLI and turns its stream into log, events and snapshots (design §5, §8, §13.1)."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+agent-protocol = { workspace = true }
+event-log = { workspace = true }
+normalizer = { workspace = true }
+worktree = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }

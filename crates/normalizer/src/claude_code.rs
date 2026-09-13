@@ -56,7 +56,8 @@ pub struct ClaudeCodeNormalizer {
     /// Set by the first turn that ended badly; decides run.finished vs run.failed.
     failure: Option<String>,
     /// tool_use_id → tool name, so a completion can name the tool that produced
-    /// it. The provider does not repeat the name on the result.
+    /// it. The provider does not repeat the name on the result, and the driver
+    /// needs it to label the shadow-history snapshot a tool call causes (§13.1).
     tool_names: HashMap<String, String>,
     stats: Stats,
 }
@@ -78,6 +79,23 @@ impl ClaudeCodeNormalizer {
             tool_names: HashMap::new(),
             stats: Stats::default(),
         }
+    }
+
+    /// Continue numbering a run that already has events in the log.
+    ///
+    /// A resumed run **must** use this. A fresh normalizer restarts `seq` at 1
+    /// and interleaves with history; the log rejects that rather than storing
+    /// it, so the symptom is an error rather than corruption — but the fix is
+    /// here. Seed from `EventLog::last_seq` (design §8, §14).
+    pub fn resume_at(run_id: RunId, clock: Box<dyn Clock>, last_seq: u64) -> Self {
+        let mut n = Self::with_clock(run_id, clock);
+        n.seq = last_seq;
+        // A resumed stream's `init` is structurally identical to a fresh run's
+        // (§14): no marker, no replayed history. The provider will not tell us,
+        // so the run row remembers and we start already started -- otherwise
+        // the resume emits a second `run.started` for the same run.
+        n.started = true;
+        n
     }
 
     pub fn stats(&self) -> &Stats {
@@ -380,6 +398,7 @@ impl ClaudeCodeNormalizer {
                 Some("tool_result") => {
                     let id = str_field(block, "tool_use_id").unwrap_or_default();
                     Event::ToolCompleted(ToolCompleted {
+                        name: self.tool_names.get(&id).cloned(),
                         is_error: block
                             .get("is_error")
                             .and_then(Value::as_bool)

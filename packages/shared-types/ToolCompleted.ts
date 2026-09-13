@@ -2,7 +2,18 @@
 import type { ToolResult } from "./ToolResult";
 import type { ToolUseId } from "./ToolUseId";
 
-export type ToolCompleted = { tool_use_id: ToolUseId, is_error: boolean, 
+export type ToolCompleted = { tool_use_id: ToolUseId, 
+/**
+ * The tool that produced this result, carried over from the `tool.started`
+ * that opened it.
+ *
+ * The provider does not repeat it: `tool_result` carries only
+ * `tool_use_id`. Without this every consumer has to build the same
+ * correlation map, and the one place that already has it is here.
+ * `None` means we saw a result for a call we never saw start — a
+ * truncated or resumed stream.
+ */
+name: string | null, is_error: boolean, 
 /**
  * What the tool returned to the model.
  */

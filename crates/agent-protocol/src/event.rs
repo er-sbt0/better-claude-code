@@ -256,6 +256,16 @@ pub struct ToolStarted {
 #[ts(export)]
 pub struct ToolCompleted {
     pub tool_use_id: ToolUseId,
+    /// The tool that produced this result, carried over from the `tool.started`
+    /// that opened it.
+    ///
+    /// The provider does not repeat it: `tool_result` carries only
+    /// `tool_use_id`. Without this every consumer has to build the same
+    /// correlation map, and the one place that already has it is here.
+    /// `None` means we saw a result for a call we never saw start — a
+    /// truncated or resumed stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub is_error: bool,
     /// What the tool returned to the model.
     pub content: String,

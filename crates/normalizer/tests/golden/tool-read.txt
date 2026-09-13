@@ -5,7 +5,7 @@
   5  run.rate_limited
   6  assistant.thinking     block=0 disclosed=false len=0
   7  tool.started           name=Read args={file_path}
-  8  tool.completed         is_error=false result=structured non_execution=-
+  8  tool.completed         name=Read is_error=false result=structured non_execution=-
   9  assistant.message      block=0 len=102
  10  turn.finished          index=0 subtype=success ok=true denials=0 models=2 cost_reconciles=true
  11  run.finished           turns=1

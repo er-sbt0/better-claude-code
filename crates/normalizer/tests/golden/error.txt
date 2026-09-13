@@ -4,7 +4,7 @@
   4  turn.started           index=0
   5  run.rate_limited
   6  tool.started           name=Read args={file_path}
-  7  tool.completed         is_error=true result=text non_execution=-
+  7  tool.completed         name=Read is_error=true result=text non_execution=-
   8  turn.finished          index=0 subtype=error_max_turns ok=false denials=0 models=2 cost_reconciles=true
   9  run.failed             turns=1 reason=turn ended with subtype `error_max_turns`
 

@@ -98,7 +98,8 @@ fn render(events: &[RawEvent], stats: &normalizer::Stats) -> String {
             }
             Event::ToolStarted(p) => format!("name={} args={}", p.name, arg_keys(&p.input)),
             Event::ToolCompleted(p) => format!(
-                "is_error={} result={} non_execution={}",
+                "name={} is_error={} result={} non_execution={}",
+                opt(&p.name),
                 p.is_error,
                 match &p.result {
                     Some(agent_protocol::ToolResult::Text(_)) => "text",
@@ -520,4 +521,39 @@ fn a_stream_that_never_starts_is_a_failure() {
     let mut n = ClaudeCodeNormalizer::with_clock("run_x".into(), Box::new(FixedClock::default()));
     let events = n.finish(Some(1));
     assert!(matches!(events[0].event, Event::RunFailed(_)));
+}
+
+/// A `tool_result` carries only `tool_use_id`; the provider never repeats the
+/// tool's name. The normalizer already correlates the two, so the completion
+/// carries it — otherwise every consumer rebuilds the same map, and the shadow
+/// snapshot a tool call causes (§13.1) cannot be labelled with what caused it.
+#[test]
+fn a_completion_names_the_tool_that_produced_it() {
+    let mut checked = 0;
+    for (name, _) in fixtures() {
+        let events = events_of(&name);
+        let started: BTreeMap<String, String> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                Event::ToolStarted(p) => Some((p.tool_use_id.0.clone(), p.name.clone())),
+                _ => None,
+            })
+            .collect();
+        for e in &events {
+            let Event::ToolCompleted(p) = &e.event else {
+                continue;
+            };
+            let expected = started.get(&p.tool_use_id.0);
+            assert_eq!(
+                p.name.as_ref(),
+                expected,
+                "{name}: completion of {} names the wrong tool",
+                p.tool_use_id
+            );
+            if expected.is_some() {
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 0, "no fixture exercised a tool completion");
 }

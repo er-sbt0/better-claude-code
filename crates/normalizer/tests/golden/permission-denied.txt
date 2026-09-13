@@ -5,7 +5,7 @@
   5  run.rate_limited
   6  tool.started           name=Write args={content,file_path}
   7  permission.resolved    tool=Write allowed=false reason_type=asyncAgent
-  8  tool.completed         is_error=true result=text non_execution=permission-rule
+  8  tool.completed         name=Write is_error=true result=text non_execution=permission-rule
   9  assistant.message      block=0 len=260
  10  turn.finished          index=0 subtype=success ok=true denials=1 models=2 cost_reconciles=true
  11  run.finished           turns=1
