@@ -1,0 +1,20 @@
+[package]
+name = "workspace-mcp"
+description = "The workspace's own MCP server, injected into every agent (design §6 source 3, §18)."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+agent-protocol = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+# The binary Claude Code actually spawns. Named here rather than left to
+# `src/bin` auto-discovery because the driver has to locate it by this name in
+# the build directory, so it is part of the contract rather than a filename.
+[[bin]]
+name = "workspace-mcp-relay"
+path = "src/bin/relay.rs"

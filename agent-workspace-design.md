@@ -314,7 +314,7 @@ claude -p "<prompt>" \
   --include-partial-messages \              # token-level streaming; see the caveat below
   --session-id <uuid we generate> \         # we assign it; see §14
   --mcp-config <generated.json> \           # our workspace server (§6)
-  --permission-prompt-tool mcp__workspace__request_permission \
+  --permission-prompt-tool mcp__agent-workspace__request_permission \
   --append-system-prompt "<the workspace MCP tools exist; when to use them>" \
   --system-prompt-snapshot off \            # or the appended prompt is frozen; see below
   --thinking-display summarized \           # or thinking blocks arrive empty
@@ -571,8 +571,14 @@ Never let a failed parse degrade the run. Unparsed is the default, not an error.
 agent.** The agent then reports structure to us directly, agent-neutrally, by
 construction — no scraping, no parsers, no vendor-specific event schemas.
 
+The server is injected under the name **`agent-workspace`**, not `workspace`:
+the latter is reserved by Claude Code for its own hosted tools, and a config
+claiming it is dropped with a warning on the debug channel only — leaving a run
+with no server and no visible error. Verified the hard way; see
+`docs/verification/claude-code-permission-prompt-tool.md`.
+
 ```text
-workspace MCP server — tools exposed to the agent
+agent-workspace MCP server — tools exposed to the agent
 
   report_finding(severity, title, body, references[])
   open_plan(steps[])           update_plan(step_id, status)
@@ -1472,11 +1478,21 @@ Two things the recording exposed about the method itself:
   `--permission-prompts none`, so the first attempt at a denial fixture recorded
   no denial. Write to a file if you want a permission decision.
 
-Still owed: Codex, and the two event classes that need a workspace MCP server
-that does not exist yet — `permission.requested` via `--permission-prompt-tool`,
-and `workspace.report` (§6 source 3). Subagent traffic is a third gap worth
-closing early: `parent_tool_use_id` is present but null in every current
-fixture, which is exactly the shape that hides a normalizer bug.
+Still owed: Codex, and a recorded capture of `workspace.report` — the server now
+exists (`crates/workspace-mcp`) and both event classes have been produced by a
+real run, but no `.ndjson` in `fixtures/` contains one yet.
+
+**`permission.requested` can never have a fixture, and that is structural.** The
+provider's permission layer calls our tool directly, so the request is not a
+`tool_use` block and never appears on stdout at all. Replaying a recorded stream
+can no more produce it than it can produce `run.finished`. It is covered by a
+driver test and by live runs instead, and §16's re-record ritual will not catch
+a change to it — the permission-tool response contract has to be re-verified
+against the binary, which is why it has its own verification record.
+
+Subagent traffic is a third gap worth closing early: `parent_tool_use_id` is
+present but null in every current fixture, which is exactly the shape that hides
+a normalizer bug.
 
 ---
 

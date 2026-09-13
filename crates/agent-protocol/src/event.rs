@@ -10,6 +10,25 @@ use crate::usage::Usage;
 /// change; never repurpose a variant name (design §7).
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// The name our own MCP server is injected under (design §6 source 3).
+///
+/// **Not `workspace`.** Claude Code reserves that for its own hosted tools and
+/// drops a config claiming it with a debug-channel warning, leaving a run with
+/// no server and no visible error — see `workspace_mcp::SERVER_NAME`, where
+/// that is written up in full.
+///
+/// It lives here because two crates that must agree about it cannot see each
+/// other: `normalizer` recognizes the prefix on the wire, `workspace-mcp`
+/// publishes it, and neither should depend on the other.
+pub const WORKSPACE_MCP_SERVER: &str = "agent-workspace";
+
+/// How that server's tools are namespaced on the wire.
+///
+/// Claude Code qualifies every MCP tool as `mcp__<server>__<tool>`. Kept as a
+/// literal because a `const` cannot be interpolated into one; `prefix_matches_
+/// the_server_name` is what stops the two from drifting.
+pub const WORKSPACE_TOOL_PREFIX: &str = "mcp__agent-workspace__";
+
 /// One observed fact about what a provider did.
 ///
 /// Raw events are append-only and immutable. Anything we *concluded* rather
@@ -324,8 +343,26 @@ pub struct PermissionResolved {
 #[ts(export)]
 pub struct WorkspaceReport {
     /// Which workspace MCP tool the agent called, e.g. `report_finding`.
+    ///
+    /// The bare name, not the `mcp__agent-workspace__report_finding` spelling the
+    /// provider uses on the wire. The prefix is Claude Code's namespacing of
+    /// our own server and says nothing a consumer needs.
     pub tool: String,
     pub payload: Value,
+    /// The call this report stands for.
+    ///
+    /// A report *replaces* the `tool.started` for the same block (§8: emitting
+    /// both would make one recomputable from the other), so without this id
+    /// nothing pairs the report with the `tool.completed` that answers it —
+    /// which is the only place `is_error` says whether our server accepted the
+    /// payload.
+    pub tool_use_id: ToolUseId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    /// Set when a subagent reported rather than the main agent (§13.1 uses the
+    /// same field for attribution granularity).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_tool_use_id: Option<ToolUseId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]

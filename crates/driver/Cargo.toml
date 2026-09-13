@@ -12,6 +12,7 @@ agent-protocol = { workspace = true }
 event-log = { workspace = true }
 normalizer = { workspace = true }
 worktree = { workspace = true }
+workspace-mcp = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }

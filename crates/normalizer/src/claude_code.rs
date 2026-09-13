@@ -14,7 +14,7 @@ use agent_protocol::{
     AssistantMessage, AssistantThinking, Event, ModelUsage, PermissionResolved, RawEvent,
     RunFailed, RunFinished, RunId, RunRateLimited, RunStarted, SessionId, ToolCompleted,
     ToolResult, ToolStarted, ToolUseId, TurnFinished, TurnStarted, Unclassified,
-    UnclassifiedReason, Usage, UserMessage, SCHEMA_VERSION,
+    UnclassifiedReason, Usage, UserMessage, WorkspaceReport, SCHEMA_VERSION, WORKSPACE_TOOL_PREFIX,
 };
 use serde_json::Value;
 
@@ -217,6 +217,27 @@ impl ClaudeCodeNormalizer {
         vec![self.wrap(None, event)]
     }
 
+    /// Number an event this normalizer did not parse.
+    ///
+    /// Everything else here is a pure function of the stream, and that is the
+    /// point of the crate — but two event classes have no stream to be a
+    /// function of. A `permission.requested` is a call the *provider* makes to
+    /// our MCP server; it is never a `tool_use` block, so no amount of reading
+    /// stdout produces it (design §12 option A, §15).
+    ///
+    /// Such an event still has to be addressable (§7) and ordered against
+    /// everything else in the run, and `seq` has exactly one owner. Letting the
+    /// driver number these itself would be a second writer to that counter,
+    /// which is the bug this method exists to prevent — so out-of-band events
+    /// come back here to be numbered, and the caller serializes access.
+    ///
+    /// No idempotency key: there is no provider `uuid` to key on, and unlike a
+    /// replayed stream these are never re-delivered. A resume re-asks rather
+    /// than replays.
+    pub fn wrap_external(&mut self, event: Event) -> RawEvent {
+        self.wrap(None, event)
+    }
+
     fn wrap(&mut self, idempotency_key: Option<String>, event: Event) -> RawEvent {
         self.seq += 1;
         RawEvent {
@@ -336,14 +357,44 @@ impl ClaudeCodeNormalizer {
                     Some("tool_use") => {
                         let id = str_field(block, "id").unwrap_or_default();
                         let name = str_field(block, "name").unwrap_or_default();
+                        // Correlation is by tool_use id and is deliberately
+                        // blind to what kind of event the call became: the
+                        // matching `tool_result` needs the name either way.
                         self.tool_names.insert(id.clone(), name.clone());
-                        Event::ToolStarted(ToolStarted {
-                            tool_use_id: ToolUseId::from(id),
-                            name,
-                            input: block.get("input").cloned().unwrap_or(Value::Null),
-                            message_id: message_id.clone(),
-                            parent_tool_use_id: parent.clone(),
-                        })
+                        let input = block.get("input").cloned().unwrap_or(Value::Null);
+
+                        // A call to our own workspace MCP server is a report,
+                        // and it replaces `tool.started` rather than
+                        // accompanying it. §8 forbids storing anything
+                        // recomputable: emitting both would make
+                        // `workspace.report` derivable from `tool.started` by
+                        // matching this prefix, which is a projection, and
+                        // projections do not go in the log. So the semantic
+                        // event stands in for the observed one, carrying the
+                        // BARE tool name and the `input` verbatim.
+                        //
+                        // The asymmetry with the matching `tool_result`, which
+                        // still emits `tool.completed`, is intentional and not
+                        // an oversight: that result carries `is_error`, the
+                        // only signal that our own server rejected a payload.
+                        // Nothing else records it, so it is an observed fact
+                        // and it stays.
+                        match name.strip_prefix(WORKSPACE_TOOL_PREFIX).map(str::to_owned) {
+                            Some(tool) => Event::WorkspaceReport(WorkspaceReport {
+                                tool,
+                                payload: input,
+                                tool_use_id: ToolUseId::from(id),
+                                message_id: message_id.clone(),
+                                parent_tool_use_id: parent.clone(),
+                            }),
+                            None => Event::ToolStarted(ToolStarted {
+                                tool_use_id: ToolUseId::from(id),
+                                name,
+                                input,
+                                message_id: message_id.clone(),
+                                parent_tool_use_id: parent.clone(),
+                            }),
+                        }
                     }
                     _ => malformed(block, "unrecognized assistant content block"),
                 }

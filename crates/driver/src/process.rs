@@ -41,8 +41,17 @@ pub struct Outcome {
 /// A running agent.
 pub struct Session {
     control: Sender<Control>,
-    reader: JoinHandle<Result<(Outcome, Pipeline)>>,
+    reader: JoinHandle<Result<Outcome>>,
     killer: Arc<Mutex<Option<Child>>>,
+    /// Shared, because the stream is no longer the only writer: the workspace
+    /// MCP server appends `permission.requested` from the thread serving the
+    /// provider's call (§6, §12). The log is still single-writer in the sense
+    /// §14 means — one process, one connection — and this mutex is what makes
+    /// that true across the two producers inside it.
+    pipeline: Arc<Mutex<Pipeline>>,
+    /// Held so it outlives the run and is shut down before the log is
+    /// reclaimed. `None` when no workspace server was injected.
+    mcp: Option<workspace_mcp::Listener>,
 }
 
 impl Session {
@@ -73,8 +82,22 @@ impl Session {
     }
 
     /// Block until the agent exits, and take back the log.
-    pub fn wait(self) -> Result<(Outcome, EventLog)> {
-        let (outcome, pipeline) = self.reader.join().unwrap_or_else(|_| Err(Error::Closed))?;
+    pub fn wait(mut self) -> Result<(Outcome, EventLog)> {
+        let outcome = self.reader.join().unwrap_or_else(|_| Err(Error::Closed))?;
+
+        // Order matters. Every connection thread the server is still serving
+        // holds a reference to the pipeline, so the log cannot be reclaimed
+        // until the listener is down and joined. Doing this after the reader
+        // has finished also means a permission request that arrives during
+        // teardown is answered rather than dropped on a closed socket.
+        if let Some(mcp) = self.mcp.take() {
+            mcp.shutdown();
+        }
+
+        let pipeline = Arc::try_unwrap(self.pipeline)
+            .map_err(|_| Error::Closed)?
+            .into_inner()
+            .expect("pipeline mutex poisoned");
         Ok((outcome, pipeline.into_log()))
     }
 }
@@ -85,10 +108,12 @@ impl Session {
 /// `--input-format stream-json` the prompt is a `user` message on the wire.
 pub fn spawn(
     spec: &LaunchSpec,
-    mut pipeline: Pipeline,
+    pipeline: Arc<Mutex<Pipeline>>,
     first_prompt: &str,
     sink: Option<Sender<RawEvent>>,
+    mcp: Option<workspace_mcp::Listener>,
 ) -> Result<Session> {
+    spec.validate()?;
     let argv = spec.argv();
     let mut child = Command::new(&spec.binary)
         .args(&argv)
@@ -116,8 +141,9 @@ pub fn spawn(
 
     let killer = Arc::new(Mutex::new(Some(child)));
     let reader_killer = Arc::clone(&killer);
+    let reader_pipeline = Arc::clone(&pipeline);
     let reader = thread::spawn(move || {
-        let outcome = read_loop(stdout, &mut pipeline, sink.as_ref());
+        let outcome = read_loop(stdout, &reader_pipeline, sink.as_ref());
         // Reap before joining the helpers: the writer is blocked on a channel
         // that stays open until the caller drops the Session, and stderr does
         // not close until the process does.
@@ -136,23 +162,28 @@ pub fn spawn(
         // These events go to the sink like any other: `run.finished` is the one
         // a live view most needs, and it is produced here rather than by a line
         // of stdout, so forgetting it leaves every run looking unfinished.
-        let tail = pipeline.finish(outcome.exit_code)?;
+        let tail = reader_pipeline
+            .lock()
+            .expect("pipeline mutex poisoned")
+            .finish(outcome.exit_code)?;
         outcome.stored += tail.stored as u64;
         emit(sink.as_ref(), tail.events);
         drop(writer);
-        Ok((outcome, pipeline))
+        Ok(outcome)
     });
 
     Ok(Session {
         control: control_tx,
         reader,
         killer,
+        pipeline,
+        mcp,
     })
 }
 
 fn read_loop(
     stdout: ChildStdout,
-    pipeline: &mut Pipeline,
+    pipeline: &Mutex<Pipeline>,
     sink: Option<&Sender<RawEvent>>,
 ) -> Result<Outcome> {
     let mut outcome = Outcome {
@@ -169,13 +200,20 @@ fn read_loop(
             // up to here is already durable.
             Err(_) => break,
         };
+        // Held for one line only. A permission request arriving mid-stream
+        // waits for this to be released, which is the serialization `seq`
+        // requires -- and the agent is blocked on that answer anyway, so it
+        // costs nothing it was not already paying.
         let Ingested {
             events,
             stored,
             duplicates,
             snapshot,
             ..
-        } = pipeline.ingest(&line)?;
+        } = pipeline
+            .lock()
+            .expect("pipeline mutex poisoned")
+            .ingest(&line)?;
         outcome.stored += stored as u64;
         outcome.duplicates += duplicates as u64;
         if snapshot.is_some() {

@@ -22,12 +22,14 @@
 
 mod error;
 mod launch;
+mod permission;
 mod pipeline;
 mod process;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 
 use agent_protocol::{RawEvent, RunId};
 use event_log::{EventLog, Run, RunStatus};
@@ -35,6 +37,7 @@ use worktree::{ShadowHistory, Worktree};
 
 pub use error::{Error, Result};
 pub use launch::{new_session_id, user_message, LaunchSpec, Permission, Thinking};
+pub use permission::{Decider, DenyEverything, RunWorkspace};
 pub use pipeline::{Ingested, Pipeline};
 pub use process::{Outcome, Session};
 
@@ -61,8 +64,58 @@ pub struct RunSpec {
     /// tool call.
     pub post_create_hook: Option<Vec<String>>,
     /// Launch flags. `cwd` is overwritten with the worktree — §13 does not
-    /// leave that to the caller.
+    /// leave that to the caller. So are the four flags the workspace MCP
+    /// server owns, when one is requested.
     pub launch: LaunchSpec,
+    /// Inject our own MCP server into the run (§6 source 3, §12 option A).
+    ///
+    /// `None` leaves the launch exactly as the caller built it, which in
+    /// practice means `Permission::DenyPrompts`: a run that can only be
+    /// pre-authorized. That is honest, and it is not the product.
+    pub workspace_mcp: Option<WorkspaceMcp>,
+}
+
+/// How to host the workspace MCP server for one run.
+#[derive(Clone)]
+pub struct WorkspaceMcp {
+    /// Absolute path to the relay binary the provider will spawn.
+    ///
+    /// The provider starts stdio MCP servers as its own children, so the
+    /// server cannot simply live in this process. The relay is a byte pipe from
+    /// those pipes to our socket; all protocol logic stays in
+    /// `workspace-mcp`, where a test reaches it without spawning anything.
+    pub relay: PathBuf,
+    /// Directory to put the run's socket in.
+    ///
+    /// **Not the worktree.** §15 treats everything the agent can write as
+    /// untrusted, and the socket is the one channel whose integrity the
+    /// permission model depends on. `$XDG_RUNTIME_DIR` is the right answer on
+    /// Linux; see [`default_runtime_dir`].
+    pub runtime_dir: PathBuf,
+    /// Who answers a permission request.
+    pub decider: Arc<dyn Decider>,
+}
+
+impl std::fmt::Debug for WorkspaceMcp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkspaceMcp")
+            .field("relay", &self.relay)
+            .field("runtime_dir", &self.runtime_dir)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Where run sockets go when the caller has no opinion.
+///
+/// `$XDG_RUNTIME_DIR` is per-user, mode 0700 and on tmpfs, which is what a
+/// socket carrying permission decisions wants. Falling back to the temp dir is
+/// weaker — it is world-readable — so the socket's own directory is created
+/// 0700 either way rather than relying on where it landed.
+pub fn default_runtime_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("agent-workspace")
 }
 
 /// A started run: its worktree, its shadow history, and the live process.
@@ -112,8 +165,19 @@ pub fn start(
     })?;
 
     spec.launch.cwd = wt.path().to_path_buf();
-    let pipeline = Pipeline::new(spec.run_id.clone(), log, Some(shadow));
-    let session = process::spawn(&spec.launch, pipeline, &spec.prompt, sink)?;
+    let pipeline = Arc::new(Mutex::new(Pipeline::new(
+        spec.run_id.clone(),
+        log,
+        Some(shadow),
+    )));
+    let mcp = wire_workspace_mcp(
+        &mut spec.launch,
+        &spec.run_id,
+        spec.workspace_mcp.as_ref(),
+        &pipeline,
+        sink.as_ref(),
+    )?;
+    let session = process::spawn(&spec.launch, pipeline, &spec.prompt, sink, mcp)?;
 
     Ok(Started {
         session,
@@ -132,6 +196,7 @@ pub fn resume(
     mut launch: LaunchSpec,
     prompt: &str,
     sink: Option<Sender<RawEvent>>,
+    workspace_mcp: Option<&WorkspaceMcp>,
 ) -> Result<Session> {
     let wt = Worktree::open(Path::new(
         run.worktree_path.as_deref().unwrap_or(&run.workspace_path),
@@ -139,8 +204,71 @@ pub fn resume(
     let shadow = ShadowHistory::open(&wt, &run.id)?;
     launch.cwd = wt.path().to_path_buf();
     launch.resume = run.provider_session_id.clone();
-    let pipeline = Pipeline::resuming(run.id.clone(), log, Some(shadow))?;
-    process::spawn(&launch, pipeline, prompt, sink)
+    let pipeline = Arc::new(Mutex::new(Pipeline::resuming(
+        run.id.clone(),
+        log,
+        Some(shadow),
+    )?));
+    // A resumed run gets its own socket and its own listener. The server is
+    // per-process, not per-run-row: the old one died with the old process, and
+    // the provider will spawn a fresh relay for this one.
+    let mcp = wire_workspace_mcp(
+        &mut launch,
+        &run.id,
+        workspace_mcp,
+        &pipeline,
+        sink.as_ref(),
+    )?;
+    process::spawn(&launch, pipeline, prompt, sink, mcp)
+}
+
+/// Bind the run's MCP server and rewrite the flags that depend on it.
+///
+/// Four flags, and each is load-bearing:
+///
+/// - `--mcp-config` as inline JSON. The provider treats a value starting with
+///   `{` as JSON and anything else as a path, so nothing here writes a file.
+/// - `--permission-prompt-tool mcp__agent-workspace__request_permission`, which
+///   is the whole of §12 option A.
+/// - `mcp__agent-workspace__report_finding` on the allow-list. Verified the
+///   hard way: without it, reporting a finding raises a permission request of
+///   its own — the agent asking to be allowed to tell us something — so a
+///   deny-by-default policy silently denies its own reporting channel.
+///   `request_permission` is deliberately *not* allow-listed: the provider
+///   invokes it directly, and the model has no business calling it.
+/// - `--append-system-prompt`, because a tool the agent is never told about is
+///   a tool it never calls (§6). Appended to whatever the caller set rather
+///   than replacing it.
+fn wire_workspace_mcp(
+    launch: &mut LaunchSpec,
+    run_id: &RunId,
+    cfg: Option<&WorkspaceMcp>,
+    pipeline: &Arc<Mutex<Pipeline>>,
+    sink: Option<&Sender<RawEvent>>,
+) -> Result<Option<workspace_mcp::Listener>> {
+    let Some(cfg) = cfg else { return Ok(None) };
+
+    let workspace = Arc::new(RunWorkspace::new(
+        Arc::clone(pipeline),
+        sink.cloned(),
+        Arc::clone(&cfg.decider),
+    ));
+    let listener = workspace_mcp::Listener::bind(&cfg.runtime_dir.join(&run_id.0), workspace)?;
+
+    launch.mcp_config = Some(listener.mcp_config(&cfg.relay));
+    launch.permission = Permission::AskVia {
+        tool: workspace_mcp::qualified(workspace_mcp::REQUEST_PERMISSION),
+    };
+    let report = workspace_mcp::qualified(workspace_mcp::REPORT_FINDING);
+    if !launch.allowed_tools.contains(&report) {
+        launch.allowed_tools.push(report);
+    }
+    launch.append_system_prompt = Some(match launch.append_system_prompt.take() {
+        Some(existing) => format!("{existing}\n\n{}", workspace_mcp::SYSTEM_PROMPT),
+        None => workspace_mcp::SYSTEM_PROMPT.to_owned(),
+    });
+
+    Ok(Some(listener))
 }
 
 /// Reconcile runs the log still calls running (§8's crash recovery).

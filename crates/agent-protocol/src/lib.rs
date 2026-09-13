@@ -17,7 +17,7 @@ pub use event::{
     AssistantMessage, AssistantThinking, Event, PermissionRequested, PermissionResolved,
     ProcessOutput, RawEvent, RunFailed, RunFinished, RunRateLimited, RunStarted, ToolCompleted,
     ToolResult, ToolStarted, TurnFinished, TurnStarted, Unclassified, UnclassifiedReason,
-    UserMessage, WorkspaceReport, SCHEMA_VERSION,
+    UserMessage, WorkspaceReport, SCHEMA_VERSION, WORKSPACE_MCP_SERVER, WORKSPACE_TOOL_PREFIX,
 };
 pub use ids::{RunId, SessionId, ToolUseId};
 pub use usage::{ModelUsage, Usage};
@@ -26,6 +26,25 @@ pub use usage::{ModelUsage, Usage};
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The two halves of the server's identity have to agree, and one of them
+    /// is a literal because `const` cannot be interpolated.
+    ///
+    /// Worth a test rather than a comment: getting this wrong does not fail
+    /// loudly. Claude Code drops an unknown server with a debug-channel
+    /// warning, so the symptom of a drifted prefix is reports quietly never
+    /// being recognized — which reads as an agent that chose not to report.
+    #[test]
+    fn the_tool_prefix_matches_the_server_name() {
+        assert_eq!(
+            WORKSPACE_TOOL_PREFIX,
+            format!("mcp__{WORKSPACE_MCP_SERVER}__")
+        );
+        assert_ne!(
+            WORKSPACE_MCP_SERVER, "workspace",
+            "`workspace` is reserved by Claude Code and is silently not loaded"
+        );
+    }
 
     /// The envelope must serialize exactly as design §8 draws it: `type` and
     /// `payload` at the top level, beside the envelope fields.

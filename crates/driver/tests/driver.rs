@@ -101,6 +101,7 @@ fn spec(repo: &Path, binary: &Path, run: &RunId) -> RunSpec {
         prompt: "add retry to refresh()".to_owned(),
         post_create_hook: None,
         launch,
+        workspace_mcp: None,
     }
 }
 
@@ -471,3 +472,141 @@ const EDIT_THEN_REPORT_LINES: &[&str] = &[
     r#"{"type":"user","uuid":"u2","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"ok"}]}}"#,
     r#"{"type":"assistant","uuid":"u3","message":{"id":"m2","content":[{"type":"text","text":"done"}]}}"#,
 ];
+
+// ------------------------------------------------ the permission channel --
+
+fn in_memory_run(run: &RunId) -> EventLog {
+    let mut log = EventLog::open_in_memory().unwrap();
+    log.create_run(&event_log::Run {
+        id: run.clone(),
+        agent: "claude-code".to_owned(),
+        agent_version: None,
+        provider_session_id: None,
+        workspace_path: "/tmp".to_owned(),
+        worktree_path: None,
+        branch: None,
+        shadow_ref: None,
+        prompt: None,
+        status: RunStatus::Running,
+        started_at: "2026-09-13T09:00:00.000Z".to_owned(),
+        finished_at: None,
+        parent_run_id: None,
+    })
+    .unwrap();
+    log
+}
+
+struct Answer(workspace_mcp::Decision);
+
+impl driver::Decider for Answer {
+    fn decide(&self, _r: &workspace_mcp::PermissionRequest) -> workspace_mcp::Decision {
+        match &self.0 {
+            workspace_mcp::Decision::Allow { updated_input } => workspace_mcp::Decision::Allow {
+                updated_input: updated_input.clone(),
+            },
+            workspace_mcp::Decision::Deny { message, interrupt } => workspace_mcp::Decision::Deny {
+                message: message.clone(),
+                interrupt: *interrupt,
+            },
+        }
+    }
+}
+
+/// The permission round trip, without a process.
+///
+/// This is the class of event no recorded stream contains and no parser can
+/// produce: the provider calls our tool, so the request exists only on the
+/// runtime's own channel (§12 option A, §15). What it has to prove is that the
+/// channel both *answers* and *records* — a decision that reaches the agent but
+/// not the log would be a grant nobody can audit.
+#[test]
+fn a_permission_request_is_answered_and_recorded() {
+    use std::sync::{Arc, Mutex};
+    use workspace_mcp::Workspace;
+
+    let run = RunId::from("run_perm");
+    let pipeline = Arc::new(Mutex::new(Pipeline::new(
+        run.clone(),
+        in_memory_run(&run),
+        None,
+    )));
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let ws = driver::RunWorkspace::new(
+        Arc::clone(&pipeline),
+        Some(tx),
+        Arc::new(Answer(workspace_mcp::Decision::Deny {
+            message: "not in this worktree".to_owned(),
+            interrupt: false,
+        })),
+    );
+
+    let decision = ws.request_permission(workspace_mcp::PermissionRequest {
+        tool_name: "Write".to_owned(),
+        input: serde_json::json!({"file_path": "/etc/passwd", "content": "x"}),
+        tool_use_id: Some("toolu_1".to_owned()),
+    });
+
+    match decision {
+        workspace_mcp::Decision::Deny { message, .. } => {
+            assert_eq!(message, "not in this worktree")
+        }
+        other => panic!("expected the decider's answer, got {other:?}"),
+    }
+
+    let stored = pipeline.lock().unwrap().log().events(&run).unwrap();
+    let kinds: Vec<&str> = stored.iter().map(|e| e.type_name()).collect();
+    assert_eq!(
+        kinds,
+        ["permission.requested", "permission.resolved"],
+        "the question is recorded before the answer, so a crash mid-decision \
+         still says what was asked"
+    );
+    assert_eq!(stored[0].seq, 1);
+    assert_eq!(stored[1].seq, 2);
+
+    let Event::PermissionResolved(r) = &stored[1].event else {
+        panic!("expected permission.resolved")
+    };
+    assert!(!r.allowed);
+    assert_eq!(r.reason.as_deref(), Some("not in this worktree"));
+    assert_eq!(
+        r.reason_type.as_deref(),
+        Some("workspace"),
+        "our answer must be distinguishable from the provider's own refusals"
+    );
+
+    // §8's trap: an event that reaches the log but not the live view leaves the
+    // UI showing a run that is waiting on nothing.
+    let seen: Vec<String> = rx.try_iter().map(|e| e.type_name().to_owned()).collect();
+    assert_eq!(seen, ["permission.requested", "permission.resolved"]);
+}
+
+/// A run that cannot be asked must not claim it can.
+///
+/// `--strict-mcp-config` means the only servers loaded are ours, so an
+/// `AskVia` naming a tool on a server we never injected makes every permission
+/// request fail — and the provider reports that as the agent being unable to do
+/// anything, not as a bad flag.
+#[test]
+fn a_permission_tool_without_its_server_is_refused_before_spawning() {
+    let mut s = LaunchSpec::new(
+        "/wt",
+        agent_protocol::SessionId::from("uuid-1"),
+        Permission::AskVia {
+            tool: workspace_mcp::qualified(workspace_mcp::REQUEST_PERMISSION),
+        },
+    );
+    assert!(s.validate().is_err(), "no mcp_config: cannot resolve");
+
+    s.mcp_config = Some("{\"mcpServers\":{}}".to_owned());
+    assert!(s.validate().is_ok());
+
+    s.permission = Permission::AskVia {
+        tool: "request_permission".to_owned(),
+    };
+    assert!(
+        s.validate().is_err(),
+        "a bare tool name parses to nothing: the CLI needs mcp__<server>__<tool>"
+    );
+}

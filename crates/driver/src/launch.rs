@@ -9,6 +9,8 @@ use std::path::PathBuf;
 
 use agent_protocol::SessionId;
 
+use crate::error::{Error, Result};
+
 /// How permission prompts are answered.
 ///
 /// Not defaulted, because there is no safe default: every value is a posture
@@ -26,7 +28,10 @@ pub enum Permission {
     /// (`--permission-prompt-tool`), which is §12 option A.
     ///
     /// Requires [`LaunchSpec::mcp_config`]; the tool lives on the same server
-    /// as §6's. Unreachable until that server is built.
+    /// as §6's, and [`LaunchSpec::validate`] refuses the combination without
+    /// it. The name must be fully qualified as `mcp__<server>__<tool>` — the
+    /// CLI parses the server out of it and waits for that server to load, so a
+    /// bare tool name does not resolve.
     AskVia { tool: String },
     /// Hand the decision to the agent's own mode, with no prompt reaching us.
     Mode(String),
@@ -94,6 +99,41 @@ impl LaunchSpec {
             resume: None,
             extra: Vec::new(),
         }
+    }
+
+    /// Refuse a launch that would fail as something else.
+    ///
+    /// `--permission-prompt-tool` names a tool on an MCP server, and
+    /// `--strict-mcp-config` — which [`LaunchSpec::argv`] always passes —
+    /// guarantees the only servers loaded are the ones we injected. So an
+    /// `AskVia` without an [`mcp_config`](LaunchSpec::mcp_config) names a tool
+    /// that cannot exist, and the provider reports that as every permission
+    /// request failing rather than as a bad flag. The symptom is an agent that
+    /// mysteriously cannot do anything, which is expensive to diagnose and
+    /// cheap to prevent here.
+    pub fn validate(&self) -> Result<()> {
+        if let Permission::AskVia { tool } = &self.permission {
+            if self.mcp_config.is_none() {
+                return Err(Error::LaunchSpec {
+                    reason: format!(
+                        "--permission-prompt-tool {tool} needs the MCP server that defines it, \
+                         but mcp_config is unset and --strict-mcp-config is always passed"
+                    ),
+                });
+            }
+            // `mcp__<server>__<tool>`: the CLI splits on `__` and requires the
+            // first segment to be exactly `mcp`, then waits for `<server>` to
+            // load. Anything else parses to nothing and never resolves.
+            if !tool.starts_with("mcp__") {
+                return Err(Error::LaunchSpec {
+                    reason: format!(
+                        "--permission-prompt-tool needs a fully qualified \
+                         mcp__<server>__<tool> name, got {tool}"
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Build the argv.

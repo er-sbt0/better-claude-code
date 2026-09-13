@@ -117,7 +117,9 @@ fn render(events: &[RawEvent], stats: &normalizer::Stats) -> String {
                 )
             }
             Event::PermissionRequested(p) => format!("tool={}", p.tool_name),
-            Event::WorkspaceReport(p) => format!("tool={}", p.tool),
+            Event::WorkspaceReport(p) => {
+                format!("tool={} args={}", p.tool, arg_keys(&p.payload))
+            }
             Event::ProcessOutput(p) => format!("stream={}", p.stream),
             Event::Unclassified(p) => {
                 let source = match (&p.source_type, &p.source_subtype) {
@@ -556,4 +558,194 @@ fn a_completion_names_the_tool_that_produced_it() {
         }
     }
     assert!(checked > 0, "no fixture exercised a tool completion");
+}
+
+// ------------------------------------------- regressions: workspace reports --
+
+/// One `assistant` line, ready to hand to `push_line`.
+fn assistant_line(uuid: &str, blocks: &str) -> String {
+    format!(
+        r#"{{"type":"assistant","uuid":"{uuid}","message":{{"id":"msg_1","content":[{blocks}]}}}}"#
+    )
+}
+
+fn tool_use_block(id: &str, name: &str, input: &str) -> String {
+    format!(r#"{{"type":"tool_use","id":"{id}","name":"{name}","input":{input}}}"#)
+}
+
+fn tool_result_line(uuid: &str, id: &str, is_error: bool) -> String {
+    format!(
+        r#"{{"type":"user","uuid":"{uuid}","message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}","is_error":{is_error},"content":"ok"}}]}}}}"#
+    )
+}
+
+fn normalizer() -> ClaudeCodeNormalizer {
+    ClaudeCodeNormalizer::with_clock("run_x".into(), Box::new(FixedClock::default()))
+}
+
+/// §6 source 3 and §8. A call to our own workspace MCP server is a *report*,
+/// and it stands in for `tool.started` rather than joining it: emitting both
+/// would make one derivable from the other by prefix, and a projection does not
+/// belong in the log.
+#[test]
+fn a_workspace_tool_call_becomes_a_report_rather_than_a_tool_call() {
+    let mut n = normalizer();
+    let events = n.push_line(&assistant_line(
+        "u1",
+        &tool_use_block(
+            "toolu_1",
+            "mcp__agent-workspace__report_finding",
+            r#"{"severity":"high","title":"unbounded loop"}"#,
+        ),
+    ));
+
+    assert_eq!(events.len(), 1, "one content block, one event");
+    let Event::WorkspaceReport(report) = &events[0].event else {
+        panic!("expected workspace.report, got {:?}", events[0].event);
+    };
+    assert_eq!(
+        report.tool, "report_finding",
+        "the bare tool name, not the wire spelling"
+    );
+    assert_eq!(
+        report.payload["severity"], "high",
+        "the tool_use input verbatim"
+    );
+    assert_eq!(report.payload["title"], "unbounded loop");
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.event, Event::ToolStarted(_))),
+        "the report replaces tool.started, it does not accompany it"
+    );
+    assert_eq!(
+        events[0].idempotency_key.as_deref(),
+        Some("u1"),
+        "a single event keeps the provider uuid unsuffixed"
+    );
+    assert!(n.stats().balances());
+}
+
+/// The deliberate asymmetry: the report replaces `tool.started`, but the
+/// matching `tool_result` still becomes `tool.completed`. It carries `is_error`
+/// — the only record that our own server rejected a payload — so suppressing it
+/// would lose an observed fact.
+#[test]
+fn a_workspace_tool_result_still_completes_and_names_the_tool() {
+    let mut n = normalizer();
+    n.push_line(&assistant_line(
+        "u1",
+        &tool_use_block(
+            "toolu_1",
+            "mcp__agent-workspace__open_plan",
+            r#"{"steps":[]}"#,
+        ),
+    ));
+    let events = n.push_line(&tool_result_line("u2", "toolu_1", true));
+
+    assert_eq!(events.len(), 1);
+    let Event::ToolCompleted(done) = &events[0].event else {
+        panic!("expected tool.completed, got {:?}", events[0].event);
+    };
+    assert_eq!(
+        done.name.as_deref(),
+        Some("mcp__agent-workspace__open_plan"),
+        "correlation still names the tool, by its wire spelling"
+    );
+    assert!(done.is_error, "a rejection by our own server is recorded");
+    assert!(n.stats().balances());
+}
+
+/// Only our own server's calls are reports. Another MCP server's tools are
+/// ordinary tool calls and must stay that way.
+#[test]
+fn an_mcp_call_to_another_server_stays_an_ordinary_tool_call() {
+    let mut n = normalizer();
+    let events = n.push_line(&assistant_line(
+        "u1",
+        &tool_use_block(
+            "toolu_1",
+            "mcp__github__create_issue",
+            r#"{"title":"flaky test"}"#,
+        ),
+    ));
+
+    assert_eq!(events.len(), 1);
+    let Event::ToolStarted(started) = &events[0].event else {
+        panic!("expected tool.started, got {:?}", events[0].event);
+    };
+    assert_eq!(
+        started.name, "mcp__github__create_issue",
+        "the name is untouched"
+    );
+}
+
+/// The change must be invisible to every tool that is not ours.
+#[test]
+fn an_ordinary_tool_call_is_unaffected() {
+    let mut n = normalizer();
+    let events = n.push_line(&assistant_line(
+        "u1",
+        &tool_use_block("toolu_1", "Edit", r#"{"file_path":"/tmp/a.rs"}"#),
+    ));
+
+    assert_eq!(events.len(), 1);
+    let Event::ToolStarted(started) = &events[0].event else {
+        panic!("expected tool.started, got {:?}", events[0].event);
+    };
+    assert_eq!(started.name, "Edit");
+    assert_eq!(started.tool_use_id.0, "toolu_1");
+    assert_eq!(started.input["file_path"], "/tmp/a.rs");
+}
+
+/// An `assistant` line fans out per content block, and only some blocks are
+/// workspace calls. The other blocks keep their own event kinds, and the
+/// `#{i}` idempotency suffix still makes every event on the line distinct.
+#[test]
+fn a_mixed_assistant_line_keeps_one_key_per_block() {
+    let mut n = normalizer();
+    let blocks = format!(
+        r#"{{"type":"text","text":"here goes"}},{},{}"#,
+        tool_use_block("toolu_1", "Read", r#"{"file_path":"/tmp/a.rs"}"#),
+        tool_use_block(
+            "toolu_2",
+            "mcp__agent-workspace__note_decision",
+            r#"{"title":"use a queue"}"#
+        ),
+    );
+    let events = n.push_line(&assistant_line("u1", &blocks));
+
+    let kinds: Vec<&str> = events.iter().map(|e| e.type_name()).collect();
+    assert_eq!(
+        kinds,
+        vec!["assistant.message", "tool.started", "workspace.report"],
+        "each block keeps its own kind, in order"
+    );
+
+    let keys: Vec<Option<&str>> = events
+        .iter()
+        .map(|e| e.idempotency_key.as_deref())
+        .collect();
+    assert_eq!(
+        keys,
+        vec![Some("u1#0"), Some("u1#1"), Some("u1#2")],
+        "a fanned-out line suffixes each event's key"
+    );
+
+    let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, vec![1, 2, 3], "seq assignment is unchanged");
+
+    // Both calls still correlate, whichever event kind they became.
+    let done = n.push_line(&tool_result_line("u2", "toolu_2", false));
+    let Event::ToolCompleted(p) = &done[0].event else {
+        panic!("expected tool.completed");
+    };
+    assert_eq!(
+        p.name.as_deref(),
+        Some("mcp__agent-workspace__note_decision")
+    );
+
+    assert_eq!(n.stats().classified, 2, "two lines, both classified");
+    assert!(n.stats().balances());
 }

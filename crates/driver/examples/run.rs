@@ -3,15 +3,21 @@
 //!     cargo run -p driver --example run -- --repo <path> "<prompt>"
 //!
 //! The first thing in this repository that can be pointed at a real agent. It
-//! is a demonstration of the spine, not a product: no UI, no permission dialog
-//! (that needs the workspace MCP server, §6), and everything that would prompt
-//! is denied outright — `--permission-prompts none` — so a run is safe to leave
-//! alone and honest about what it could not do.
+//! is a demonstration of the spine, not a product: no UI, and no permission
+//! dialog — but with `--ask` there is now a permission *channel*, which is the
+//! thing §12 option A needs and the thing a dialog would sit on top of.
+//!
+//! Without `--ask`, everything that would prompt is denied outright
+//! (`--permission-prompts none`), so a run is safe to leave alone and honest
+//! about what it could not do.
 //!
 //!     --repo <path>       repository to run in (required)
 //!     --model <id>        e.g. claude-sonnet-5
 //!     --allow <tool>      repeatable, e.g. --allow Read --allow Edit
 //!     --mode <mode>       --permission-mode, e.g. acceptEdits
+//!     --ask <policy>      host the workspace MCP server and answer prompts:
+//!                         `allow` or `deny` (default: no server, deny-prompts)
+//!     --relay <path>      the relay binary (default: beside this example)
 //!     --max-turns <n>     default 6
 //!     --budget <usd>      default 1.00
 //!     --db <path>         event log (default <repo>/.agent-workspace/log.sqlite)
@@ -19,11 +25,60 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::sync::Arc;
 
 use agent_protocol::{Event, RunId};
-use driver::{LaunchSpec, Permission, RunSpec};
+use driver::{Decider, LaunchSpec, Permission, RunSpec, WorkspaceMcp};
 use event_log::EventLog;
+use workspace_mcp::{Decision, PermissionRequest};
 use worktree::{ShadowHistory, Worktree};
+
+/// Answer every request the same way, and say so on stdout.
+///
+/// A real policy belongs in the UI (§12's V1 surface is a dialog). This exists
+/// to prove the channel carries a decision in both directions, which is the
+/// thing that had never been demonstrated.
+struct Fixed {
+    allow: bool,
+}
+
+impl Decider for Fixed {
+    fn decide(&self, request: &PermissionRequest) -> Decision {
+        let args = request
+            .input
+            .as_object()
+            .map(|m| {
+                let mut k: Vec<&str> = m.keys().map(String::as_str).collect();
+                k.sort();
+                format!("{{{}}}", k.join(","))
+            })
+            .unwrap_or_else(|| "-".to_owned());
+        println!(
+            "      ?  permission  {} {} -> {}",
+            request.tool_name,
+            args,
+            if self.allow { "allow" } else { "deny" }
+        );
+        if self.allow {
+            Decision::Allow {
+                updated_input: None,
+            }
+        } else {
+            Decision::Deny {
+                message: "denied by --ask deny".to_owned(),
+                interrupt: false,
+            }
+        }
+    }
+}
+
+/// The relay lives beside whatever binary is running this example.
+fn relay_beside_me() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    // target/<profile>/examples/run -> target/<profile>/workspace-mcp-relay
+    let candidate = exe.parent()?.parent()?.join("workspace-mcp-relay");
+    candidate.exists().then_some(candidate)
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -35,6 +90,8 @@ fn main() {
     let mut budget = 1.0f64;
     let mut db: Option<PathBuf> = None;
     let mut keep = false;
+    let mut ask: Option<String> = None;
+    let mut relay: Option<PathBuf> = None;
     let mut prompt = None;
 
     let mut it = args.into_iter();
@@ -47,6 +104,8 @@ fn main() {
             "--max-turns" => max_turns = it.next().and_then(|s| s.parse().ok()).unwrap_or(6),
             "--budget" => budget = it.next().and_then(|s| s.parse().ok()).unwrap_or(1.0),
             "--db" => db = it.next().map(PathBuf::from),
+            "--ask" => ask = it.next(),
+            "--relay" => relay = it.next().map(PathBuf::from),
             "--keep" => keep = true,
             "-h" | "--help" => return usage(),
             _ if prompt.is_none() => prompt = Some(a),
@@ -83,6 +142,27 @@ fn main() {
         _ => {}
     }
 
+    let workspace_mcp = match ask.as_deref() {
+        None => None,
+        Some(policy @ ("allow" | "deny")) => {
+            let Some(relay) = relay.or_else(relay_beside_me) else {
+                return die(
+                    "--ask needs the relay binary: run `cargo build -p workspace-mcp` \
+                     or pass --relay <path>",
+                );
+            };
+            println!("relay   {}", relay.display());
+            Some(WorkspaceMcp {
+                relay,
+                runtime_dir: driver::default_runtime_dir(),
+                decider: Arc::new(Fixed {
+                    allow: policy == "allow",
+                }),
+            })
+        }
+        Some(other) => return die(&format!("--ask takes `allow` or `deny`, got {other}")),
+    };
+
     let run_id = RunId::from(format!("run_{}", uuid_like()));
     let mut launch = LaunchSpec::new(&repo, driver::new_session_id(), Permission::DenyPrompts);
     launch.model = model;
@@ -99,6 +179,7 @@ fn main() {
         prompt: prompt.clone(),
         post_create_hook: None,
         launch,
+        workspace_mcp,
     };
 
     let (tx, rx) = mpsc::channel();
@@ -269,7 +350,11 @@ fn describe(e: &Event) -> String {
             p.allowed,
             p.reason_type.as_deref().unwrap_or("")
         ),
-        Event::WorkspaceReport(p) => format!("workspace.report  {}", p.tool),
+        Event::WorkspaceReport(p) => format!(
+            "workspace.report  {} {}",
+            p.tool,
+            clip(&p.payload.to_string())
+        ),
         Event::ProcessOutput(p) => format!("process.output    {}", clip(&p.text)),
         Event::Unclassified(p) => format!(
             "raw.unclassified  {:?} {}",

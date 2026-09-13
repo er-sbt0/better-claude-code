@@ -105,6 +105,23 @@ impl Pipeline {
         self.absorb(events)
     }
 
+    /// Record an event that did not come from the agent's stdout.
+    ///
+    /// The workspace MCP server is the other producer (§6 source 3, §12): the
+    /// provider calls our `request_permission` tool directly, on a thread that
+    /// is not the one reading the stream. That call is an observed fact about
+    /// the run and belongs in the log beside everything else, in order.
+    ///
+    /// Two consequences the caller must respect. `seq` still comes from the
+    /// normalizer, so this must not run concurrently with [`Pipeline::ingest`]
+    /// — the driver holds one mutex over the whole pipeline for exactly that
+    /// reason. And no snapshot is taken: nothing has run yet at the moment
+    /// permission is *asked*, so there is nothing on disk to attribute (§13.1).
+    pub fn ingest_external(&mut self, event: Event) -> Result<Ingested> {
+        let event = self.normalizer.wrap_external(event);
+        self.absorb(vec![event])
+    }
+
     /// Close the run once the process has exited.
     ///
     /// The stream never says a run is over — `result` is per turn (§5) — so the
