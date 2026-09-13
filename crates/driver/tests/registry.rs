@@ -665,3 +665,129 @@ fn forking_through_the_registry_supervises_the_child_like_any_other_run() {
         "a fork inherits its parent's model, by copy onto its own row"
     );
 }
+
+/// **A conversation outlives the window that started it** (§14).
+///
+/// Nothing closes a run's stdin on its behalf, so every run ends when the app
+/// does. Until `Registry::resume` existed the composer could only reach runs
+/// this process happened to be holding, which meant it was dead on every run
+/// from every previous session — nearly all of them, for anyone who has closed
+/// the app once. The provider owns the session and we assign its id, so a run
+/// we are not holding is asleep rather than gone.
+#[test]
+fn a_run_this_process_is_not_holding_can_be_resumed_and_take_another_turn() {
+    let home = TempDir::new("resume");
+    let repo = repo(home.path());
+    let bin = stub_agent(home.path(), "waits", WAITS_FOR_STDIN);
+    let run = RunId::from("run_resume");
+    let db = home.path().join("log.sqlite");
+
+    let registry = registry();
+    let (on_event, rx) = events();
+    let spec = spec(&repo, &bin, &run);
+    let session_id = spec.launch.session_id.clone();
+    let binary = spec.launch.binary.clone();
+    registry
+        .start(EventLog::open(&db).unwrap(), spec, on_event)
+        .unwrap();
+    wait_for_event(&rx, "turn.finished");
+
+    // The window closes: the run is ended and reaped, exactly as `shutdown`
+    // would leave it.
+    registry.end(&run).unwrap();
+    eventually("the run to be reaped", || !registry.is_live(&run));
+
+    let log = EventLog::open(&db).unwrap();
+    let row = log.run(&run).unwrap().expect("the run row");
+    assert_eq!(
+        row.provider_session_id.as_ref(),
+        Some(&session_id),
+        "§14: we assign the session id, so the row is what makes a resume possible"
+    );
+    let last = log.last_seq(&run).unwrap();
+    assert!(last > 0, "the first life of the run wrote events");
+
+    // A second life, from the row alone.
+    let mut launch = LaunchSpec::new(
+        row.worktree_path.as_deref().unwrap_or(&row.workspace_path),
+        session_id,
+        Permission::DenyPrompts,
+    );
+    launch.binary = binary;
+    launch.thinking = Thinking::Off;
+
+    let (on_event2, rx2) = events();
+    let live = registry
+        .resume(
+            EventLog::open(&db).unwrap(),
+            &row,
+            launch,
+            "and now the second turn",
+            None,
+            on_event2,
+        )
+        .unwrap();
+
+    assert_eq!(
+        live.run_id, run,
+        "a resumed run is the same run, not a new one"
+    );
+    assert_eq!(
+        live.worktree_path,
+        std::path::PathBuf::from(row.worktree_path.as_deref().unwrap()),
+        "and it works in the tree the row already named"
+    );
+    assert!(registry.is_live(&run), "it is supervised again");
+
+    wait_for_event(&rx2, "turn.finished");
+    assert!(
+        log.last_seq(&run).unwrap() > last,
+        "the second life appended to the same run's log rather than starting one"
+    );
+
+    registry.end(&run).unwrap();
+    eventually("the resumed run to be reaped", || !registry.is_live(&run));
+}
+
+/// A run that never reached a provider session has nothing to resume, and
+/// saying so is better than starting a fresh session under its row — which
+/// would detach the row from the conversation it names.
+#[test]
+fn resuming_a_run_with_no_provider_session_is_refused() {
+    let home = TempDir::new("resume-none");
+    let repo = repo(home.path());
+    let bin = stub_agent(home.path(), "waits", WAITS_FOR_STDIN);
+    let run = RunId::from("run_sessionless");
+    let db = home.path().join("log.sqlite");
+
+    let registry = registry();
+    let (on_event, _rx) = events();
+    let spec = spec(&repo, &bin, &run);
+    registry
+        .start(EventLog::open(&db).unwrap(), spec, on_event)
+        .unwrap();
+    registry.end(&run).unwrap();
+    eventually("the run to be reaped", || !registry.is_live(&run));
+
+    let log = EventLog::open(&db).unwrap();
+    let mut row = log.run(&run).unwrap().expect("the run row");
+    row.provider_session_id = None;
+
+    let launch = LaunchSpec::new(&repo, driver::new_session_id(), Permission::DenyPrompts);
+    let (on_event2, _rx2) = events();
+    let err = registry
+        .resume(
+            EventLog::open(&db).unwrap(),
+            &row,
+            launch,
+            "wake up",
+            None,
+            on_event2,
+        )
+        .expect_err("a run with no session cannot be resumed");
+    assert!(
+        err.to_string().contains("no provider session id"),
+        "the refusal says why: {err}"
+    );
+    assert!(!registry.is_live(&run), "and it started no process");
+}

@@ -131,7 +131,11 @@ export function RunNode({
             onMeasure={onMeasure}
             onSelect={onSelect}
           />
-          <Composer live={live} onSend={onSend} />
+          <Composer
+            live={live}
+            resumable={run.provider_session_id !== null}
+            onSend={onSend}
+          />
         </>
       )}
     </div>
@@ -268,20 +272,33 @@ const EMPTY_BLOCKS: Block[] = []
  * begins with the user typing into the branch, which is the whole reason the
  * default state shows messages.
  *
- * A run this process is not supervising cannot take a turn — the agent is a
- * process, and one from an earlier session is gone even though its log is
- * right there. That is said out loud rather than shown as a dead button.
+ * **Three states, not two.** A run this process is not supervising is asleep,
+ * not gone: the agent process died with the window that started it, but §14
+ * says the provider owns the session and we assign its id, so the row carries
+ * everything needed to wake it. Sending to a sleeping run resumes it and sends
+ * the turn as the prompt that does the waking — `send_turn` decides which of
+ * the two it is, because deciding is not the shell's.
+ *
+ * Only a run with no provider session id is genuinely unable to take a turn,
+ * and that is a run whose process never got far enough to be resumable. The
+ * earlier version of this component treated *every* unsupervised run that way,
+ * which meant the composer was dead on every run from every previous session —
+ * which is nearly all of them, for anyone who has closed the app once.
  */
 function Composer({
   live,
+  resumable,
   onSend,
 }: {
   live: boolean
+  /** Asleep rather than gone: there is a provider session to resume. */
+  resumable: boolean
   onSend: (text: string) => Promise<void>
 }) {
   const [text, setText] = useState('')
   const [sending, setSending] = useState(false)
-  const ready = live && !sending && text.trim() !== ''
+  const canSend = live || resumable
+  const ready = canSend && !sending && text.trim() !== ''
 
   const submit = (e?: FormEvent) => {
     e?.preventDefault()
@@ -304,12 +321,14 @@ function Composer({
           // Enter sends, Shift+Enter is a newline — a composer, not a form.
           if (e.key === 'Enter' && !e.shiftKey) submit()
         }}
-        disabled={!live}
+        disabled={!canSend}
         rows={2}
         placeholder={
           live
             ? 'Reply to this run…  (Enter to send, Shift+Enter for a newline)'
-            : 'This run is not supervised by this session — its agent process is gone.'
+            : resumable
+              ? 'Reply to wake this run…  (Enter to send, Shift+Enter for a newline)'
+              : 'This run never reached a provider session, so there is nothing to resume.'
         }
         className="w-full resize-none rounded-sm border border-border bg-bg px-2 py-1 font-mono text-mono text-text outline-none select-text placeholder:text-faint focus:border-accent/70 disabled:cursor-not-allowed disabled:text-faint"
       />
@@ -317,7 +336,9 @@ function Composer({
         <span className="min-w-0 flex-1 truncate text-micro text-faint">
           {live
             ? 'Nothing can prompt: a tool outside the run’s allow-list is denied (§12).'
-            : 'Only a run this session started can take another turn.'}
+            : resumable
+              ? 'Asleep. Sending resumes the session in its own worktree, and pre-grants no tools.'
+              : 'No provider session was ever recorded for this run.'}
         </span>
         <button
           type="submit"

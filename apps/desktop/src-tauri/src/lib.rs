@@ -457,10 +457,63 @@ fn fork_run(
     })
 }
 
-/// A follow-up turn, through the process that is already running (§5).
+/// A follow-up turn — through the running process, or through a new one.
+///
+/// **A conversation outlives the window it was started in.** Nothing closes a
+/// run's stdin on its behalf, so every run dies when the app exits, and a
+/// composer that could only reach runs this process happens to be holding was
+/// dead on every run from any previous session — which is to say, on almost
+/// every run a returning user sees. §14 is what makes the other path possible:
+/// the provider owns the session, we *assign* its id and keep it on the row, so
+/// a run we are not holding is asleep rather than gone.
+///
+/// So the fall-back is not an error path, it is the ordinary one: send to the
+/// live process if there is one, and otherwise resume the session and send the
+/// turn as the prompt that wakes it. The run keeps its id, its row, its
+/// worktree and its shadow history, because [`driver::Registry::resume`] takes
+/// all four off the row rather than inventing them.
 #[tauri::command]
-fn send_turn(state: State<'_, AppState>, run_id: RunId, text: String) -> Result<(), String> {
-    state.runs.send(&run_id, &text).map_err(|e| e.to_string())
+fn send_turn(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    run_id: RunId,
+    text: String,
+) -> Result<(), String> {
+    if state.runs.is_live(&run_id) {
+        return state.runs.send(&run_id, &text).map_err(|e| e.to_string());
+    }
+
+    let log = EventLog::open(&state.boot.log_path).map_err(|e| e.to_string())?;
+    let run = log
+        .run(&run_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("{} is not in the log", run_id.0))?;
+
+    // Its own connection, for the same reason `start_run` opens one: the
+    // driver takes an `EventLog` by value and only gives it back from
+    // `Session::wait()`, so the UI's connection cannot be lent to a run.
+    let write = EventLog::open(&state.boot.log_path).map_err(|e| e.to_string())?;
+    let session_id = run
+        .provider_session_id
+        .clone()
+        .ok_or_else(|| format!("{} has no provider session to resume", run_id.0))?;
+    let mut launch = LaunchSpec::new(
+        PathBuf::from(run.worktree_path.as_deref().unwrap_or(&run.workspace_path)),
+        session_id,
+        Permission::DenyPrompts,
+    );
+    // The model is on the row, so a resumed run is the same model it was. The
+    // allow-list is not: the row stores no launch flags beyond the model, so a
+    // resumed run pre-grants nothing and is refused whatever it is not given —
+    // the same gap `fork_run` has, and the same one a launch-flags column would
+    // close for both.
+    launch.model = run.model.clone();
+
+    state
+        .runs
+        .resume(write, &run, launch, &text, None, emit_events(app))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// End a run: close its stdin, and let the agent finish the turn it is in.

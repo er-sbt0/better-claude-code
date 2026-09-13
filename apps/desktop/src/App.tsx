@@ -371,11 +371,19 @@ export default function App() {
   // re-thrown after the toast so the composer can keep what was typed.
   const send = useCallback(
     (id: RunId, text: string) =>
-      sendTurn(id, text).catch((e: unknown) => {
-        fail('The turn was not sent')(e)
-        throw e
-      }),
-    [fail],
+      sendTurn(id, text)
+        .then(() => {
+          // A turn sent to a sleeping run resumes it, so the run that was not
+          // supervised a moment ago is supervised now. Without this the
+          // composer would keep saying "asleep" at a run that is answering,
+          // until something else happened to refresh the list.
+          refreshRuns()
+        })
+        .catch((e: unknown) => {
+          fail('The turn was not sent')(e)
+          throw e
+        }),
+    [fail, refreshRuns],
   )
 
   /**

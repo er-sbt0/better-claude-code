@@ -142,7 +142,14 @@ impl Registry {
 
         let (tx, rx) = mpsc::channel();
         let started = crate::start(log, spec, &started_at, Some(tx))?;
-        Ok(self.adopt(run_id, branch, started_at, started, rx, on_event))
+        let live = Live {
+            run_id,
+            branch,
+            worktree_path: started.tree.worktree.path().to_path_buf(),
+            shadow_ref: started.tree.shadow_ref,
+            started_at,
+        };
+        Ok(self.adopt(live, started.session, rx, on_event))
     }
 
     /// Fork a live or finished run, and supervise the child exactly like a root
@@ -181,7 +188,14 @@ impl Registry {
 
         let (tx, rx) = mpsc::channel();
         let started = crate::fork(log, spec, &started_at, Some(tx))?;
-        Ok(self.adopt(run_id, branch, started_at, started, rx, on_event))
+        let live = Live {
+            run_id,
+            branch,
+            worktree_path: started.tree.worktree.path().to_path_buf(),
+            shadow_ref: started.tree.shadow_ref,
+            started_at,
+        };
+        Ok(self.adopt(live, started.session, rx, on_event))
     }
 
     /// Take ownership of a run that has just been spawned: file it, watch it,
@@ -196,28 +210,20 @@ impl Registry {
     /// session in the map forever.
     fn adopt<F>(
         &self,
-        run_id: RunId,
-        branch: String,
-        started_at: String,
-        started: crate::Started,
+        live: Live,
+        session: Session,
         events: Receiver<RawEvent>,
         on_event: F,
     ) -> Live
     where
         F: FnMut(RawEvent) + Send + 'static,
     {
-        let live = Live {
-            run_id: run_id.clone(),
-            branch,
-            worktree_path: started.tree.worktree.path().to_path_buf(),
-            shadow_ref: started.tree.shadow_ref,
-            started_at,
-        };
+        let run_id = live.run_id.clone();
 
         self.lock().insert(
             run_id.clone(),
             Entry {
-                session: Some(started.session),
+                session: Some(session),
                 supervisor: None,
             },
         );
@@ -239,6 +245,65 @@ impl Registry {
         }
 
         live
+    }
+
+    /// Take a run this process is not holding and make it live again (§14).
+    ///
+    /// **This is what makes a conversation outlive a window.** Nothing closes
+    /// stdin on a run's behalf, so a run ends when the app exits, and until
+    /// this existed the composer on every run from a previous session was dead
+    /// forever: the only runs that could take a turn were the ones started
+    /// since launch. The provider still holds the session, we still hold its
+    /// id (§14: we *assign* it), and [`resume`](crate::resume) already knew how
+    /// to seed the normalizer from the log — what was missing was a way to put
+    /// the result back under supervision.
+    ///
+    /// The run row is the input rather than a spec, because everything this
+    /// needs was written down when the run was created: its worktree, its
+    /// shadow ref, its branch, and the provider session to resume. A caller
+    /// that had to reconstruct those would be guessing at three of them.
+    ///
+    /// Refuses a run with no provider session id — there is nothing to resume,
+    /// and starting a fresh session under an old run's row would silently
+    /// detach the row from the conversation it names.
+    pub fn resume<F>(
+        &self,
+        log: EventLog,
+        run: &event_log::Run,
+        launch: crate::LaunchSpec,
+        prompt: &str,
+        workspace_mcp: Option<&crate::WorkspaceMcp>,
+        on_event: F,
+    ) -> Result<Live>
+    where
+        F: FnMut(RawEvent) + Send + 'static,
+    {
+        refuse_unsupervisable(workspace_mcp.is_some())?;
+
+        if run.provider_session_id.is_none() {
+            return Err(Error::CannotFork {
+                run: run.id.0.clone(),
+                reason: "it has no provider session id, so there is no conversation to resume"
+                    .to_owned(),
+            });
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let session = crate::resume(log, run, launch, prompt, Some(tx), workspace_mcp)?;
+
+        // Straight off the row: a resumed run is the same run, in the same tree,
+        // writing the same shadow history. Anything invented here would be a
+        // second opinion about a fact already recorded.
+        let live = Live {
+            run_id: run.id.clone(),
+            branch: run.branch.clone().unwrap_or_default(),
+            worktree_path: PathBuf::from(
+                run.worktree_path.as_deref().unwrap_or(&run.workspace_path),
+            ),
+            shadow_ref: run.shadow_ref.clone().unwrap_or_default(),
+            started_at: run.started_at.clone(),
+        };
+        Ok(self.adopt(live, session, rx, on_event))
     }
 
     /// Send a follow-up user turn to a live run (§5: one process, many turns).
