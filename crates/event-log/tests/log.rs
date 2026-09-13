@@ -48,6 +48,7 @@ fn run_row(id: &str) -> Run {
         started_at: "2026-09-12T14:22:00.000Z".to_owned(),
         finished_at: None,
         parent_run_id: None,
+        branch_point_seq: None,
     }
 }
 
@@ -373,6 +374,342 @@ fn a_failing_batch_stores_nothing() {
         log.events(&RunId::from("r")).unwrap().is_empty(),
         "the batch was not atomic"
     );
+}
+
+/// The graph surface (§10) draws finished branches as well as live ones, so
+/// this query must answer with what `running_runs` deliberately hides.
+#[test]
+fn recent_runs_returns_finished_runs_newest_first_and_honours_the_limit() {
+    let mut log = EventLog::open_in_memory().unwrap();
+    log.create_run(&Run {
+        started_at: "2026-09-12T14:00:00.000Z".to_owned(),
+        ..run_row("oldest")
+    })
+    .unwrap();
+    log.create_run(&Run {
+        status: RunStatus::Finished,
+        started_at: "2026-09-12T15:00:00.000Z".to_owned(),
+        finished_at: Some("2026-09-12T15:05:00.000Z".to_owned()),
+        ..run_row("middle")
+    })
+    .unwrap();
+    log.create_run(&Run {
+        status: RunStatus::Failed,
+        started_at: "2026-09-12T16:00:00.000Z".to_owned(),
+        finished_at: Some("2026-09-12T16:01:00.000Z".to_owned()),
+        parent_run_id: Some(RunId::from("middle")),
+        branch_point_seq: Some(12),
+        ..run_row("newest")
+    })
+    .unwrap();
+
+    let ids: Vec<_> = log
+        .recent_runs(10)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            RunId::from("newest"),
+            RunId::from("middle"),
+            RunId::from("oldest")
+        ],
+        "newest first, and a finished or failed run is still a run"
+    );
+
+    // The edge the graph is drawn from survives the round trip; nothing else
+    // in this repository records it (§10).
+    let newest = log.recent_runs(1).unwrap();
+    assert_eq!(newest.len(), 1, "the limit is honoured");
+    assert_eq!(newest[0].parent_run_id, Some(RunId::from("middle")));
+    assert_eq!(newest[0].branch_point_seq, Some(12));
+}
+
+// --------------------------------------------------------------- the edge ---
+
+/// The graph edge, both halves, through the database and back.
+///
+/// This is the only place the edge will ever live. The provider records no
+/// parentage — a forked transcript is a full copy re-stamped with its own
+/// session id (`docs/verification/claude-code-session-forking.md`) — so unlike
+/// every other number the UI shows, this one cannot be recomputed if the write
+/// is lost. Hence a column, against §8's rule that recomputable things are
+/// projections, and hence a test that reads it back off disk rather than out of
+/// the struct it was built from.
+#[test]
+fn a_forks_parent_and_branch_point_survive_the_round_trip() {
+    let mut log = EventLog::open_in_memory().unwrap();
+    log.create_run(&run_row("trunk")).unwrap();
+    log.create_run(&Run {
+        started_at: "2026-09-12T15:00:00.000Z".to_owned(),
+        parent_run_id: Some(RunId::from("trunk")),
+        branch_point_seq: Some(17),
+        ..run_row("branch")
+    })
+    .unwrap();
+
+    let branch = log.run(&RunId::from("branch")).unwrap().expect("stored");
+    assert_eq!(branch.parent_run_id, Some(RunId::from("trunk")));
+    assert_eq!(
+        branch.branch_point_seq,
+        Some(17),
+        "the branch point is *where* in the parent, and nothing else records it"
+    );
+
+    let trunk = log.run(&RunId::from("trunk")).unwrap().expect("stored");
+    assert_eq!(trunk.parent_run_id, None);
+    assert_eq!(
+        trunk.branch_point_seq, None,
+        "a root run has no branch point"
+    );
+
+    // Every path that reads a row reads both halves, not just `run()` --
+    // §10's graph is drawn from `recent_runs`, and §8's boot reconcile walks
+    // `running_runs`.
+    let recent = log.recent_runs(10).unwrap();
+    let drawn = recent
+        .iter()
+        .find(|r| r.id == RunId::from("branch"))
+        .expect("recent_runs sees the fork");
+    assert_eq!(drawn.branch_point_seq, Some(17));
+    let running = log.running_runs().unwrap();
+    let orphan = running
+        .iter()
+        .find(|r| r.id == RunId::from("branch"))
+        .expect("running_runs sees the fork");
+    assert_eq!(orphan.branch_point_seq, Some(17));
+}
+
+/// The pairing invariant, reached without a database.
+///
+/// Deliberately not a SQL `CHECK`: SQLite cannot add one through
+/// `ALTER TABLE` without rebuilding the table, and the repo's rule is that
+/// anything which starts deciding belongs where a test can reach it. This test
+/// is what "reach it" means — no file, no connection, no migration.
+#[test]
+fn half_a_fork_edge_is_refused_without_a_database() {
+    run_row("root")
+        .check_fork_pairing()
+        .expect("neither half: a root run");
+    Run {
+        parent_run_id: Some(RunId::from("trunk")),
+        branch_point_seq: Some(4),
+        ..run_row("fork")
+    }
+    .check_fork_pairing()
+    .expect("both halves: a fork");
+
+    // A parent with no branch point draws an arrow the surface cannot anchor.
+    let dangling = Run {
+        parent_run_id: Some(RunId::from("trunk")),
+        branch_point_seq: None,
+        ..run_row("dangling")
+    };
+    assert!(
+        matches!(
+            dangling.check_fork_pairing(),
+            Err(Error::IncompleteForkEdge { ref run, .. }) if *run == RunId::from("dangling")
+        ),
+        "a parent without a branch point must be refused"
+    );
+
+    // A branch point with no parent names a seq in a log nobody can name.
+    let orphaned = Run {
+        parent_run_id: None,
+        branch_point_seq: Some(4),
+        ..run_row("orphaned")
+    };
+    assert!(
+        matches!(
+            orphaned.check_fork_pairing(),
+            Err(Error::IncompleteForkEdge { .. })
+        ),
+        "a branch point without a parent must be refused"
+    );
+}
+
+/// And the log applies it, so nothing reaches the table by another route.
+#[test]
+fn create_run_refuses_half_a_fork_edge() {
+    let mut log = EventLog::open_in_memory().unwrap();
+    log.create_run(&run_row("trunk")).unwrap();
+    let err = log
+        .create_run(&Run {
+            parent_run_id: Some(RunId::from("trunk")),
+            branch_point_seq: None,
+            ..run_row("half")
+        })
+        .unwrap_err();
+    assert!(matches!(err, Error::IncompleteForkEdge { .. }), "{err}");
+    assert!(
+        log.run(&RunId::from("half")).unwrap().is_none(),
+        "the row must not have been written"
+    );
+}
+
+/// The `runs` table exactly as it shipped at `user_version` 1.
+///
+/// A frozen copy, and it must **not** be updated when the schema moves — that
+/// is the whole point. `EventLog::open` on a fresh file runs every migration in
+/// order, so the fresh path is exercised by every other test in this file and
+/// the upgrade path by none of them. The upgrade is the one that runs on a
+/// user's existing log, and it is the one that breaks in the field.
+const V1_AS_SHIPPED: &str = r#"
+-- Identity and lifecycle of a run. Deliberately NOT its metrics: §8's rule is
+-- that anything recomputable from the log is a projection and must not be the
+-- source of truth, and token counts and cost are recomputable from
+-- `turn.finished`. See `EventLog::metrics`.
+CREATE TABLE runs (
+    id                  TEXT PRIMARY KEY,
+    -- Adapter id, e.g. `claude-code`. Not a foreign key: an agent the user has
+    -- since removed must not take its history with it.
+    agent               TEXT NOT NULL,
+    agent_version       TEXT,
+    -- §14: the provider owns session state. We hold its id so we can ask for a
+    -- resume; we never claim to be able to rebuild the session ourselves.
+    provider_session_id TEXT,
+    workspace_path      TEXT NOT NULL,
+    -- §13: a run is created *with* its worktree, so cwd is never the user's own
+    -- checkout.
+    worktree_path       TEXT,
+    branch              TEXT,
+    -- §13.1: refs/agent-workspace/runs/<id>. Review's attribution is blame
+    -- against this ref; if it is gone, attribution is unavailable and must be
+    -- shown as unavailable rather than silently omitted.
+    shadow_ref          TEXT,
+    prompt              TEXT,
+    status              TEXT NOT NULL,
+    started_at          TEXT NOT NULL,
+    finished_at         TEXT,
+    parent_run_id       TEXT REFERENCES runs(id)
+) STRICT;
+
+CREATE INDEX runs_started_at ON runs(started_at DESC);
+
+-- The log. Observed, immutable, append-only (§8).
+CREATE TABLE raw_events (
+    run_id          TEXT    NOT NULL REFERENCES runs(id),
+    -- Assigned by the writer, not by this table: an event is addressable (§7)
+    -- the moment the normalizer produces it, before it is durable, which is
+    -- what lets the UI render a streaming run. Strictly increasing per run --
+    -- but NOT contiguous; see `EventLog::append`.
+    seq             INTEGER NOT NULL,
+    ts              TEXT    NOT NULL,
+    schema          INTEGER NOT NULL,
+    idempotency_key TEXT,
+    type            TEXT    NOT NULL,
+    -- The `payload` object, as JSON. Stored whole rather than shredded into
+    -- columns: the payload is versioned by `schema` and the log has to be
+    -- readable by code that predates the shape it is reading.
+    payload         TEXT    NOT NULL,
+    PRIMARY KEY (run_id, seq)
+) STRICT;
+
+-- What makes replaying a resumed stream safe: the second copy of an event
+-- collides here instead of being stored twice (§14).
+CREATE UNIQUE INDEX raw_events_idempotency
+    ON raw_events(run_id, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
+
+CREATE INDEX raw_events_type ON raw_events(run_id, type);
+
+-- §8 says raw events are "never edited, never deleted". Triggers make that
+-- true rather than aspirational: a projection bug that reaches for UPDATE gets
+-- an error, not a corrupted log.
+CREATE TRIGGER raw_events_are_append_only_update
+BEFORE UPDATE ON raw_events
+BEGIN
+    SELECT RAISE(ABORT, 'raw_events is append-only (design §8)');
+END;
+
+CREATE TRIGGER raw_events_are_append_only_delete
+BEFORE DELETE ON raw_events
+BEGIN
+    SELECT RAISE(ABORT, 'raw_events is append-only (design §8)');
+END;
+"#;
+
+/// A log written by the previous build gains the column and keeps its rows.
+///
+/// Both halves matter. A migration that loses the old runs is obvious; one that
+/// lands an *existing* database in a different shape from a fresh one is not,
+/// and shows up much later as a query that works on the developer's machine and
+/// not on anyone else's. So this asserts the old row survives, reads back with
+/// no branch point, and that a fork can be recorded afterwards.
+#[test]
+fn an_existing_v1_database_migrates_and_keeps_its_runs() {
+    use rusqlite::Connection;
+
+    let dir = tempdir();
+    let path = dir.join("log.sqlite");
+
+    // A database as the previous build left it: V1's schema, V1's
+    // `user_version`, and a run in it.
+    {
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(V1_AS_SHIPPED).unwrap();
+        old.pragma_update(None, "user_version", 1u32).unwrap();
+        old.execute(
+            "INSERT INTO runs (id, agent, workspace_path, status, started_at)
+             VALUES ('before', 'claude-code', '/home/u/my-app', 'finished',
+                     '2026-09-12T14:22:00.000Z')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            old.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name = 'branch_point_seq'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap()
+                == 0,
+            "the fixture is only meaningful if the old schema lacks the column"
+        );
+    }
+
+    let mut log = EventLog::open(&path).unwrap();
+
+    let before = log.run(&RunId::from("before")).unwrap().expect("kept");
+    assert_eq!(before.status, RunStatus::Finished);
+    assert_eq!(
+        before.branch_point_seq, None,
+        "a run recorded before the column existed is a root run"
+    );
+
+    // The migrated database is the same database a fresh one would have been:
+    // a fork records both halves and reads them back.
+    log.create_run(&Run {
+        parent_run_id: Some(RunId::from("before")),
+        branch_point_seq: Some(9),
+        ..run_row("after")
+    })
+    .unwrap();
+    assert_eq!(
+        log.run(&RunId::from("after"))
+            .unwrap()
+            .unwrap()
+            .branch_point_seq,
+        Some(9)
+    );
+
+    // And the log itself still works on the upgraded file: the events table
+    // came from V1 and the migration must not have disturbed it.
+    log.append(&ev(
+        "after",
+        1,
+        None,
+        Event::TurnStarted(TurnStarted { index: 0 }),
+    ))
+    .unwrap();
+    assert_eq!(log.events(&RunId::from("after")).unwrap().len(), 1);
+
+    // Re-opening is a no-op rather than a second attempt at the ALTER.
+    drop(log);
+    let reopened = EventLog::open(&path).unwrap();
+    assert!(reopened.run(&RunId::from("after")).unwrap().is_some());
 }
 
 // --------------------------------------------------------------- lifecycle ---

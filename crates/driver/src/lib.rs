@@ -169,7 +169,10 @@ pub fn start(
         status: RunStatus::Running,
         started_at: started_at.to_owned(),
         finished_at: None,
+        // A root run: no parent, therefore no branch point. The fork path that
+        // fills both in is not built yet (§19).
         parent_run_id: None,
+        branch_point_seq: None,
     })?;
 
     spec.launch.cwd = wt.path().to_path_buf();

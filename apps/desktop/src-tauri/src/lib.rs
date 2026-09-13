@@ -25,9 +25,9 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use agent_protocol::RunId;
+use agent_protocol::{RawEvent, RunId};
 use driver::{LaunchSpec, Permission, Registry, RunSpec};
-use event_log::{EventLog, Run};
+use event_log::{EventLog, Run, RunMetrics};
 use normalizer::{Clock, SystemClock};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -121,10 +121,9 @@ fn boot_report(state: State<'_, AppState>) -> BootReport {
 
 /// Runs that are alive *now* — after reconciliation, so this is honest.
 ///
-/// The Runs home screen (§10) needs every run, not just the live ones, and
-/// `EventLog` has no query for that yet. That is the next thing to add, and
-/// this command is deliberately the narrow version rather than a stub of the
-/// wide one.
+/// Narrow on purpose. The surfaces that draw runs want [`recent_runs`]; this
+/// one answers "what is in flight", which is a status-bar question, and the
+/// two must not be collapsed into one call that serves neither.
 #[tauri::command]
 fn running_runs(state: State<'_, AppState>) -> Result<Vec<Run>, String> {
     state
@@ -132,6 +131,53 @@ fn running_runs(state: State<'_, AppState>) -> Result<Vec<Run>, String> {
         .lock()
         .map_err(|_| "event log lock poisoned".to_owned())?
         .running_runs()
+        .map_err(|e| e.to_string())
+}
+
+/// Every run the log has, newest first — what the graph (§10) is drawn from.
+///
+/// The limit is the caller's because the shell decides how much history it is
+/// willing to lay out, and an unbounded query behind a surface that draws a
+/// node per row is a cliff nobody sees until the log is a year old.
+#[tauri::command]
+fn recent_runs(state: State<'_, AppState>, limit: u32) -> Result<Vec<Run>, String> {
+    state
+        .log
+        .lock()
+        .map_err(|_| "event log lock poisoned".to_owned())?
+        .recent_runs(limit)
+        .map_err(|e| e.to_string())
+}
+
+/// One run's events, from the log.
+///
+/// The live channel ([`RUN_EVENT`]) carries a run's events only while this
+/// process is supervising it, so it is the *only* source for a run started in
+/// an earlier session — and selecting such a run without this command shows an
+/// empty stream that looks like a bug in the feed rather than an absent
+/// subscription.
+#[tauri::command]
+fn run_events(state: State<'_, AppState>, run_id: RunId) -> Result<Vec<RawEvent>, String> {
+    state
+        .log
+        .lock()
+        .map_err(|_| "event log lock poisoned".to_owned())?
+        .events(&run_id)
+        .map_err(|e| e.to_string())
+}
+
+/// Cost, tokens and turns for one run.
+///
+/// §14 and [`RunMetrics`]: these are a projection recomputed from
+/// `turn.finished`, never columns on the run row, so this is a query and not a
+/// field the UI can read off [`Run`].
+#[tauri::command]
+fn run_metrics(state: State<'_, AppState>, run_id: RunId) -> Result<RunMetrics, String> {
+    state
+        .log
+        .lock()
+        .map_err(|_| "event log lock poisoned".to_owned())?
+        .metrics(&run_id)
         .map_err(|e| e.to_string())
 }
 
@@ -272,6 +318,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             boot_report,
             running_runs,
+            recent_runs,
+            run_events,
+            run_metrics,
             live_runs,
             start_run,
             send_turn,

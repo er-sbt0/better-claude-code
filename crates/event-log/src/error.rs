@@ -27,6 +27,22 @@ pub enum Error {
     )]
     SeqNotMonotonic { run: RunId, got: u64, last: u64 },
 
+    /// Half a graph edge: a parent without a branch point, or the reverse.
+    ///
+    /// The edge is one fact in two columns and nothing outside this database
+    /// remembers it — the provider re-stamps a forked transcript with its own
+    /// session id and records no parent — so storing half of it loses the other
+    /// half permanently. See [`crate::Run::check_fork_pairing`].
+    #[error(
+        "run {run}: a fork needs both a parent and a branch point, \
+             got parent_run_id={parent_run_id:?} branch_point_seq={branch_point_seq:?}"
+    )]
+    IncompleteForkEdge {
+        run: RunId,
+        parent_run_id: Option<RunId>,
+        branch_point_seq: Option<u64>,
+    },
+
     /// Two different events claimed the same idempotency key.
     #[error("run {run}: idempotency key {key:?} is already held by a {existing} at seq {seq}")]
     IdempotencyConflict {

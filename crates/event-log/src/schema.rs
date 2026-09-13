@@ -9,7 +9,7 @@ use crate::Result;
 
 /// Bump when adding a migration; `migrate` applies everything above the
 /// database's current `user_version`.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Apply every migration the database has not seen.
 pub fn migrate(conn: &Connection) -> Result<()> {
@@ -19,6 +19,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     }
     if current < 1 {
         conn.execute_batch(V1)?;
+    }
+    if current < 2 {
+        conn.execute_batch(V2)?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
@@ -97,4 +100,34 @@ BEFORE DELETE ON raw_events
 BEGIN
     SELECT RAISE(ABORT, 'raw_events is append-only (design §8)');
 END;
+"#;
+
+const V2: &str = r#"
+-- The other half of the graph edge (§19, `docs/branching-surface.md`).
+--
+-- `parent_run_id` shipped in V1 and says *which* run a fork descends from;
+-- this says *where*. Together they are one fact, and the reason it is a column
+-- rather than a projection is the finding in
+-- `docs/verification/claude-code-session-forking.md`: **the provider records
+-- no parentage.** A forked transcript is a full copy of the parent's,
+-- re-stamped with its own session id, so nothing on disk outside this table
+-- remembers that the two runs are related or where they diverged. §8's
+-- standing rule is that anything recomputable from the log is a projection and
+-- must not be stored; this is the exception that proves it, because it is not
+-- recomputable from anything — not from the log, not from the provider, not
+-- from git. Fail to write it at fork time and the edge is gone for good.
+--
+-- It is a `seq` in the PARENT's log: the event the child was anchored at, whose
+-- `raw_events.idempotency_key` is the chain-entry uuid handed to
+-- `--resume-session-at` (`docs/verification/claude-code-fork-address.md` —
+-- and note the `#i` fan-out suffix is ours, so the address is the part before
+-- it). NULL for a root run.
+--
+-- The pairing invariant — a root run has neither a parent nor a branch point, a
+-- fork has both — is enforced in `Run::check_fork_pairing` rather than by a
+-- CHECK constraint. SQLite cannot add one via `ALTER TABLE` without rebuilding
+-- the table, a rebuild is not worth it for this, and §8's rule that anything
+-- which starts deciding belongs where a test can reach it without a database
+-- points the same way.
+ALTER TABLE runs ADD COLUMN branch_point_seq INTEGER;
 "#;

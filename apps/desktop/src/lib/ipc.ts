@@ -4,6 +4,7 @@ import type { BootReport } from '@agent-workspace/shared-types/BootReport'
 import type { RawEvent } from '@agent-workspace/shared-types/RawEvent'
 import type { Run } from '@agent-workspace/shared-types/Run'
 import type { RunId } from '@agent-workspace/shared-types/RunId'
+import type { RunMetrics } from '@agent-workspace/shared-types/RunMetrics'
 import type { StartRunRequest } from '@agent-workspace/shared-types/StartRunRequest'
 import type { StartedRun } from '@agent-workspace/shared-types/StartedRun'
 
@@ -14,6 +15,20 @@ import type { StartedRun } from '@agent-workspace/shared-types/StartedRun'
 export const bootReport = () => invoke<BootReport>('boot_report')
 
 export const runningRuns = () => invoke<Run[]>('running_runs')
+
+// Every run the log has, newest first — finished and failed ones included,
+// which is the difference that matters: the graph draws a branch *after* it
+// finishes, and `runningRuns()` is the query that hides exactly those.
+export const recentRuns = (limit: number) => invoke<Run[]>('recent_runs', { limit })
+
+// One run's events out of the log. The live channel below only carries runs
+// this process is supervising, so a run from an earlier session has no stream
+// at all until this is called.
+export const runEvents = (runId: RunId) => invoke<RawEvent[]>('run_events', { runId })
+
+// Cost, tokens and turns — a projection recomputed from `turn.finished` (§14),
+// never a column on the run row.
+export const runMetrics = (runId: RunId) => invoke<RunMetrics>('run_metrics', { runId })
 
 // Runs this process is supervising, which is not the same question as
 // runningRuns(): that one asks the log about rows, this one asks about

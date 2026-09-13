@@ -16,4 +16,27 @@ export type Run = { id: RunId, agent: string, agent_version: string | null, prov
  * `refs/agent-workspace/runs/<id>` (design §13.1). `None` means Review has
  * no attribution for this run and must say so.
  */
-shadow_ref: string | null, prompt: string | null, status: RunStatus, started_at: string, finished_at: string | null, parent_run_id: RunId | null, };
+shadow_ref: string | null, prompt: string | null, status: RunStatus, started_at: string, finished_at: string | null, 
+/**
+ * Which run this one was forked from (§19). `None` for a root run.
+ */
+parent_run_id: RunId | null, 
+/**
+ * *Where* in the parent it was forked from: a `seq` in the **parent's**
+ * log, naming the event the fork was anchored at.
+ *
+ * This and [`Run::parent_run_id`] are one fact in two columns, and they
+ * are the only record the graph edge will ever have. The provider records
+ * no parentage — a forked transcript is a full copy re-stamped with its
+ * own session id
+ * (`docs/verification/claude-code-session-forking.md`) — so unlike
+ * [`RunMetrics`], which §8 makes a projection because it is recomputable,
+ * this is recomputable from nothing at all. It is written once, at the
+ * fork, or it is lost.
+ *
+ * The corresponding `raw_events.idempotency_key` is the chain-entry uuid
+ * `--resume-session-at` accepts, which is what makes a stored `seq` enough
+ * to re-address the branch point later
+ * (`docs/verification/claude-code-fork-address.md`).
+ */
+branch_point_seq: number | null, };

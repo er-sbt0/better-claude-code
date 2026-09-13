@@ -373,6 +373,7 @@ fn every_recorded_fixture_survives_the_pipeline() {
             started_at: "2026-09-13T09:00:00.000Z".to_owned(),
             finished_at: None,
             parent_run_id: None,
+            branch_point_seq: None,
         })
         .unwrap();
 
@@ -491,6 +492,7 @@ fn in_memory_run(run: &RunId) -> EventLog {
         started_at: "2026-09-13T09:00:00.000Z".to_owned(),
         finished_at: None,
         parent_run_id: None,
+        branch_point_seq: None,
     })
     .unwrap();
     log

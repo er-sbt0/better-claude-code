@@ -2,6 +2,8 @@ use agent_protocol::{ModelUsage, RunId, SessionId};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::{Error, Result};
+
 /// Identity and lifecycle of a run.
 ///
 /// Note what is absent: the token and cost columns §14 lists on the run entity.
@@ -25,7 +27,52 @@ pub struct Run {
     pub status: RunStatus,
     pub started_at: String,
     pub finished_at: Option<String>,
+    /// Which run this one was forked from (§19). `None` for a root run.
     pub parent_run_id: Option<RunId>,
+    /// *Where* in the parent it was forked from: a `seq` in the **parent's**
+    /// log, naming the event the fork was anchored at.
+    ///
+    /// This and [`Run::parent_run_id`] are one fact in two columns, and they
+    /// are the only record the graph edge will ever have. The provider records
+    /// no parentage — a forked transcript is a full copy re-stamped with its
+    /// own session id
+    /// (`docs/verification/claude-code-session-forking.md`) — so unlike
+    /// [`RunMetrics`], which §8 makes a projection because it is recomputable,
+    /// this is recomputable from nothing at all. It is written once, at the
+    /// fork, or it is lost.
+    ///
+    /// The corresponding `raw_events.idempotency_key` is the chain-entry uuid
+    /// `--resume-session-at` accepts, which is what makes a stored `seq` enough
+    /// to re-address the branch point later
+    /// (`docs/verification/claude-code-fork-address.md`).
+    #[ts(type = "number | null")]
+    pub branch_point_seq: Option<u64>,
+}
+
+impl Run {
+    /// A root run has neither a parent nor a branch point; a fork has both.
+    ///
+    /// Enforced here rather than as a SQL `CHECK`, for two reasons that agree.
+    /// SQLite cannot add a `CHECK` through `ALTER TABLE` without rebuilding the
+    /// table, and the repo's standing rule is that anything which starts
+    /// deciding belongs where a test can reach it — which here means without a
+    /// database at all.
+    ///
+    /// Half an edge is worse than none: a parent with no branch point draws an
+    /// arrow the UI cannot anchor, and a branch point with no parent names a
+    /// `seq` in a log nobody can name. Both are silent if they are allowed to
+    /// be stored, and both are unrecoverable afterwards, since nothing else
+    /// remembers the fork.
+    pub fn check_fork_pairing(&self) -> Result<()> {
+        match (&self.parent_run_id, self.branch_point_seq) {
+            (Some(_), Some(_)) | (None, None) => Ok(()),
+            _ => Err(Error::IncompleteForkEdge {
+                run: self.id.clone(),
+                parent_run_id: self.parent_run_id.clone(),
+                branch_point_seq: self.branch_point_seq,
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]

@@ -144,12 +144,17 @@ impl EventLog {
 
     /// Record a run. `started_at` and `status` are the caller's to set, because
     /// the log has no clock of its own (§8: timestamps come from the runtime).
+    ///
+    /// The graph edge is checked before it is written
+    /// ([`Run::check_fork_pairing`]): half an edge cannot be repaired later,
+    /// because nothing outside this table remembers the fork.
     pub fn create_run(&mut self, run: &Run) -> Result<()> {
+        run.check_fork_pairing()?;
         self.conn.execute(
             "INSERT INTO runs (id, agent, agent_version, provider_session_id, workspace_path,
                                worktree_path, branch, shadow_ref, prompt, status, started_at,
-                               finished_at, parent_run_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                               finished_at, parent_run_id, branch_point_seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 run.id.0,
                 run.agent,
@@ -164,6 +169,7 @@ impl EventLog {
                 run.started_at,
                 run.finished_at,
                 run.parent_run_id.as_ref().map(|r| &r.0),
+                run.branch_point_seq.map(to_i64),
             ],
         )?;
         Ok(())
@@ -174,7 +180,7 @@ impl EventLog {
             .query_row(
                 "SELECT id, agent, agent_version, provider_session_id, workspace_path,
                         worktree_path, branch, shadow_ref, prompt, status, started_at,
-                        finished_at, parent_run_id
+                        finished_at, parent_run_id, branch_point_seq
                  FROM runs WHERE id = ?1",
                 params![id.0],
                 row_to_run,
@@ -217,10 +223,34 @@ impl EventLog {
         let mut stmt = self.conn.prepare(
             "SELECT id, agent, agent_version, provider_session_id, workspace_path,
                     worktree_path, branch, shadow_ref, prompt, status, started_at,
-                    finished_at, parent_run_id
+                    finished_at, parent_run_id, branch_point_seq
              FROM runs WHERE status = 'running' ORDER BY started_at",
         )?;
         let rows = stmt.query_map([], row_to_run)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Error::from)
+    }
+
+    /// The most recently started runs, whatever became of them.
+    ///
+    /// [`running_runs`](Self::running_runs) answers a different question, and
+    /// the difference is the whole reason this exists: a graph that only shows
+    /// runs still in flight loses a branch the moment it finishes, which is
+    /// precisely when it becomes worth looking at. §10's surface needs the
+    /// dead ones too.
+    ///
+    /// Ordered newest first and capped, because the caller draws these and
+    /// there is no workspace filter here on purpose — the desktop shell groups
+    /// by `workspace_path` itself, and the same query then serves both the
+    /// per-workspace graph and §10's cross-workspace index.
+    pub fn recent_runs(&self, limit: u32) -> Result<Vec<Run>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, agent, agent_version, provider_session_id, workspace_path,
+                    worktree_path, branch, shadow_ref, prompt, status, started_at,
+                    finished_at, parent_run_id, branch_point_seq
+             FROM runs ORDER BY started_at DESC, id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], row_to_run)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Error::from)
     }
@@ -532,5 +562,6 @@ fn row_to_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         started_at: r.get(10)?,
         finished_at: r.get(11)?,
         parent_run_id: r.get::<_, Option<String>>(12)?.map(RunId),
+        branch_point_seq: r.get::<_, Option<i64>>(13)?.map(from_i64),
     })
 }

@@ -60,6 +60,7 @@ fn main() {
                 started_at: "2026-09-12T00:00:00.000Z".to_owned(),
                 finished_at: None,
                 parent_run_id: None,
+                branch_point_seq: None,
             })
             .unwrap();
 
