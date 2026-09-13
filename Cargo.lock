@@ -590,6 +590,7 @@ version = "0.0.0"
 dependencies = [
  "agent-protocol",
  "chrono",
+ "document-model",
  "driver",
  "event-log",
  "normalizer",
@@ -676,6 +677,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "document-model"
+version = "0.0.0"
+dependencies = [
+ "agent-protocol",
+ "chrono",
+ "event-log",
+ "normalizer",
+ "serde",
+ "serde_json",
+ "ts-rs",
 ]
 
 [[package]]

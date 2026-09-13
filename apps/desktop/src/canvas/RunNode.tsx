@@ -1,18 +1,13 @@
-import {
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useRef,
-  useState,
-  type FormEvent,
-} from 'react'
-import type { ForkBlock } from '@agent-workspace/shared-types/ForkBlock'
-import type { RawEvent } from '@agent-workspace/shared-types/RawEvent'
+import { useState, type FormEvent } from 'react'
+import type { Block } from '@agent-workspace/shared-types/Block'
+import type { Feed as FeedDocument } from '@agent-workspace/shared-types/Feed'
 import type { Run } from '@agent-workspace/shared-types/Run'
 import type { RunActivity } from '@agent-workspace/shared-types/RunActivity'
 import type { Size } from './layout'
 import { ACTIVITY, STATUS, clip, goalOf, nameOf } from '../lib/format'
-import { EventStream } from './EventStream'
+import { Feed, type Branch } from './Feed'
+
+export type { Branch } from './Feed'
 
 // A node on the graph, and `docs/branching-surface.md` decided what that is: a
 // conversation column. Header, message list, composer — not a card you expand.
@@ -56,21 +51,12 @@ export const sizeOf =
   (): Size =>
     mode === 'map' ? CARD : COLUMN
 
-/** Two measurements are equal when every block is in the same place. */
-const same = (a: Record<number, number>, b: Record<number, number>): boolean => {
-  const ka = Object.keys(a)
-  return ka.length === Object.keys(b).length && ka.every((k) => a[Number(k)] === b[Number(k)])
-}
-
-/** Where a child branched, and which child it was — for the parent's own body. */
-export type Branch = { seq: number; child: Run }
-
 export function RunNode({
   run,
   mode,
   activity,
-  events,
-  forkable,
+  feed,
+  inheritedAt,
   branches,
   parent,
   inherited,
@@ -86,9 +72,10 @@ export function RunNode({
   mode: ViewMode
   /** The three-word status and the message count, both projections (§8). */
   activity: RunActivity | null
-  events: RawEvent[]
-  /** The blocks of *this* run a fork can be anchored at (`EventLog::fork_points`). */
-  forkable: ForkBlock[]
+  /** §7's blocks for this run, or `null` while the projection has not arrived. */
+  feed: FeedDocument | null
+  /** What a fork at a `seq` of this run would inherit (`EventLog::fork_points`). */
+  inheritedAt: (seq: number) => number | null
   /** Where this run's children branched off it. */
   branches: Branch[]
   /** The run this one was forked from, when it is on screen. */
@@ -134,10 +121,11 @@ export function RunNode({
           {parent !== null && (
             <InheritedContext run={run} parent={parent} inherited={inherited} />
           )}
-          <Body
-            events={events}
-            forkable={forkable}
+          <Feed
+            blocks={feed?.blocks ?? EMPTY_BLOCKS}
+            loaded={feed !== null}
             branches={branches}
+            inheritedAt={inheritedAt}
             onHoverBlock={onHoverBlock}
             onFork={onFork}
             onMeasure={onMeasure}
@@ -268,188 +256,8 @@ function InheritedContext({
   )
 }
 
-/**
- * The scrolling body — a frame around scaffolding, and the one place the fork
- * gesture can live.
- *
- * `EventStream.tsx`'s own comment says it "must be replaced, not extended", and
- * it is untouched: §7's feed is the next piece of work and the largest in V1's
- * UI. What this adds sits *over* it rather than inside it — a hover toolbar, a
- * breadcrumb per branch point, and the measurement the anchored edges need.
- *
- * **How it addresses a block without editing the feed.** `EventStream` renders
- * exactly one `<li>` per event, in order, so the *n*th child of its list is
- * `events[n]`. That index is the whole coupling, it is read and never written,
- * and it disappears at step 6: §7's blocks carry `(runId, seqRange)` addresses
- * of their own, which is precisely what this is a stand-in for.
- */
-function Body({
-  events,
-  forkable,
-  branches,
-  onHoverBlock,
-  onFork,
-  onMeasure,
-  onSelect,
-}: {
-  events: RawEvent[]
-  forkable: ForkBlock[]
-  branches: Branch[]
-  onHoverBlock: (seq: number | null) => void
-  onFork: (seq: number) => void
-  onMeasure: (anchors: Record<number, number>) => void
-  onSelect: () => void
-}) {
-  const scroller = useRef<HTMLDivElement | null>(null)
-  const pinned = useRef(true)
-  const [hover, setHover] = useState<{ seq: number; top: number } | null>(null)
-  const [marks, setMarks] = useState<Record<number, number>>({})
-
-  const forkableAt = new Map(forkable.map((b) => [b.seq, b]))
-
-  // Follow a live run, but only while the reader is already at the bottom —
-  // yanking someone back down mid-scroll is how a feed becomes unreadable.
-  useEffect(() => {
-    const el = scroller.current
-    if (el === null || !pinned.current) return
-    el.scrollTop = el.scrollHeight
-  }, [events.length])
-
-  /**
-   * Measure every branch point, twice over: once in the node's own coordinates
-   * for the edge that leaves the column, and once in the feed's for the
-   * breadcrumb that stays with the block.
-   *
-   * Offsets rather than `getBoundingClientRect`, because the canvas draws this
-   * node inside a CSS transform: a rect would come back multiplied by the
-   * camera's scale and the layout pass works in unscaled coordinates.
-   */
-  const measure = useCallback(() => {
-    const el = scroller.current
-    if (el === null) return
-    const list = el.querySelector('ol')
-    const nodeLocal: Record<number, number> = {}
-    const feedLocal: Record<number, number> = {}
-    for (const { seq } of branches) {
-      const index = events.findIndex((e) => e.seq === seq)
-      const li = index < 0 ? null : list?.children[index]
-      if (!(li instanceof HTMLElement)) continue
-      feedLocal[seq] = li.offsetTop + li.offsetHeight / 2
-      nodeLocal[seq] = el.offsetTop + feedLocal[seq] - el.scrollTop
-    }
-    // Both guarded by value: this runs on every layout, and handing back a
-    // fresh object each time would re-render, re-measure and never settle.
-    setMarks((prev) => (same(prev, feedLocal) ? prev : feedLocal))
-    onMeasure(nodeLocal)
-  }, [branches, events, onMeasure])
-
-  useLayoutEffect(measure, [measure])
-
-  const blockAt = (target: EventTarget | null): RawEvent | null => {
-    if (!(target instanceof Element)) return null
-    const li = target.closest('li')
-    const list = li?.parentElement
-    if (li === null || list === undefined || list === null) return null
-    const index = Array.prototype.indexOf.call(list.children, li)
-    return events[index] ?? null
-  }
-
-  return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      <p className="shrink-0 border-b border-border-soft px-3 py-1 text-micro text-faint">
-        raw event log — scaffolding, not §7’s feed · ⌘⇧F forks at a message
-      </p>
-      <div
-        ref={scroller}
-        // Read by the canvas's wheel handler, which otherwise swallows the
-        // gesture to pan and leaves this region unable to scroll at all.
-        data-scrollable="true"
-        onScroll={(e) => {
-          const el = e.currentTarget
-          pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24
-          measure()
-        }}
-        onMouseMove={(e) => {
-          // The toolbar sits over the block it belongs to, so a pointer that
-          // has moved onto the toolbar is still on that block. Without this,
-          // reaching for the button clears the hover that produced it.
-          if (e.target instanceof Element && e.target.closest('[data-fork-ui]') !== null) return
-          const event = blockAt(e.target)
-          const li = e.target instanceof Element ? e.target.closest('li') : null
-          // **No snapping.** A block the `fork_points` projection did not offer
-          // is not forkable — it may carry no key at all, or carry one the
-          // provider will not resolve — and the surface says so by offering
-          // nothing, never by rounding back to the last block that is.
-          if (event === null || li === null || !forkableAt.has(event.seq)) {
-            setHover(null)
-            onHoverBlock(null)
-            return
-          }
-          setHover({ seq: event.seq, top: li.offsetTop })
-          onHoverBlock(event.seq)
-        }}
-        onMouseLeave={() => {
-          setHover(null)
-          onHoverBlock(null)
-        }}
-        // `relative` makes this the offset parent for the overlays below, so a
-        // breadcrumb pinned at a block's `offsetTop` scrolls with the block.
-        className="relative min-h-0 flex-1 overflow-y-auto"
-      >
-        <EventStream events={events} />
-
-        {/* In-parent fork breadcrumbs, at the branch point (the record carries
-            these over from the prototype without argument). This is the parent
-            half of the edge the canvas draws: the graph says a branch left
-            here, and the feed says it left *from this message*. */}
-        {branches.map(({ seq, child }) =>
-          marks[seq] === undefined ? null : (
-            <button
-              key={child.id}
-              type="button"
-              data-fork-ui="true"
-              onPointerDown={(e) => e.stopPropagation()}
-              onClick={(e) => {
-                e.stopPropagation()
-                onSelect()
-              }}
-              style={{ top: marks[seq] }}
-              title={`A branch left this message: ${nameOf(child)}`}
-              className="absolute left-0 -translate-y-1/2 rounded-r-sm border-y border-r border-alt/50 bg-panel px-1.5 font-mono text-micro text-alt"
-            >
-              ⑂ {nameOf(child)}
-            </button>
-          ),
-        )}
-
-        {/* The hover toolbar. It exists on forkable blocks and nowhere else. */}
-        {hover !== null && (
-          <div
-            data-fork-ui="true"
-            style={{ top: hover.top }}
-            className="absolute right-2 flex items-center gap-1"
-          >
-            <span className="rounded-sm bg-bg/80 px-1 font-mono text-micro text-faint">
-              inherits {forkableAt.get(hover.seq)?.inherited_messages ?? '—'} msgs
-            </span>
-            <button
-              type="button"
-              onPointerDown={(e) => e.stopPropagation()}
-              onClick={(e) => {
-                e.stopPropagation()
-                onFork(hover.seq)
-              }}
-              title="Fork the conversation at this message (⌘⇧F)"
-              className="rounded-sm border border-alt/60 bg-panel px-1.5 font-mono text-micro text-alt hover:bg-hover"
-            >
-              ⑂ fork here ⌘⇧F
-            </button>
-          </div>
-        )}
-      </div>
-    </div>
-  )
-}
+/** One shared empty list, so a run whose feed has not arrived is handed the same one twice. */
+const EMPTY_BLOCKS: Block[] = []
 
 /**
  * The composer, pinned to the bottom edge — and it sends.

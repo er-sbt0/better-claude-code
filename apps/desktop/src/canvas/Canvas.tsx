@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import type { Feed } from '@agent-workspace/shared-types/Feed'
 import type { ForkPoints } from '@agent-workspace/shared-types/ForkPoints'
-import type { RawEvent } from '@agent-workspace/shared-types/RawEvent'
 import type { Run } from '@agent-workspace/shared-types/Run'
 import type { RunId } from '@agent-workspace/shared-types/RunId'
 import type { RunActivity } from '@agent-workspace/shared-types/RunActivity'
@@ -55,6 +55,9 @@ import { ACTIVITY, nameOf } from '../lib/format'
 // Everything that moves it — ⌘\, ⌘[ / ⌘], and the fork motion — ends in
 // `centreOn` from `motion.ts`, so "look at this" has exactly one meaning here.
 
+/** How far outside the window a node still counts as seen, in screen pixels. */
+const VISIBLE_MARGIN = 600
+
 const MIN_SCALE = 0.35
 const MAX_SCALE = 1.6
 const PAD = 48
@@ -63,12 +66,13 @@ export type { Viewport } from './motion'
 
 export function Canvas({
   runs,
-  events,
+  feeds,
   activity,
   forkPoints,
   selected,
   live,
   arriving,
+  onVisible,
   onSelect,
   onSend,
   onFork,
@@ -77,7 +81,8 @@ export function Canvas({
   viewportRef,
 }: {
   runs: Run[]
-  events: Record<RunId, RawEvent[]>
+  /** §7's blocks per run, projected by `document-model` — never derived here. */
+  feeds: Record<RunId, Feed>
   activity: Record<RunId, RunActivity>
   /** Which blocks can be forked at, per run — a projection, never derived here. */
   forkPoints: Record<RunId, ForkPoints>
@@ -86,6 +91,8 @@ export function Canvas({
   live: RunId[]
   /** A child that has just been forked, and is about to appear on the graph. */
   arriving: RunId | null
+  /** Which runs the camera can currently see — see `visible` below. */
+  onVisible: (runs: RunId[]) => void
   onSelect: (id: RunId) => void
   onSend: (id: RunId, text: string) => Promise<void>
   onFork: (parent: RunId, seq: number) => void
@@ -351,6 +358,43 @@ export function Canvas({
 
   const toggleMode = useCallback(() => setMode((m) => (m === 'map' ? 'focus' : 'map')), [])
 
+  /**
+   * Which runs the camera can see, plus a margin of roughly one node.
+   *
+   * Every column stays mounted — the record's focus view keeps them all, and
+   * this does not change that. What it reports is which of them are worth
+   * *projecting*: a feed is thousands of blocks, and a two-hundred-node window
+   * of them is most of the log on a surface where the reader is looking at two.
+   * The margin is what stops a feed arriving only after the column is already
+   * under the eye.
+   */
+  const seen = useMemo(() => {
+    if (box.width === 0) return ''
+    const ids: RunId[] = []
+    for (const node of graph.nodes) {
+      const x1 = view.x + node.x * view.scale
+      const y1 = view.y + node.y * view.scale
+      const x2 = x1 + node.w * view.scale
+      const y2 = y1 + node.h * view.scale
+      if (
+        x2 > -VISIBLE_MARGIN &&
+        x1 < box.width + VISIBLE_MARGIN &&
+        y2 > -VISIBLE_MARGIN &&
+        y1 < box.height + VISIBLE_MARGIN
+      ) {
+        ids.push(node.run.id)
+      }
+    }
+    // Joined rather than returned as an array: this recomputes on every frame
+    // of every pan, and a fresh array each time would re-run the effect below
+    // sixty times a second to report the same answer.
+    return ids.sort().join(',')
+  }, [graph.nodes, view, box])
+
+  useEffect(() => {
+    onVisible(seen === '' ? [] : seen.split(','))
+  }, [seen, onVisible])
+
   viewportRef.current = {
     fit,
     zoomIn: () => zoomBy(1.2),
@@ -475,6 +519,17 @@ export function Canvas({
     return out
   }, [graph.nodes])
 
+  /**
+   * What a fork at a `seq` of this run would inherit, for that run's own feed.
+   *
+   * Read off `EventLog::fork_points` rather than counted here, exactly as the
+   * strip below is: the two numbers sit beside each other on the canvas — a
+   * node's header says `N msgs`, its child says it inherited M of them — and two
+   * counting rules would make one of them wrong.
+   */
+  const inheritedIn = (id: RunId) => (seq: number) =>
+    forkPoints[id]?.blocks.find((b) => b.seq === seq)?.inherited_messages ?? null
+
   /** What a child inherited, read off the parent's projection — never counted here. */
   const inheritedBy = (run: Run): number | null => {
     if (run.parent_run_id === null || run.branch_point_seq === null) return null
@@ -559,8 +614,8 @@ export function Canvas({
                   run={node.run}
                   mode={mode}
                   activity={activity[node.run.id] ?? null}
-                  events={events[node.run.id] ?? []}
-                  forkable={forkPoints[node.run.id]?.blocks ?? []}
+                  feed={feeds[node.run.id] ?? null}
+                  inheritedAt={inheritedIn(node.run.id)}
                   branches={branchesByParent.get(node.run.id) ?? EMPTY_BRANCHES}
                   parent={
                     node.run.parent_run_id === null

@@ -1,0 +1,10 @@
+        1  raw        -        raw.unclassified · not_modeled
+        2  raw        -        raw.unclassified · not_modeled
+        3  raw        -        run.started · {"agent":"claude-code","agent_version":"2.1.269","cwd":"/FIXTURE_SANDBOX","mcp_…
+        4  raw        -        turn.started · {"index":0}
+        5  raw        -        run.rate_limited · {"detail":{"rate_limit_info":{"isUsingOverage":false,"overageDisabledReason":"o…
+      6,7  tool_call  fork@7   Read /FIXTURE_SANDBOX/src/does-not-exist.ts ✗
+        8  raw        -        turn.finished · {"duration_ms":1870,"index":0,"ok":false,"permission_denials":0,"subtype":"erro…
+        9  raw        -        run.failed · {"exit_code":0,"reason":"turn ended with subtype `error_max_turns`","turns":1}
+
+blocks=8 version=1 addressable=1

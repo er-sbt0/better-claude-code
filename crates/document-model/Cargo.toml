@@ -1,0 +1,24 @@
+[package]
+name = "document-model"
+description = "Raw events in, §7's blocks out — the run feed's projection."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+agent-protocol = { workspace = true }
+# Forkability is one rule and it lives next to the code that mints
+# `raw_events.idempotency_key`. This crate reads it exactly as
+# `EventLog::fork_points` does, rather than restating it — see `Block::fork_seq`.
+normalizer = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ts-rs = { workspace = true, features = ["serde-json-impl"] }
+
+[dev-dependencies]
+# The fork projection this crate's addresses must agree with. Dev only: the
+# feed is a function of a slice of events and never of a database.
+event-log = { workspace = true }

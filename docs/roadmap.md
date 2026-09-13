@@ -34,6 +34,9 @@ docs/development.md                            toolchains and system libraries, 
 docs/branching-surface.md                      what the run graph *is*, decided from a prototype (§10, §19)
 docs/verification/claude-code-cli-2.1.270.md   every CLI flag: what was checked
 docs/verification/claude-code-session-forking.md  §19: can one session become a graph
+docs/verification/claude-code-fork-address.md  §19: the stdout uuid IS the fork address
+docs/verification/claude-code-fork-anchor-types.md  which keyed blocks the provider will branch at
+docs/verification/webkitgtk-feed-budget.md     §4's budget, re-measured for N feeds — memory half still open
 docs/verification/git-shadow-attribution.md    §13.1: what was checked, and the spike
 fixtures/claude-code/2.1.269/                  13 recorded streams + record.sh + MANIFEST.md
 fixtures/claude-code/2.1.270/                  14 recorded streams — the full set, re-recorded; no drift from .269
@@ -41,6 +44,7 @@ crates/agent-protocol/                         raw event vocabulary and envelope
 crates/normalizer/                             stream-json in, raw events out
 crates/event-log/                              SQLite; the append-only log (§8, §14)
 crates/worktree/                               worktree-per-run + shadow history (§13, §13.1)
+crates/document-model/                         §7's blocks: raw events in, six types plus Raw out
 crates/driver/                                 spawns the agent; the spine (§5, §8, §13.1)
 crates/workspace-mcp/                          our own MCP server + its relay (§6 source 3, §12, §18)
 apps/desktop/                                  the Tauri shell (§4, §22) — the run graph, in both its representations: conversation columns, ⌘\'s shape cards, and ⌘⇧F forking at a message. §7's feed inside each node is still a flat event list
@@ -111,13 +115,17 @@ node is and the window now draws it: 560 wide, a header carrying the name, the
 three-word status, the message count and the model, a scrolling body, and a
 composer pinned to the bottom edge that sends a real turn through `send_turn`.
 The status and the count are a projection in `event-log`
-(`EventLog::recent_activity`), not something the shell works out. The **body**
-is the old flat list of one line per raw event — `driver/examples/run.rs`'s
-terminal output, in a window — and it is explicitly not §7's feed: no block
-types, no virtualization, no collapse, no `(runId, seqRange)` addressing. It has
-been framed rather than grown, on purpose: the feed is the largest piece of
-work in V1's UI and is meant to be built against fork addresses a working fork
-is already resolving.
+(`EventLog::recent_activity`), not something the shell works out.
+
+**The body is now §7's feed.** `crates/document-model` projects raw events into
+six block types plus `Raw`, each carrying the `seq`s of the events it was
+derived from; the shell renders them and works out none of them. The feed is
+virtualized by a prefix-sum table and a binary search (`windowing.ts`, no
+library), collapse is per block, and the degradation invariant is a test rather
+than an intention: every event of every fixture is accounted for by a block, and
+an unclassified line survives byte for byte. `EventStream.tsx` and
+`lib/describe.ts` are gone — replaced, as the former's own comment demanded,
+rather than grown.
 
 **The window forks, and that is the whole of this step.** ⌘⇧F on a message
 branches the conversation: `fork_run` resolves that block's provider address in
@@ -176,11 +184,18 @@ The provider capability it rests on is verified as of 2026-09-13
 divergent branches, we assign every branch's id, and a branch can start
 mid-conversation. In rough order:
 
-- **Spike the WebKitGTK performance budget** — and re-draw it. §4's budget
-  assumed one linear 5k-block feed plus CodeMirror and xterm; the surface is now
-  pan/zoom over a DAG of *several* virtualized feeds. This is the one item that
-  could invalidate a stack decision rather than add work to it, and the thesis
-  just made it heavier. It goes first.
+- **Finish the WebKitGTK budget.** Partly done, 2026-09-13
+  ([`webkitgtk-feed-budget.md`](verification/webkitgtk-feed-budget.md)), and the
+  half that is done is the reassuring half: at 5,000 blocks a column, one to
+  three columns hold 58–60 fps with at most three slow frames, and DOM nodes
+  stay flat per column, so virtualization works and **no stack decision is in
+  danger**. Twelve columns is 49 fps and degrades only on *horizontal* pan, the
+  phase that brings new columns into view. What is **not** measured is memory,
+  and that is now the binding constraint rather than frame rate: repeated runs
+  drove the machine into multi-gigabyte growth and crashed it. The record
+  proposes a mechanism — a 400,000px column composited by the `opacity` used to
+  dim unfocused ones — and, deliberately, does not claim it. Run the capped
+  experiment it describes before designing against it.
 - ~~**Confirm the fork address.**~~ Done, 2026-09-13
   ([`claude-code-fork-address.md`](verification/claude-code-fork-address.md)).
   The stdout `uuid` we store as `raw_events.idempotency_key` *is* the chain-entry
@@ -253,7 +268,7 @@ four that are screens.
 | **Worktrees** — run-per-worktree, create/list/clean up | §13 | **done**, fork-at-`seq` included — `ShadowHistory::commit_at` resolves a branch-point `seq` to the newest snapshot at or before it (§13.1 never commits an unchanged tree, so most `seq` values have no commit of their own and `<=` is the correct rule, not a lenient one), and a test forks a parent mid-edits and asserts the child's tree holds the parent's content *as of that seq* rather than as of its tip |
 | **Persistence** — SQLite, `runs` + `raw_events` only; projections recomputed on load | §14 | **done** — the whole graph edge is now in the schema: `parent_run_id` plus `branch_point_seq` (migration V2), the only record the graph will ever have, since the provider records no parentage. A root run has neither half and a fork has both; the pairing is enforced in `Run::check_fork_pairing`, not in SQL, so a test reaches it without a database. `driver::fork` writes both halves, and a fork's tree is checked out from the parent's shadow commit at that `seq`. V3 adds `model` — the second thing the log cannot recompute, since what a run was *launched* with is not what the stream reports: `run.started` names one only sometimes and `turn.finished` names what a turn billed. A fork inherits its parent's by copy, so a branch can differ from it. Each migration has a test that an existing database of the previous version keeps its rows |
 | **Workspace MCP server** — `report_finding`, `open_plan`, `record_test_run` | §6 | **done** for `request_permission` + `report_finding`; the other four tools are unbuilt |
-| **Run feed** — six block types plus `Raw`, virtualized, every block carrying `(runId, seqRange)`, **collapse/expand first-class** | §7 | not started — the window's flat event list is bridge scaffolding, not a first draft of this. Second in the slice, built against fork addresses a working fork is already resolving |
+| **Run feed** — six block types plus `Raw`, virtualized, every block carrying `(runId, seqRange)`, **collapse/expand first-class** | §7 | **done** — `crates/document-model` projects events into blocks; the shell renders them. Virtualized without a library, collapse per block, and the degradation invariant replayed over every fixture. The address is the block's exact `seq`s rather than §7's span, because spans overlap — see §8. Frame budget measured for 1–3 columns; the memory ceiling is not (§7) |
 | **The run graph** — the home screen: nodes are runs, edges are `parentRunId` + branch `seq`; generated layout, no drawing library | §10, §19 | **built, against a thin feed** — *the thesis*, and it now answers the gesture it exists for. A node is the conversation column [`branching-surface.md`](branching-surface.md) decided on — 560 wide, header (name · status · message count, then the model), a scrolling body, a composer that sends — and ⌘\ is the same canvas seen the other way: **one camera and one layout pass**, with `sizeOf` answering 560×620 for a column and 560×132 for §10's shape card, so nothing slides sideways under the toggle and the two representations cannot drift apart. ⌘[ / ⌘] walk siblings. ⌘⇧F forks at a message, and only where the provider gave that message an address: forkability is `EventLog::fork_points` over `normalizer::claude_code::fork_address`, never re-derived in TypeScript, and an unaddressable block offers nothing rather than snapping to a neighbour — where "unaddressable" now means *no key, or a key on an event that did not come off an `assistant` or `user` line*, which is nine of the provider's fifteen keyed line kinds (`claude-code-fork-anchor-types.md`). The fork motion is the record's variant B — the child starts on its parent at `scale(.88)`, peels out over ~900ms while the camera holds both at ≤ .78, and focus lands on the child. The edge leaves the parent at the **measured** y of the forked message, which reaches `layout.ts` through the `sizeOf` seam widened by one function (`anchorOf`) rather than by moving layout into a component. Inherited-context strip, in-parent breadcrumbs and edge slivers are all there. The three-word vocabulary is a projection and not shell logic; the map card adds the run's *outcome* beside it, because attention and outcome are different axes and the map is where branches are compared (§8). Missing: §7's feed inside the body, and inline decision blocks |
 | **Review** — the diff surface with reasoning attached to hunks, a branch diffed against its fork point | §13.1 | not started — *the one screen that must be excellent* |
 | **Compare siblings** — two branches off one point, side by side | §19 | not started — last in, first cut if V1 runs long |
@@ -494,9 +509,15 @@ reach stdout": true of a `-p` run, false of ours.
 - **Whether Codex forks at all.** Folded into the Codex debt below, but called
   out separately because the thesis now depends on it: if it does not, the graph
   is a tier-1 capability that must degrade (§5).
-- **The WebKitGTK budget for the graph.** §4's number was drawn for one linear
-  feed. Pan/zoom over a DAG of several virtualized feeds is a different question
-  and has never been measured.
+- **The WebKitGTK budget for the graph — the memory half.** The frame-rate half
+  is discharged (`webkitgtk-feed-budget.md`): 1–3 columns of 5,000 blocks run at
+  58–60 fps and virtualization holds DOM nodes flat per column. Memory was
+  sampled once (352 MB at one column / 500 blocks) and then stopped measuring,
+  because repeated runs crashed the machine — which is itself the finding: the
+  ceiling on how many feeds may be mounted at once is a memory ceiling, not a
+  frame-rate one. The record names a suspected mechanism and the capped
+  experiment that would confirm or kill it. Until that runs, "how many feeds are
+  live at once" is answered for 1–3 and open above it.
 - **Codex, entirely.** Not installed on this machine. `codex exec --json` event
   shapes, `codex exec resume`, the `--sandbox` modes, and the key names in §5's
   mapping table are all still asserted from stale knowledge. Still the largest
@@ -572,6 +593,20 @@ reach stdout": true of a `-p` run, false of ours.
 - **Attribution needs a root snapshot at `seq 0`**, after §13's post-create hook
   and before the first tool call. `SEQ_BEFORE_RUN` names it: `seq` 0 belongs to
   no event, which is why it is the honest label for "as the agent found it".
+- **A block's address is its `seq`s, not §7's span.** §7 spells the address
+  `{runId, seqStart, seqEnd}`. Building the projection found that **spans
+  overlap**: one assistant message can open two tool calls before either
+  returns, so block A covers `seq` 11 and 13 while B covers 12 and 14, and a
+  span alone cannot say which block owns `seq` 12. Storing the exact events
+  keeps the span available — it is the ends of the list — and makes ownership
+  decidable. A range query is still what §9.1's block-range actions resolve
+  against.
+- **A `ToolCall` is addressed at its *result*, not at its start.** The fork
+  anchor has to be a block the provider will branch at, and of the pair only the
+  `tool_result` line is one (`claude-code-fork-anchor-types.md`). Anchoring at
+  the start would also have offered a fork that silently excluded the result of
+  the call the reader pointed at, which is the same lie §8's no-snapping rule
+  refuses.
 - **`tool.completed` carries the tool's name.** The provider never repeats it on
   a `tool_result`; the normalizer had the correlation map and never read it.
   Dead state, and every consumer was going to rebuild it.

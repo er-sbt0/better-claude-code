@@ -26,6 +26,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use agent_protocol::{RawEvent, RunId};
+use document_model::Feed;
 use driver::{ForkPoint, ForkSpec, LaunchSpec, Permission, Registry, RunSpec};
 use event_log::{EventLog, ForkPoints, Run, RunActivity, RunMetrics};
 use normalizer::{Clock, SystemClock};
@@ -192,13 +193,16 @@ fn recent_runs(state: State<'_, AppState>, limit: u32) -> Result<Vec<Run>, Strin
         .map_err(|e| e.to_string())
 }
 
-/// One run's events, from the log.
+/// One run's events, from the log — the unprocessed transcript itself.
 ///
 /// The live channel ([`RUN_EVENT`]) carries a run's events only while this
-/// process is supervising it, so it is the *only* source for a run started in
-/// an earlier session — and selecting such a run without this command shows an
-/// empty stream that looks like a bug in the feed rather than an absent
-/// subscription.
+/// process is supervising it, so this is the *only* source for a run started in
+/// an earlier session.
+///
+/// The node body no longer calls it: [`run_feed`] is what a column renders, and
+/// asking for both would send the same run over the boundary twice. It stays
+/// because §7's invariant asks for more than "nothing is dropped" — "the
+/// unprocessed transcript is always one click away" — and this is the click.
 #[tauri::command]
 fn run_events(state: State<'_, AppState>, run_id: RunId) -> Result<Vec<RawEvent>, String> {
     state
@@ -207,6 +211,34 @@ fn run_events(state: State<'_, AppState>, run_id: RunId) -> Result<Vec<RawEvent>
         .map_err(|_| "event log lock poisoned".to_owned())?
         .events(&run_id)
         .map_err(|e| e.to_string())
+}
+
+/// §7's feed for one run: six block types plus `Raw`, in stream order.
+///
+/// A projection recomputed from the log ([`document_model::project`]), like
+/// [`run_metrics`] and [`run_activity`] and for the same reason, which here is
+/// the load-bearing one: **deriving is deciding**. Several events fan into one
+/// `ToolCall` block, one `assistant` line fans into a `Text` and a `Code` block,
+/// and a permission decision belongs to the call it refused. Every one of those
+/// is a decision, so it lives in a crate a test can reach without a window and
+/// the webview receives blocks it only has to draw.
+///
+/// **Why the whole feed rather than a delta.** The webview already holds the
+/// run's events — they arrive on [`RUN_EVENT`] — so projecting there would cost
+/// no round trip, and that is exactly the trade the rule above refuses. What it
+/// costs instead is re-reading the log and re-projecting it on each call, and
+/// that buys something a delta would not: a feed that stopped rendering while
+/// the camera was elsewhere rejoins the stream by calling this again. There is
+/// no catch-up to get wrong, because there is no delta to miss.
+#[tauri::command]
+fn run_feed(state: State<'_, AppState>, run_id: RunId) -> Result<Feed, String> {
+    let events = state
+        .log
+        .lock()
+        .map_err(|_| "event log lock poisoned".to_owned())?
+        .events(&run_id)
+        .map_err(|e| e.to_string())?;
+    Ok(document_model::project(&run_id, &events))
 }
 
 /// Cost, tokens and turns for one run.
@@ -509,6 +541,7 @@ pub fn run() {
             running_runs,
             recent_runs,
             run_events,
+            run_feed,
             run_metrics,
             run_activity,
             fork_points,
@@ -560,6 +593,37 @@ mod tests {
         assert_eq!(v["run_id"], serde_json::json!("run_1842"));
         assert_eq!(v["seq"], serde_json::json!(7));
         assert_eq!(v["type"], serde_json::json!("turn.started"));
+    }
+
+    /// §7's degradation invariant, checked across the webview boundary.
+    ///
+    /// "An unknown `type` renders as `Raw` and is preserved verbatim." The Rust
+    /// half is tested where it lives — `document-model`'s fixture suite asserts
+    /// that an event with no block type becomes a `Raw` block with its payload
+    /// intact. The half this checks is the one no test in this workspace can
+    /// otherwise reach: the *renderer* must have a fallback for a block type it
+    /// has never heard of, because a document projected by a newer backend than
+    /// the bundle is an ordinary thing once §9.1 starts storing them.
+    ///
+    /// A string match, like the channel test below and for the same reason: the
+    /// alternative is a TypeScript test runner this workspace does not have, and
+    /// the failure this catches — a renderer refactored into an exhaustive
+    /// switch with no default, which type-checks perfectly — is otherwise
+    /// invisible until it renders nothing.
+    #[test]
+    fn the_renderer_keeps_a_fallback_for_a_block_type_it_does_not_know() {
+        let blocks = include_str!("../../src/canvas/Blocks.tsx");
+        assert!(
+            blocks.contains("unknown block type"),
+            "apps/desktop/src/canvas/Blocks.tsx has no fallback for an unknown \
+             block type — §7's degradation invariant is not rendered"
+        );
+        assert!(
+            blocks.contains("const unreachable: never = block"),
+            "the exhaustiveness check is gone from Blocks.tsx, so a seventh \
+             block type would silently fall through to the fallback instead of \
+             failing the build"
+        );
     }
 
     /// Both halves of the channel name, checked against each other.

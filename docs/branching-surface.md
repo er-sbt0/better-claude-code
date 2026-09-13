@@ -373,7 +373,17 @@ ours to make true.
   cheap enough that nobody would notice either way. With §7's virtualized feed
   inside each, N live feeds in focus view is still the number to measure, and
   the WebKitGTK item in §2 — already re-priced once for pan/zoom over a DAG —
-  is still where it gets paid. Measure before choosing.
+  is still where it gets paid.
+
+  **Measured, half of it** (`verification/webkitgtk-feed-budget.md`). With the
+  real feed inside each column at 5,000 blocks: one to three columns run at
+  58–60 fps, twelve at 49 fps degrading only on horizontal pan, and DOM nodes
+  stay flat per column — so virtualization holds and frame rate is not what
+  bounds this. **Memory is**, and it is unmeasured: the measurement was
+  abandoned after repeated runs crashed the machine. So the answer is "1–3 is
+  comfortable, above that is unknown", and the lever this bullet describes —
+  unmount on ⌘\, which already happens — has not had to be pulled yet. Freezing
+  focus-view feeds is still unbuilt and still carries the catch-up cost.
 - ~~**Whether every *keyed* block is really forkable.**~~ It is not, and the
   rule is now measured rather than guessed. The built surface turned this up on
   its first day: a fork offered at the run's **first** block — a `system` /

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { BootReport } from '@agent-workspace/shared-types/BootReport'
+import type { Feed } from '@agent-workspace/shared-types/Feed'
 import type { ForkPoints } from '@agent-workspace/shared-types/ForkPoints'
 import type { RawEvent } from '@agent-workspace/shared-types/RawEvent'
 import type { Run } from '@agent-workspace/shared-types/Run'
@@ -18,7 +19,7 @@ import {
   onRunEvent,
   recentRuns,
   runActivity,
-  runEvents,
+  runFeed,
   runMetrics,
   sendTurn,
   startRun,
@@ -50,16 +51,37 @@ import { Toasts, toast, type Toast } from './shell/Toasts'
 // rule is `normalizer::claude_code::fork_address`, and a second copy of it in
 // TypeScript would be out of reach of every test in this workspace.
 //
-// What is *not* built is as load-bearing as what is: the node bodies still hold
-// a flat list of raw events rather than §7's blocks. That is marked at the
-// point of use rather than here, so that whoever replaces it finds the note
-// attached to it.
+// The node bodies are §7's feed as of this step: six block types plus `Raw`,
+// virtualized, every block carrying the `(runId, seq…)` address collapse, fork
+// and compare resolve against. The blocks themselves are projected by
+// `document-model` and fetched (`runFeed`), for the same reason the three-word
+// status is fetched: deciding that three events are one block is deciding.
+//
+// **Which feeds are live is decided here**, and it is the question
+// `branching-surface.md` left open. A feed is fetched for a run the camera can
+// see, for the selected one, and for every run this session is supervising;
+// feeds for runs that scroll off are dropped, and a run that comes back fetches
+// again. Because the projection is a function of the log alone, coming back is
+// one call — there is no delta to miss, which is what makes the cheap answer
+// also the correct one.
 
 /** Events keyed by run, because one channel carries every run's stream. */
 type Streams = Record<RunId, RawEvent[]>
 
 /** How much history the graph is willing to lay out. */
 const WINDOW = 200
+
+/**
+ * How often a *live* run's feed is re-projected while it streams.
+ *
+ * A finished run's log is immutable, so its feed is fetched once and never
+ * again; this interval only ever applies to runs this session is supervising.
+ * It is a poll rather than a fetch per event because a run emits events in
+ * bursts — a turn can produce a dozen in a few milliseconds — and one round
+ * trip per event would re-project the same log a dozen times to answer the same
+ * question.
+ */
+const FEED_POLL_MS = 250
 
 /** The two events that mean this run's process is gone (§8: not a turn). */
 const isTerminal = (event: RawEvent) =>
@@ -79,6 +101,9 @@ export default function App() {
   const [metrics, setMetrics] = useState<Record<RunId, RunMetrics>>({})
   const [activity, setActivity] = useState<Record<RunId, RunActivity>>({})
   const [forks, setForks] = useState<Record<RunId, ForkPoints>>({})
+  const [feeds, setFeeds] = useState<Record<RunId, Feed>>({})
+  /** The runs the camera can see, reported by the canvas. */
+  const [visible, setVisible] = useState<RunId[]>([])
   const [selected, setSelected] = useState<RunId | null>(null)
   const [starting, setStarting] = useState(false)
   /** A child that has just been forked, until the canvas has landed on it. */
@@ -227,22 +252,84 @@ export default function App() {
     refreshForkPoints()
   }, [eventCount, refreshForkPoints])
 
+  // ------------------------------------------------------------- the feeds --
+
+  /**
+   * Which runs need a feed: the ones the camera can see, the selected one, and
+   * the ones this session is supervising.
+   *
+   * This is the answer to `branching-surface.md`'s "how many feeds are live at
+   * once", and it is a *data* answer rather than a rendering one — every column
+   * stays mounted, as the record's focus view requires, and what is bounded is
+   * how many of them hold a projected run. A supervised run is included even
+   * off screen, because its feed is what the header count and the fork toolbar
+   * are read from the moment the camera arrives.
+   */
+  const wanted = useMemo(() => {
+    const ids = new Set<RunId>(visible)
+    if (selected !== null) ids.add(selected)
+    for (const id of live) ids.add(id)
+    return [...ids].filter((id) => runs.some((r) => r.id === id)).sort()
+  }, [visible, selected, live, runs])
+  const wantedKey = wanted.join(',')
+
+  // Refs, because the sync below runs on a timer and must see the current
+  // answer rather than the one captured when the timer was set.
+  const wantedRef = useRef(wanted)
+  wantedRef.current = wanted
+  const liveRef = useRef(live)
+  liveRef.current = live
+  const streamsRef = useRef(streams)
+  streamsRef.current = streams
+  /** Event count each run's feed was last projected at. */
+  const projectedAt = useRef<Record<RunId, number>>({})
+
+  const syncFeeds = useCallback(() => {
+    for (const id of wantedRef.current) {
+      const events = streamsRef.current[id]?.length ?? 0
+      const at = projectedAt.current[id]
+      // Fetched once, then again only while the run is still producing events.
+      // A finished run's log is immutable (§8: append-only), so its feed cannot
+      // change and re-asking would be a round trip for the same answer.
+      if (at !== undefined && (at === events || !liveRef.current.includes(id))) continue
+      projectedAt.current[id] = events
+      runFeed(id)
+        .then((feed) => setFeeds((prev) => ({ ...prev, [id]: feed })))
+        .catch((e: unknown) => {
+          // Let the next pass try again rather than leaving the column empty
+          // for the life of the session.
+          delete projectedAt.current[id]
+          fail('Could not read the run’s feed')(e)
+        })
+    }
+  }, [fail])
+
+  useEffect(() => {
+    syncFeeds()
+    // Drop what the camera has left behind. A feed is thousands of blocks, and
+    // keeping every run the session has ever looked at is how a long-lived
+    // window grows without bound. Coming back re-fetches, which is correct
+    // rather than merely cheap: the projection is a function of the log.
+    setFeeds((prev) => {
+      const keep = new Set(wantedRef.current)
+      const next = Object.fromEntries(Object.entries(prev).filter(([id]) => keep.has(id)))
+      for (const id of Object.keys(prev)) if (!keep.has(id)) delete projectedAt.current[id]
+      return Object.keys(next).length === Object.keys(prev).length ? prev : next
+    })
+  }, [wantedKey, syncFeeds])
+
+  // A live run's feed is re-projected on a timer; nothing else is. With nothing
+  // supervised there is no timer at all, so an idle window does no work.
+  useEffect(() => {
+    if (live.length === 0) return
+    const timer = setInterval(syncFeeds, FEED_POLL_MS)
+    return () => clearInterval(timer)
+  }, [live.length, syncFeeds])
+
   const current = useMemo(
     () => runs.find((r) => r.id === selected) ?? null,
     [runs, selected],
   )
-
-  // Selecting a run is the moment its history is worth fetching: the live
-  // channel only carries runs this process is supervising, so a run from an
-  // earlier session has no events at all until the log is asked.
-  useEffect(() => {
-    if (selected === null) return
-    runEvents(selected)
-      .then((events) =>
-        setStreams((prev) => ({ ...prev, [selected]: merge(prev[selected] ?? [], events) })),
-      )
-      .catch(fail('Could not read the run’s events'))
-  }, [selected, fail])
 
   useEffect(() => {
     if (selected === null) return
@@ -433,12 +520,13 @@ export default function App() {
 
         <Canvas
           runs={runs}
-          events={streams}
+          feeds={feeds}
           activity={activity}
           forkPoints={forks}
           selected={selected}
           live={live}
           arriving={arriving}
+          onVisible={setVisible}
           onSelect={setSelected}
           onSend={send}
           onFork={fork}
@@ -461,7 +549,7 @@ export default function App() {
       <StatusBar
         run={current}
         metrics={selected === null ? null : (metrics[selected] ?? null)}
-        events={selected === null ? 0 : (streams[selected]?.length ?? 0)}
+        blocks={selected === null ? null : (feeds[selected]?.blocks.length ?? null)}
         live={listening}
         logPath={boot?.log_path ?? null}
       />

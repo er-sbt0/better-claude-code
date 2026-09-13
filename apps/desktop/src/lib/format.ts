@@ -82,7 +82,7 @@ export function elapsed(fromIso: string, toIso: string | null): string {
 /** Four decimals, because a run that cost $0.0004 did not cost $0.00. */
 export const money = (usd: number): string => `$${usd.toFixed(usd < 0.01 ? 4 : 2)}`
 
-/** Long text on one line — the same clip `describe.ts` applies to events. */
+/** Long text on one line, for a header or a card. */
 export const clip = (text: string, max: number): string => {
   const line = text.replace(/\s+/gu, ' ').trim()
   return line.length <= max ? line : `${line.slice(0, max - 1)}…`

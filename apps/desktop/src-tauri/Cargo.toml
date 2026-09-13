@@ -19,6 +19,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 agent-protocol = { workspace = true }
+document-model = { workspace = true }
 driver = { workspace = true }
 event-log = { workspace = true }
 normalizer = { workspace = true }

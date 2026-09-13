@@ -1,0 +1,15 @@
+        1  raw        -        raw.unclassified · not_modeled
+        2  raw        -        raw.unclassified · not_modeled
+        3  raw        -        run.started · {"agent":"claude-code","agent_version":"2.1.270","cwd":"/FIXTURE_SANDBOX","mcp_…
+        4  raw        -        turn.started · {"index":0}
+        5  raw        -        run.rate_limited · {"detail":{"rate_limit_info":{"isUsingOverage":false,"overageDisabledReason":"o…
+        6  text       fork@6   you · Say the word HELLO and nothing else.
+        7  text       fork@7   agent · HELLO
+        8  raw        -        turn.finished · {"duration_ms":1756,"index":0,"ok":true,"permission_denials":0,"subtype":"succe…
+        9  raw        -        turn.started · {"index":1}
+       10  text       fork@10  you · Now say it backwards, and nothing else.
+       11  text       fork@11  agent · OLLEH
+       12  raw        -        turn.finished · {"duration_ms":1450,"index":1,"ok":true,"permission_denials":0,"subtype":"succe…
+       13  raw        -        run.finished · {"exit_code":0,"turns":2}
+
+blocks=13 version=1 addressable=4

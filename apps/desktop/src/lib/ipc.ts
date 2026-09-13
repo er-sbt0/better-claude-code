@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { BootReport } from '@agent-workspace/shared-types/BootReport'
+import type { Feed } from '@agent-workspace/shared-types/Feed'
 import type { RawEvent } from '@agent-workspace/shared-types/RawEvent'
 import type { Run } from '@agent-workspace/shared-types/Run'
 import type { RunId } from '@agent-workspace/shared-types/RunId'
@@ -24,10 +25,26 @@ export const runningRuns = () => invoke<Run[]>('running_runs')
 // finishes, and `runningRuns()` is the query that hides exactly those.
 export const recentRuns = (limit: number) => invoke<Run[]>('recent_runs', { limit })
 
-// One run's events out of the log. The live channel below only carries runs
-// this process is supervising, so a run from an earlier session has no stream
-// at all until this is called.
+// One run's events out of the log — the unprocessed transcript (§7). The live
+// channel below only carries runs this process is supervising, so a run from an
+// earlier session has no stream at all until this is called.
+//
+// A node body does not call it: runFeed() below is what a column renders, and
+// asking for both would send the same run across the boundary twice.
 export const runEvents = (runId: RunId) => invoke<RawEvent[]>('run_events', { runId })
+
+// §7's blocks for one run — the run feed itself.
+//
+// A projection, like runActivity() and forkPoints(), and the reason is the same
+// and stronger: deciding that a `tool.started`, a `permission.resolved` and a
+// `tool.completed` are *one block* is deciding. The webview holds the events
+// already, so projecting here would cost no round trip — and would put the rule
+// where no test in this workspace can reach it.
+//
+// The whole feed, every time, rather than a delta. That is what makes a column
+// whose feed stopped while the camera was elsewhere correct when it comes back:
+// it calls this again, and there is no missed delta to reconcile.
+export const runFeed = (runId: RunId) => invoke<Feed>('run_feed', { runId })
 
 // Cost, tokens and turns — a projection recomputed from `turn.finished` (§14),
 // never a column on the run row.

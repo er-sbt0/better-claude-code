@@ -8,13 +8,14 @@ import { STATUS, elapsed, money } from '../lib/format'
 export function StatusBar({
   run,
   metrics,
-  events,
+  blocks,
   live,
   logPath,
 }: {
   run: Run | null
   metrics: RunMetrics | null
-  events: number
+  /** §7's block count for the selected run, or `null` while its feed is unfetched. */
+  blocks: number | null
   live: boolean
   logPath: string | null
 }) {
@@ -40,7 +41,10 @@ export function StatusBar({
               <span className="font-mono">{metrics.tool_calls} tools</span>
             </>
           )}
-          <span className="font-mono">{events} events</span>
+          {/* Blocks, not events: a run with 200 events does not have 200
+              blocks — a tool call is three events and one block — and this row
+              is about what is on the screen beside it. */}
+          <span className="font-mono">{blocks === null ? '— blocks' : `${blocks} blocks`}</span>
         </>
       )}
 

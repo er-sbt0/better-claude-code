@@ -1,0 +1,13 @@
+        1  raw        -        raw.unclassified · not_modeled
+        2  raw        -        raw.unclassified · not_modeled
+        3  raw        -        run.started · {"agent":"claude-code","agent_version":"2.1.270","cwd":"/FIXTURE_SANDBOX","mcp_…
+        4  raw        -        turn.started · {"index":0}
+        5  raw        -        run.rate_limited · {"detail":{"rate_limit_info":{"isUsingOverage":false,"overageDisabledReason":"o…
+      6,7  terminal   fork@7   $ git status --short --branch
+        8  text       fork@8   agent · Output:
+        8  code       fork@8   code · 1 line
+        8  text       fork@8   agent · Working tree is clean with no changes relative to the tracked branch.
+        9  raw        -        turn.finished · {"duration_ms":6025,"index":0,"ok":true,"permission_denials":0,"subtype":"succe…
+       10  raw        -        run.finished · {"exit_code":0,"turns":1}
+
+blocks=11 version=1 addressable=4

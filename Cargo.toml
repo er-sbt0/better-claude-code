@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "apps/desktop/src-tauri",
     "crates/agent-protocol",
+    "crates/document-model",
     "crates/driver",
     "crates/event-log",
     "crates/normalizer",
@@ -19,6 +20,7 @@ publish = false
 [workspace.dependencies]
 agent-protocol = { path = "crates/agent-protocol" }
 normalizer = { path = "crates/normalizer" }
+document-model = { path = "crates/document-model" }
 driver = { path = "crates/driver" }
 event-log = { path = "crates/event-log" }
 workspace-mcp = { path = "crates/workspace-mcp" }
