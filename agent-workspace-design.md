@@ -5,7 +5,7 @@
 > guarantees. Verify every one against the current tool before building on it.
 >
 > **Claude Code's surface was verified on 2026-09-12 against 2.1.269** — flags in
-> `docs/verification/claude-code-cli-2.1.269.md`, real event streams in
+> `docs/verification/claude-code-cli-2.1.270.md`, real event streams in
 > `fixtures/claude-code/2.1.269/`. Everything said here about Claude Code is
 > evidence now. Everything said about Codex, Gemini and ACP is still assertion.
 
@@ -1731,7 +1731,7 @@ agent-workspace/
     ├── event-log.md
     ├── security.md
     └── verification/              ← exists: what was checked, against which version
-        ├── claude-code-cli-2.1.269.md
+        ├── claude-code-cli-2.1.270.md
         ├── git-shadow-attribution.md     ← §13.1, with an executable spike beside it
         └── shadow-attribution-spike.sh
 ```

@@ -12,7 +12,7 @@ Method: `claude --help`, hidden option definitions and zod schemas extracted
 
 # Claude Code: MCP injection and the permission-prompt tool
 
-`docs/verification/claude-code-cli-2.1.269.md` verified that `--mcp-config`,
+`docs/verification/claude-code-cli-2.1.270.md` verified that `--mcp-config`,
 `--strict-mcp-config` and `--permission-prompt-tool` exist and how they are
 spelled. It did not record two things the workspace MCP server cannot be built
 without:

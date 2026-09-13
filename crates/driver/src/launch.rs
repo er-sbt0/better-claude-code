@@ -1,7 +1,7 @@
 //! The launch shape for Claude Code (design §5).
 //!
-//! Every flag here is verified against 2.1.269 —
-//! `docs/verification/claude-code-cli-2.1.269.md` — and the argv is built by a
+//! Every flag here is verified against 2.1.270 —
+//! `docs/verification/claude-code-cli-2.1.270.md` — and the argv is built by a
 //! pure function so a flag change is a unit-test diff rather than a broken run.
 //! §16: these change without semver, so re-verify per version.
 

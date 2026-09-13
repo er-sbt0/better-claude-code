@@ -26,7 +26,7 @@ not only about the event log.
 agent-workspace-design.md                      the design
 docs/roadmap.md                                this file
 docs/development.md                            toolchains and system libraries, with versions
-docs/verification/claude-code-cli-2.1.269.md   flags and streams: what was checked
+docs/verification/claude-code-cli-2.1.270.md   every CLI flag: what was checked
 docs/verification/git-shadow-attribution.md    §13.1: what was checked, and the spike
 fixtures/claude-code/2.1.269/                  13 recorded streams + record.sh + MANIFEST.md
 fixtures/claude-code/2.1.270/                  14 recorded streams — the full set, re-recorded; no drift from .269
@@ -237,7 +237,12 @@ The differentiating UI remains the structured representation of agent activity.
 
 ## 7. Verification debts
 
-**Discharged:** every §5 Claude Code flag; the Claude Code event mapping; the
+**Discharged:** every §5 Claude Code flag, re-verified against 2.1.270 — which
+turned up one real change: `--input-format=stream-json` no longer requires
+`--print`. It loosens a constraint rather than tightening one and costs us
+nothing, since the driver passes `-p` unconditionally and should keep doing so
+(`--permission-prompt-tool` is still documented print-only). The Claude Code
+event mapping; the
 §13.1 attribution mechanism against git 2.48.1; **MCP injection and the
 permission-prompt tool's response contract** against 2.1.270
 (`claude-code-permission-prompt-tool.md`), including the reserved-name trap that
@@ -267,10 +272,11 @@ wanted from it.
   mapping table are all still asserted from stale knowledge. Still the largest
   debt, and §5's "write the second adapter before extracting the abstraction"
   rule is blocked behind it.
-- **The flag record is still titled 2.1.269.** Its claims were re-checked
-  against the .270 binary while building the MCP server and reproduced verbatim,
-  so the content is current and only the filename is stale. Renaming it on the
-  next verified version is cheaper than doing it twice.
+- **The help *text* of flags the driver does not pass.** The 2.1.270
+  re-verification checked that all 105 documented flags still resolve and re-ran
+  every hard-constraint probe, but spot-checked the quoted prose only on the
+  flags we actually use. A wording change in a flag nobody calls would not have
+  been caught.
 - **`permission.requested` can never have a fixture, and that is structural.**
   The provider's permission layer calls our tool directly, so the request is
   never a `tool_use` block and never reaches stdout. Replaying a stream can no

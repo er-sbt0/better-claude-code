@@ -3,17 +3,72 @@ Verification record. Discharges part of the "every CLI flag in §5" debt in
 docs/roadmap.md. Re-run against each new Claude Code version; these flags change
 without semver (agent-workspace-design.md §16).
 
-Verified: 2026-09-12 · Claude Code 2.1.269 · Ubuntu, x86-64
+Verified: 2026-09-12 against 2.1.269 · re-verified 2026-09-13 against 2.1.270
+          · Ubuntu, x86-64
 Method: `claude --help`, subcommand help, commander option definitions
         extracted from the binary, cross-checked against live validation errors.
-        No agent runs were used to produce this document.
+        The re-verification additionally checked that all 105 flags named below
+        still resolve, and re-ran every hard-constraint probe.
 -->
 
-# CLI flag verification — Claude Code 2.1.269
+# CLI flag verification — Claude Code 2.1.270
 
-Binary: `/home/eransa/.local/bin/claude` -> `/home/eransa/.local/share/claude/versions/2.1.269`
-(ELF x86-64, not stripped; BUILD_TIME 2026-09-11T17:33:46Z, GIT_SHA d0733697ad641a564c7cfcb19a6eb1eb9d61357e)
-`claude --version` => `2.1.269 (Claude Code)`
+Binary: `/home/eransa/.local/bin/claude` -> `/home/eransa/.local/share/claude/versions/2.1.270`
+`claude --version` => `2.1.270 (Claude Code)`
+
+**Everything below was written against 2.1.269 and re-checked against 2.1.270.**
+All 105 flags it names still resolve — visible in `--help` or still registered
+with `.hideHelp()` — and every hard constraint it records still fires with the
+same message, with **one exception**, in §0 immediately below. The 2.1.269
+binary was ELF x86-64, not stripped, BUILD_TIME 2026-09-11T17:33:46Z, GIT_SHA
+d0733697ad641a564c7cfcb19a6eb1eb9d61357e.
+
+---
+
+## 0. What changed in 2.1.270
+
+One thing, and it loosens a constraint rather than tightening one.
+
+### `--input-format=stream-json` no longer requires `--print`
+
+2.1.269 refused the combination:
+
+```
+Error: --input-format=stream-json requires --print.
+```
+
+2.1.270 accepts it. Verified by running a complete turn — `system/init`,
+`assistant`, `result/success` — with `--input-format stream-json
+--output-format stream-json --verbose` and no `-p` anywhere on the command
+line. The error string is still present in the binary and still fires for
+`--include-partial-messages` and `--prompt-suggestions`, so this is that one
+check being relaxed rather than the whole family going away.
+
+**No consequence for this repository.** `LaunchSpec::argv` passes `-p` last and
+unconditionally, and should keep doing so: `--permission-prompt-tool` is
+documented "only works with --print", and nothing has been verified about
+whether *that* constraint moved too. This is recorded because §16 asks for the
+diff between versions, not because anything needs changing.
+
+The companion constraint is unchanged and still fires:
+
+```
+Error: --input-format=stream-json requires output-format=stream-json.
+Error: When using --print, --output-format=stream-json requires --verbose
+```
+
+as do the choice lists for `--permission-mode` (`acceptEdits, auto,
+bypassPermissions, manual, dontAsk, plan`) and `--permission-prompts`
+(`host, none`).
+
+**Not re-checked at the same depth:** the exact help *text* of every flag in the
+tables below. Flag existence and the hard constraints were re-run; the prose
+was spot-checked on the flags the driver actually passes. A wording change in a
+flag nobody uses would not have been caught.
+
+See also `claude-code-permission-prompt-tool.md`, which verifies MCP injection
+and the permission-prompt response contract against 2.1.270 — both of which this
+record predates and does not cover.
 
 Help surfaces checked: `claude --help` (full, captured), `claude -p --help` (identical option list —
 no per-flag subhelp), `claude mcp --help`, `claude mcp serve --help`, `claude agents --help`.
@@ -76,10 +131,14 @@ if(w.outputFormat==="stream-json"&&!w.verbose){
 Two additional constraints, enforced at startup (exact strings from the binary, both reproduced live):
 ```
 Error: --input-format=stream-json requires output-format=stream-json.
-Error: --input-format=stream-json requires --print.
+Error: --input-format=stream-json requires --print.    # 2.1.269 only — see §0
 ```
 => The doc's combination (`-p` + `--output-format stream-json` + `--input-format stream-json`) satisfies
 all three constraints. Correct as written.
+
+**In 2.1.270 the second of those no longer fires** and the combination runs
+without `-p`. §0 has the evidence. Passing `-p` anyway remains correct and is
+what the driver does.
 
 ### `--mcp-config` — EXISTS, takes BOTH file paths and inline JSON strings, and is variadic
 ```
