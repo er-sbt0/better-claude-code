@@ -13,14 +13,19 @@ import type { RunId } from '@agent-workspace/shared-types/RunId'
 // (`parent_run_id`), because a fork descends from exactly one point in exactly
 // one run. That is what makes fifty lines enough.
 //
-// Nothing here knows what a node *is*. It is handed `sizeOf` — which today
-// answers 560×620 for every run and under map view (⌘\, not built) will answer
-// with §10's shape card — and that seam is why a second representation of this
-// canvas costs no change to this file.
+// Nothing here knows what a node *is*. It is handed `sizeOf` — 560×620 for a
+// conversation column in focus view, 560×132 for §10's shape card in map view
+// — and that seam is why a second representation of this canvas costs no change
+// to this file. `anchorOf` is the same seam widened once more, for the one fact
+// about a node that only the DOM can answer: where inside the parent the forked
+// message actually rendered.
 // ---------------------------------------------------------------------------
 
 const GAP_X = 72
 const GAP_Y = 14
+
+/** How close to a node's own edge an anchored wire may be pinned. */
+const EDGE_INSET = 6
 
 /** What a node measures. A conversation column is 560 wide and a fixed height:
  *  its body scrolls rather than the node growing
@@ -40,7 +45,29 @@ export type Wire = {
   id: string
   /** An SVG path: out of the parent's right edge, into the child's left. */
   d: string
+  /** Whether the parent end was placed by a measurement or by the fallback.
+   *  Nothing draws differently on it; it is here so a surface can say "the
+   *  branch point is scrolled out of view" rather than imply it is at the top
+   *  of the node. */
+  measured: boolean
 }
+
+/**
+ * Where the block at `seq` renders inside `run`'s node, in node-local pixels.
+ *
+ * `null` for "no measurement", which is the honest answer in three different
+ * situations and must not be confused with zero: the node has not laid out
+ * yet, the block is not in the events this session has loaded, or the feed is
+ * scrolled so far that the block is nowhere on the node.
+ *
+ * This exists because the fork anchor moved from the node to the *message*
+ * (`docs/branching-surface.md`), and where a message sits inside a scrolling
+ * column is a fact only the DOM holds. Passing it in keeps that fact flowing
+ * *into* the layout pass rather than moving the layout into the component that
+ * measures — which is the seam `sizeOf` already established, widened by one
+ * function.
+ */
+export type AnchorOf = (run: Run, seq: number) => number | null
 
 export type Graph = {
   nodes: Placed[]
@@ -56,7 +83,11 @@ export type Graph = {
  * fact about what the node draws, and the packing below has to know it before
  * it can promise two nodes do not overlap.
  */
-export function layout(runs: Run[], sizeOf: (run: Run) => Size): Graph {
+export function layout(
+  runs: Run[],
+  sizeOf: (run: Run) => Size,
+  anchorOf: AnchorOf = () => null,
+): Graph {
   const byId = new Map<RunId, Run>(runs.map((r) => [r.id, r]))
 
   // A parent outside this set is no parent at all: the run is drawn as a root
@@ -154,7 +185,20 @@ export function layout(runs: Run[], sizeOf: (run: Run) => Size): Graph {
     const from = placed.get(parent.id)
     if (from === undefined) continue
     const x1 = from.x + from.w
-    const y1 = from.y + Math.min(from.h / 2, 26)
+    // **The edge leaves the parent at the forked message, not at the node.**
+    // The branch point is a `seq` in the parent's log, and `anchorOf` reports
+    // where that block rendered inside the parent's scrolling body. Clamped
+    // into the node so a branch point scrolled out of the body pins the edge to
+    // the nearest edge of the column it is inside rather than flying off it,
+    // and falling back to the old node-top anchor when nothing measured it —
+    // which is what a run whose events this session never loaded looks like.
+    const measuredY =
+      node.run.branch_point_seq === null ? null : anchorOf(from.run, node.run.branch_point_seq)
+    const y1 =
+      from.y +
+      (measuredY === null
+        ? Math.min(from.h / 2, 26)
+        : Math.max(EDGE_INSET, Math.min(from.h - EDGE_INSET, measuredY)))
     const x2 = node.x
     const y2 = node.y + Math.min(node.h / 2, 26)
     // Orthogonal with a rounded turn: the same elbow §10's sketch draws, and
@@ -166,7 +210,7 @@ export function layout(runs: Run[], sizeOf: (run: Run) => Size): Graph {
       r < 1
         ? `M ${x1} ${y1} H ${x2}`
         : `M ${x1} ${y1} H ${mid - r} Q ${mid} ${y1} ${mid} ${y1 + r * dir} V ${y2 - r * dir} Q ${mid} ${y2} ${mid + r} ${y2} H ${x2}`
-    edges.push({ id: `${from.run.id}->${node.run.id}`, d })
+    edges.push({ id: `${from.run.id}->${node.run.id}`, d, measured: measuredY !== null })
   }
 
   const width = nodes.reduce((max, n) => Math.max(max, n.x + n.w), 0)

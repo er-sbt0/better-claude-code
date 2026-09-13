@@ -26,8 +26,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use agent_protocol::{RawEvent, RunId};
-use driver::{LaunchSpec, Permission, Registry, RunSpec};
-use event_log::{EventLog, Run, RunActivity, RunMetrics};
+use driver::{ForkPoint, ForkSpec, LaunchSpec, Permission, Registry, RunSpec};
+use event_log::{EventLog, ForkPoints, Run, RunActivity, RunMetrics};
 use normalizer::{Clock, SystemClock};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -83,6 +83,42 @@ pub struct StartRunRequest {
     pub prompt: String,
     pub model: Option<String>,
     /// Pre-granted tools, e.g. `Read`, `Edit`. Anything absent is denied.
+    pub allowed_tools: Vec<String>,
+    pub max_turns: Option<u32>,
+    pub max_budget_usd: Option<f64>,
+}
+
+/// What the UI has to say to fork one (§19, `docs/branching-surface.md`).
+///
+/// Two fields are the fork and the rest are the launch. `parent` and `seq` name
+/// the block the branch is anchored at — a `seq` in the **parent's** log, which
+/// [`ForkPoint::resolve`] turns into the chain-entry uuid
+/// `--resume-session-at` takes, refusing rather than snapping to a neighbour if
+/// that block carries no address.
+///
+/// **Why the launch flags are here rather than inherited.** The `runs` row
+/// records what a run *is*, and of what it was *launched with* it stores only
+/// the model (schema V3) — there is no `allowed_tools` column, and inventing
+/// one for this would be storing a launch flag to avoid passing it. So the
+/// caller passes what it knows: for a run this session started, what it started
+/// it with; for a run from an earlier session, nothing, and a child with no
+/// pre-granted tool can still think and answer but cannot edit. That is stated
+/// on the surface rather than papered over with a default nobody chose.
+#[derive(Debug, Clone, Deserialize, TS)]
+#[ts(export)]
+pub struct ForkRunRequest {
+    /// The run being branched.
+    pub parent: RunId,
+    /// The branch point: a `seq` in the parent's log.
+    #[ts(type = "number")]
+    pub seq: u64,
+    /// The first thing said to the child. A fork begins with the user typing
+    /// into the branch — that is the whole reason a node shows its messages.
+    pub prompt: String,
+    /// `None` inherits the parent's, which is what a fork means; naming one is
+    /// how a branch comes to differ from its parent (`driver::fork`).
+    pub model: Option<String>,
+    /// Pre-granted tools, as on [`StartRunRequest`]. Anything absent is denied.
     pub allowed_tools: Vec<String>,
     pub max_turns: Option<u32>,
     pub max_budget_usd: Option<f64>,
@@ -262,33 +298,122 @@ fn start_run(
 
     let live = state
         .runs
-        .start(log, spec, move |event| {
-            // The live feed, and the whole of it: one `emit` per event, inline
-            // on the run's supervisor thread, in stream order.
-            //
-            // Inline is the load-bearing word. §8's standing trap is that
-            // *events produced at process exit must reach the live view, not
-            // just the log* — `run.finished` is not a line of stdout, it is
-            // synthesized once the process has been waited for. The supervisor
-            // delivers it here as the last call it makes before reaping, so any
-            // queue, channel or thread of our own between this closure and the
-            // webview would be a thing that can still hold the tail when the
-            // run is already gone. There is none.
-            //
-            // An emit can fail — the window can be closing while a run is still
-            // talking — and there is nothing useful to do about it: the run is
-            // already running and the log already has the event. Say so on
-            // stderr rather than swallow it, because a live view that silently
-            // stops updating is the symptom this would produce.
-            if let Err(e) = app.emit(RUN_EVENT, &event) {
-                eprintln!(
-                    "{}: {} seq {} never reached the webview: {e}",
-                    event.run_id.0,
-                    event.type_name(),
-                    event.seq
-                );
-            }
-        })
+        .start(log, spec, emit_events(app))
+        .map_err(|e| e.to_string())?;
+
+    Ok(StartedRun {
+        run_id: live.run_id,
+        branch: live.branch,
+        worktree_path: live.worktree_path.display().to_string(),
+        shadow_ref: live.shadow_ref,
+        started_at: live.started_at,
+    })
+}
+
+/// Which blocks of these runs can be forked at, and what a fork there inherits.
+///
+/// A projection ([`EventLog::fork_points`]), and a command for exactly the
+/// reason [`run_activity`] is one: **forkability is a decision and the shell
+/// owns no logic**. The rule — strip the key at the first `#`, an absent or
+/// empty key is not an address — is
+/// `normalizer::claude_code::fork_address`, one function with live runs behind
+/// it (`docs/verification/claude-code-fork-address.md`). `RawEvent`'s
+/// `idempotency_key` reaches the webview, so re-deriving it there would take
+/// ten lines and no round trip; it would also be that rule in a second
+/// language, out of reach of every test in this workspace, drifting towards
+/// offering forks [`fork_run`] then refuses.
+///
+/// By name rather than by window, unlike [`run_activity`]: the answer is per
+/// *block*, so the caller asks for the runs it can actually fork in — the one
+/// being read, the ones it is supervising, and the parents of the children on
+/// screen.
+#[tauri::command]
+fn fork_points(state: State<'_, AppState>, run_ids: Vec<RunId>) -> Result<Vec<ForkPoints>, String> {
+    state
+        .log
+        .lock()
+        .map_err(|_| "event log lock poisoned".to_owned())?
+        .fork_points(&run_ids)
+        .map_err(|e| e.to_string())
+}
+
+/// Fork a run at a block, and supervise the child like any other run.
+///
+/// Three lines of translation over [`Registry::fork`], which is where every
+/// decision in a fork lives: the branch point is resolved against the parent's
+/// log, the child's worktree is checked out from the parent's shadow commit at
+/// that `seq`, and both halves of the graph edge are written to the child's row
+/// (§19 — the provider records no parentage, so a fork we fail to store is a
+/// fork that never happened).
+///
+/// Two things are decided here because there is nowhere else for them, and both
+/// are the shell choosing the *absence* of a behaviour rather than inventing
+/// one:
+///
+/// - **The child's branch is `agent/<child id>`,** exactly as [`start_run`]
+///   names a root run's. Two worktrees cannot share a branch and §13.1's
+///   history is per run, so a fork cannot reuse the parent's.
+/// - **No post-create hook.** [`ForkSpec::post_create_hook`] is a live question
+///   the branching record does not answer, and it is a real one: a shadow
+///   commit respects `.gitignore`, so the child's checkout has none of the
+///   parent's `node_modules` or `target` even though the parent has them on
+///   disk. `None` is chosen because the hook is arbitrary user code and this
+///   app has no configuration surface for one — [`StartRunRequest`] has no such
+///   field either, so every run this window starts already runs none. A fork
+///   that ran a command its parent never ran would be the shell deciding what
+///   builds the user's repository, which is the one thing the rule at the top
+///   of this file forbids. The consequence is stated rather than hidden: a
+///   child's tree holds the parent's *tracked* files at the branch point and
+///   nothing that `.gitignore` covers, so a fork of a project with a build step
+///   starts from a clean checkout. When [`StartRunRequest`] grows a hook, a
+///   fork inherits it here and this comment goes away.
+#[tauri::command]
+fn fork_run(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: ForkRunRequest,
+) -> Result<StartedRun, String> {
+    // Resolved through the UI's connection, before a second one is opened:
+    // an unaddressable block is a refusal, and a refusal should cost no run.
+    let at = {
+        let log = state
+            .log
+            .lock()
+            .map_err(|_| "event log lock poisoned".to_owned())?;
+        ForkPoint::resolve(&log, &request.parent, request.seq).map_err(|e| e.to_string())?
+    };
+
+    let log = EventLog::open(&state.boot.log_path).map_err(|e| e.to_string())?;
+    let run_id = driver::new_run_id();
+    // `cwd`, `resume` and `fork_at` are all overwritten by `driver::fork` —
+    // the first because §13 does not leave a working directory to a caller, the
+    // other two because they *are* the fork. The repo path here is a
+    // placeholder for that reason; the fork reads the real one off the parent.
+    let mut launch = LaunchSpec::new(
+        PathBuf::from(&request.parent.0),
+        driver::new_session_id(),
+        Permission::DenyPrompts,
+    );
+    launch.model = request.model;
+    launch.allowed_tools = request.allowed_tools;
+    launch.max_turns = request.max_turns;
+    launch.max_budget_usd = request.max_budget_usd;
+
+    let spec = ForkSpec {
+        run_id: run_id.clone(),
+        at,
+        branch: format!("agent/{}", run_id.0),
+        post_create_hook: None,
+        prompt: request.prompt,
+        launch,
+        // As on `start_run`, and for the same reason: §12 option A needs a
+        // `Decider` that is a person and there is not one yet.
+        workspace_mcp: None,
+    };
+
+    let live = state
+        .runs
+        .fork(log, spec, emit_events(app))
         .map_err(|e| e.to_string())?;
 
     Ok(StartedRun {
@@ -323,6 +448,40 @@ fn interrupt_run(state: State<'_, AppState>, run_id: RunId) -> Result<(), String
     state.runs.interrupt(&run_id).map_err(|e| e.to_string())
 }
 
+/// The live feed, and the whole of it: one `emit` per event, inline on the
+/// run's supervisor thread, in stream order.
+///
+/// Inline is the load-bearing word. §8's standing trap is that *events produced
+/// at process exit must reach the live view, not just the log* —
+/// `run.finished` is not a line of stdout, it is synthesized once the process
+/// has been waited for. The supervisor delivers it here as the last call it
+/// makes before reaping, so any queue, channel or thread of our own between
+/// this closure and the webview would be a thing that can still hold the tail
+/// when the run is already gone. There is none.
+///
+/// An emit can fail — the window can be closing while a run is still talking —
+/// and there is nothing useful to do about it: the run is already running and
+/// the log already has the event. Say so on stderr rather than swallow it,
+/// because a live view that silently stops updating is the symptom this would
+/// produce.
+///
+/// One function rather than a closure per command, because a fork's events are
+/// a run's events: they arrive on the same channel, filtered by `run_id` like
+/// every other run's, and a second copy of this would be a second place for the
+/// tail to go missing.
+fn emit_events(app: AppHandle) -> impl FnMut(RawEvent) + Send + 'static {
+    move |event: RawEvent| {
+        if let Err(e) = app.emit(RUN_EVENT, &event) {
+            eprintln!(
+                "{}: {} seq {} never reached the webview: {e}",
+                event.run_id.0,
+                event.type_name(),
+                event.seq
+            );
+        }
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -352,8 +511,10 @@ pub fn run() {
             run_events,
             run_metrics,
             run_activity,
+            fork_points,
             live_runs,
             start_run,
+            fork_run,
             send_turn,
             end_run,
             interrupt_run

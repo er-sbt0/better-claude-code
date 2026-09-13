@@ -247,3 +247,53 @@ impl Activity {
         }
     }
 }
+
+/// Where a run can be forked, and what a fork there would inherit.
+///
+/// A projection like [`RunActivity`], and here for the same reason: **which
+/// blocks are forkable is a decision, and the shell owns no logic** (roadmap
+/// §8). The rule itself is not re-implemented here either — it is
+/// [`normalizer::claude_code::fork_address`], the one reader of the format the
+/// normalizer mints into `raw_events.idempotency_key`, and this walks a run's
+/// blocks past that function. A second copy of "strip at the first `#`, null is
+/// not an address" in TypeScript would drift from it silently, and the surface
+/// that drifted would be the one offering forks at addresses the driver then
+/// refuses.
+///
+/// `RawEvent.idempotency_key` does reach the webview, which makes re-deriving
+/// it there look free. It is not free: it is the same rule in a second
+/// language, out of reach of every test in this workspace.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ForkPoints {
+    pub run_id: RunId,
+    /// Every block of the run that carries a provider address, oldest first.
+    ///
+    /// A run with none is a run nothing can be forked from — which is an
+    /// ordinary state, not an error: out-of-band events carry no key at all,
+    /// and a run that has only asked for a permission has nothing addressable
+    /// in it yet.
+    pub blocks: Vec<ForkBlock>,
+}
+
+/// One forkable block: where it is, and how much conversation a fork there
+/// would start with.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ForkBlock {
+    /// The `seq` in this run's log. What `Run::branch_point_seq` stores, and
+    /// what `driver::ForkPoint::resolve` is handed to re-address the block.
+    #[ts(type = "number")]
+    pub seq: u64,
+    /// Messages in this run at or before this block — what the child's
+    /// inherited-context strip states out loud.
+    ///
+    /// Counted by [`RunActivity::messages`]'s rule, which is why this is
+    /// computed here rather than by whatever draws the strip: the two numbers
+    /// appear beside each other on the canvas (a node's header says `N msgs`,
+    /// its child says it inherited M of them) and two counting rules would make
+    /// one of them wrong. `branching-surface.md` rejected snapping to a nearby
+    /// address precisely because this number is stated out loud, so it is the
+    /// number the fork decision is made against.
+    pub inherited_messages: u32,
+}

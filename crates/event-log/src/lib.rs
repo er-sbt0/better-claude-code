@@ -18,5 +18,5 @@ mod schema;
 
 pub use error::{Error, Result};
 pub use log::{Appended, EventLog, Health};
-pub use run::{Activity, Run, RunActivity, RunMetrics, RunStatus};
+pub use run::{Activity, ForkBlock, ForkPoints, Run, RunActivity, RunMetrics, RunStatus};
 pub use schema::SCHEMA_VERSION;

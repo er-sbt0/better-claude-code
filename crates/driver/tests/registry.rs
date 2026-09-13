@@ -546,3 +546,122 @@ fn a_run_that_failed_in_the_stream_is_not_filed_as_finished() {
         "a refused fork answers nothing: {types:?}"
     );
 }
+
+/// A fork is a run: the registry starts it, supervises it and reaps it through
+/// the same machinery, and the child's row carries both halves of the graph
+/// edge.
+///
+/// This is the command behind ⌘⇧F. `driver::fork` has existed since the fork
+/// path was built and nothing could call it from a window, because the registry
+/// — the one thing the shell talks to — had no `fork`. A button wired to
+/// nothing is the decoration this project keeps legislating against, so the
+/// wire is tested where a test reaches it without a window.
+#[test]
+fn forking_through_the_registry_supervises_the_child_like_any_other_run() {
+    let home = TempDir::new("fork");
+    let repo = repo(home.path());
+    let bin = stub_agent(home.path(), "one-turn", ONE_TURN);
+    let parent = RunId::from("run_parent");
+    let db = home.path().join("log.sqlite");
+
+    let registry = registry();
+    let (on_event, _rx) = events();
+    registry
+        .start(
+            EventLog::open(&db).unwrap(),
+            spec(&repo, &bin, &parent),
+            on_event,
+        )
+        .unwrap();
+    eventually("the parent to be reaped", || !registry.is_live(&parent));
+
+    // The branch point, resolved the way the shell resolves it: a `seq` in the
+    // parent's log, through the parent's own `idempotency_key`.
+    let log = EventLog::open(&db).unwrap();
+    eventually("the parent's assistant message", || {
+        log.events(&parent)
+            .unwrap()
+            .iter()
+            .any(|e| e.type_name() == "assistant.message")
+    });
+    let at_seq = log
+        .events(&parent)
+        .unwrap()
+        .iter()
+        .find(|e| e.type_name() == "assistant.message")
+        .expect("the parent said something")
+        .seq;
+    // The projection the toolbar is drawn from and the resolution the driver
+    // performs are the same rule, and this is where they are checked against
+    // each other: the surface must not offer a fork the driver then refuses.
+    let offered = log.fork_points(std::slice::from_ref(&parent)).unwrap();
+    assert!(
+        offered[0].blocks.iter().any(|b| b.seq == at_seq),
+        "the block the fork is anchored at was not offered as forkable"
+    );
+    assert_eq!(
+        offered[0]
+            .blocks
+            .iter()
+            .find(|b| b.seq == at_seq)
+            .unwrap()
+            .inherited_messages,
+        1,
+        "one answer, and the strip on the child says so"
+    );
+    let at = driver::ForkPoint::resolve(&log, &parent, at_seq).unwrap();
+    assert_eq!(
+        at.address, "u1",
+        "the address is the bare uuid, never our `#i` fan-out suffix"
+    );
+
+    let child = RunId::from("run_child");
+    let mut launch = LaunchSpec::new(&repo, driver::new_session_id(), Permission::DenyPrompts);
+    launch.binary = bin.clone();
+    launch.thinking = Thinking::Off;
+    let live = registry
+        .fork(
+            EventLog::open(&db).unwrap(),
+            driver::ForkSpec {
+                run_id: child.clone(),
+                at: at.clone(),
+                branch: format!("agent/{}", child.0),
+                post_create_hook: None,
+                prompt: "try it the other way".to_owned(),
+                launch,
+                workspace_mcp: None,
+            },
+            |_| {},
+        )
+        .unwrap();
+
+    assert_eq!(live.run_id, child);
+    assert_eq!(live.branch, "agent/run_child");
+    assert!(
+        live.worktree_path.exists()
+            && live.worktree_path != repo.join(".worktrees").join(&parent.0),
+        "a fork is created with its own worktree (§13), from the parent's \
+         shadow commit at the branch point"
+    );
+
+    // Supervised by the same thread with the same end condition, and reaped by
+    // the same rule — which is the whole claim of `Registry::fork`.
+    eventually("the child to be reaped", || !registry.is_live(&child));
+    eventually("the child's row to be closed", || {
+        status(&log, &child) != RunStatus::Running
+    });
+
+    let row = log.run(&child).unwrap().expect("the child's row");
+    assert_eq!(row.parent_run_id.as_ref(), Some(&parent));
+    assert_eq!(
+        row.branch_point_seq,
+        Some(at_seq),
+        "the graph edge is stored whole, or it is lost: the provider records \
+         no parentage"
+    );
+    assert_eq!(
+        row.model,
+        log.run(&parent).unwrap().unwrap().model,
+        "a fork inherits its parent's model, by copy onto its own row"
+    );
+}

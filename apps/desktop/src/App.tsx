@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { BootReport } from '@agent-workspace/shared-types/BootReport'
+import type { ForkPoints } from '@agent-workspace/shared-types/ForkPoints'
 import type { RawEvent } from '@agent-workspace/shared-types/RawEvent'
 import type { Run } from '@agent-workspace/shared-types/Run'
 import type { RunId } from '@agent-workspace/shared-types/RunId'
@@ -10,6 +11,8 @@ import type { UnlistenFn } from '@tauri-apps/api/event'
 import {
   bootReport,
   endRun,
+  forkPoints,
+  forkRun,
   interruptRun,
   liveRuns,
   onRunEvent,
@@ -39,10 +42,18 @@ import { Toasts, toast, type Toast } from './shell/Toasts'
 // same reason metrics are: deriving "needs you" from the log is deciding, and
 // the shell owns no logic.
 //
-// What is *not* built is as load-bearing as what is. The node bodies still
-// hold a flat list of raw events rather than §7's blocks, nothing forks, and
-// there is no map view. All three are marked at the point of use rather than
-// here, so that whoever replaces one finds the note attached to it.
+// Forking is wired end to end from here: ⌘⇧F on a block reaches `fork_run`,
+// which resolves the address in the parent's log, checks the child's worktree
+// out of the parent's shadow commit at that `seq` and supervises the child like
+// any other run. Which blocks *offer* the gesture is a projection this file
+// fetches (`forkPoints`) for the same reason the three-word status is one: the
+// rule is `normalizer::claude_code::fork_address`, and a second copy of it in
+// TypeScript would be out of reach of every test in this workspace.
+//
+// What is *not* built is as load-bearing as what is: the node bodies still hold
+// a flat list of raw events rather than §7's blocks. That is marked at the
+// point of use rather than here, so that whoever replaces it finds the note
+// attached to it.
 
 /** Events keyed by run, because one channel carries every run's stream. */
 type Streams = Record<RunId, RawEvent[]>
@@ -67,8 +78,23 @@ export default function App() {
   const [live, setLive] = useState<RunId[]>([])
   const [metrics, setMetrics] = useState<Record<RunId, RunMetrics>>({})
   const [activity, setActivity] = useState<Record<RunId, RunActivity>>({})
+  const [forks, setForks] = useState<Record<RunId, ForkPoints>>({})
   const [selected, setSelected] = useState<RunId | null>(null)
   const [starting, setStarting] = useState(false)
+  /** A child that has just been forked, until the canvas has landed on it. */
+  const [arriving, setArriving] = useState<RunId | null>(null)
+  /**
+   * What this session launched each run with.
+   *
+   * The `runs` row stores what a run *is*, and of what it was *launched with*
+   * only the model (schema V3). A fork therefore cannot inherit its parent's
+   * allowed tools through the log, and storing them to make it possible would
+   * be storing a launch flag to avoid passing one. So the shell remembers what
+   * it asked for — for this session, which is exactly as long as the runs it
+   * can fork from are supervised — and a run started before this window opened
+   * forks with nothing pre-granted, which the toast says out loud.
+   */
+  const [launched, setLaunched] = useState<Record<RunId, StartRunRequest>>({})
 
   const [leftOpen, setLeftOpen] = useState(true)
   const [rightOpen, setRightOpen] = useState(true)
@@ -133,6 +159,22 @@ export default function App() {
       .catch(fail('Could not read run activity'))
   }, [fail])
 
+  // Which blocks can be forked at, for the runs a fork can be anchored in: the
+  // one being read, the ones this session supervises, and the parents of the
+  // children on screen (a child's inherited-context strip states a count that
+  // only the parent's projection knows). Not the whole window — the answer is
+  // per block, and a two-hundred-run window of it is most of the log.
+  const refreshForkPoints = useCallback(() => {
+    const wanted = new Set<RunId>(live)
+    if (selected !== null) wanted.add(selected)
+    for (const run of runs) if (run.parent_run_id !== null) wanted.add(run.parent_run_id)
+    const ids = [...wanted].filter((id) => runs.some((r) => r.id === id))
+    if (ids.length === 0) return
+    forkPoints(ids)
+      .then((rows) => setForks(Object.fromEntries(rows.map((f) => [f.run_id, f]))))
+      .catch(fail('Could not read where this run can be forked'))
+  }, [live, runs, selected, fail])
+
   useEffect(() => {
     bootReport()
       .then((report) => {
@@ -181,6 +223,10 @@ export default function App() {
     refreshActivity()
   }, [eventCount, runs, refreshActivity])
 
+  useEffect(() => {
+    refreshForkPoints()
+  }, [eventCount, refreshForkPoints])
+
   const current = useMemo(
     () => runs.find((r) => r.id === selected) ?? null,
     [runs, selected],
@@ -216,6 +262,7 @@ export default function App() {
     try {
       const started = await startRun(request)
       setDialogOpen(false)
+      setLaunched((prev) => ({ ...prev, [started.run_id]: request }))
       setSelected(started.run_id)
       refreshRuns()
     } catch (e: unknown) {
@@ -244,6 +291,73 @@ export default function App() {
     [fail],
   )
 
+  /**
+   * ⌘⇧F: branch the conversation at a block, and the worktree with it.
+   *
+   * Everything that makes this a fork happens below the window. What the shell
+   * contributes is the two things the log cannot answer — which block (the
+   * user's pointer) and what to launch the child with (what this session
+   * started the parent with) — and then it gets out of the way.
+   *
+   * The child is announced to the canvas as `arriving` rather than selected
+   * here: selection is what the fork motion *lands* on at ~900ms, and selecting
+   * it now would teleport the camera to a node that has not been drawn yet.
+   */
+  const fork = useCallback(
+    (parent: RunId, seq: number) => {
+      const inherited = launched[parent]
+      forkRun({
+        parent,
+        seq,
+        // A fork is a conversation you continue, so the first thing said to it
+        // is the user's next turn. Typed into the child's composer, which is
+        // where every branch in the prototype begins.
+        prompt: 'Continue from here.',
+        // `null` inherits the parent's model, which is what a fork means.
+        model: null,
+        allowed_tools: inherited?.allowed_tools ?? [],
+        max_turns: inherited?.max_turns ?? null,
+        max_budget_usd: inherited?.max_budget_usd ?? null,
+      })
+        .then((child) => {
+          if (inherited === undefined) {
+            say(
+              toast(
+                'notice',
+                'Forked with no tools pre-granted',
+                `${parent} was not started by this session, so there is no allow-list to inherit — the branch can think and answer but not edit.`,
+              ),
+            )
+          } else {
+            setLaunched((prev) => ({ ...prev, [child.run_id]: inherited }))
+          }
+          setArriving(child.run_id)
+          refreshRuns()
+        })
+        .catch(fail('The fork did not happen'))
+    },
+    [launched, refreshRuns, say, fail],
+  )
+
+  /** ⌘⇧F with nothing addressable under the pointer. Said, never rounded off. */
+  const forkUnavailable = useCallback(
+    () =>
+      say(
+        toast(
+          'notice',
+          'Nothing forkable under the pointer',
+          'A fork is anchored to a message, and only where the provider gave that message an address. Hover a block that offers the toolbar — the surface will not rewind to a nearby one.',
+        ),
+      ),
+    [say],
+  )
+
+  /** The end of the fork motion: focus lands on the child at ~900ms. */
+  const arrived = useCallback((child: RunId) => {
+    setSelected(child)
+    setArriving(null)
+  }, [])
+
   usePaletteShortcut(useCallback(() => setPaletteOpen((open) => !open), []))
 
   const isLive = selected !== null && live.includes(selected)
@@ -262,6 +376,30 @@ export default function App() {
       title: 'Interrupt the selected run — stop now',
       disabled: !isLive,
       run: () => steer('interrupt'),
+    },
+    {
+      id: 'run.fork',
+      group: 'Run',
+      title: 'Fork at the hovered message — ⌘⇧F',
+      run: () => canvas.current?.forkHovered(),
+    },
+    {
+      id: 'view.map',
+      group: 'View',
+      title: 'Switch between the columns and the map — ⌘\\',
+      run: () => canvas.current?.toggleMode(),
+    },
+    {
+      id: 'view.prev',
+      group: 'View',
+      title: 'Previous sibling — ⌘[',
+      run: () => canvas.current?.sibling(-1),
+    },
+    {
+      id: 'view.next',
+      group: 'View',
+      title: 'Next sibling — ⌘]',
+      run: () => canvas.current?.sibling(1),
     },
     { id: 'view.fit', group: 'View', title: 'Fit the graph to the window', run: () => canvas.current?.fit() },
     { id: 'view.in', group: 'View', title: 'Zoom in', run: () => canvas.current?.zoomIn() },
@@ -297,10 +435,15 @@ export default function App() {
           runs={runs}
           events={streams}
           activity={activity}
+          forkPoints={forks}
           selected={selected}
           live={live}
+          arriving={arriving}
           onSelect={setSelected}
           onSend={send}
+          onFork={fork}
+          onForkUnavailable={forkUnavailable}
+          onArrived={arrived}
           viewportRef={canvas}
         />
 

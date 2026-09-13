@@ -922,6 +922,98 @@ fn the_message_count_counts_messages() {
     assert_eq!(activity(&log, "silent").messages, 0);
 }
 
+/// Forkability is a fact about a block, computed where a test reaches it.
+///
+/// The rule is `normalizer::claude_code::fork_address` and this is the
+/// projection over it: the hover toolbar appears on a block if and only if the
+/// block is in this answer. Three things it has to get right, and all three are
+/// live findings rather than opinions
+/// (`docs/verification/claude-code-fork-address.md`):
+/// a fanned-out `{uuid}#{i}` block is still forkable at its bare uuid, an event
+/// with no key is not forkable at all and must not round to a neighbour, and
+/// the inherited message count is the count *at* the block.
+#[test]
+fn fork_points_are_the_blocks_that_carry_a_provider_address() {
+    let mut log = open_with_run("branchy");
+    log.append_all(&[
+        // The user's own prompt: a chain entry we hold no key for, because it
+        // never reaches stdout. Counted as a message, not offered as a fork.
+        ev(
+            "branchy",
+            1,
+            None,
+            Event::UserMessage(UserMessage {
+                text: "add refresh-token support".to_owned(),
+                is_replay: true,
+            }),
+        ),
+        // One API message, two content blocks, one uuid fanned out by us.
+        ev("branchy", 2, Some("u1#0"), assistant("msg_01", 0)),
+        ev("branchy", 3, Some("u1#1"), assistant("msg_01", 1)),
+        // Out-of-band: reaches us over the MCP channel, never over stdout.
+        ev(
+            "branchy",
+            4,
+            None,
+            Event::PermissionRequested(PermissionRequested {
+                tool_use_id: ToolUseId::from("toolu_01"),
+                tool_name: "Edit".to_owned(),
+                input: serde_json::json!({}),
+            }),
+        ),
+        ev("branchy", 5, Some("u2"), assistant("msg_02", 0)),
+    ])
+    .unwrap();
+
+    let points = log.fork_points(&[RunId::from("branchy")]).unwrap();
+    assert_eq!(points.len(), 1);
+    let blocks = &points[0].blocks;
+    assert_eq!(
+        blocks.iter().map(|b| b.seq).collect::<Vec<_>>(),
+        vec![2, 3, 5],
+        "every keyed block is forkable, and nothing else is — the unkeyed \
+         prompt and permission request must not round to a neighbour"
+    );
+    assert_eq!(
+        blocks
+            .iter()
+            .map(|b| b.inherited_messages)
+            .collect::<Vec<_>>(),
+        vec![2, 2, 3],
+        "a fanned-out message is one message, and the count is the count *at* \
+         the block"
+    );
+
+    // The two numbers that appear beside each other on the canvas — a node's
+    // `N msgs` and its child's "inherited M" — come out of one counting rule.
+    assert_eq!(
+        blocks.last().unwrap().inherited_messages,
+        activity(&log, "branchy").messages,
+        "a fork at the last block inherits the whole conversation"
+    );
+}
+
+/// Nothing addressable is an answer, and it is not an empty list of runs.
+///
+/// The surface tells "this run cannot be forked yet" from "this run's fork
+/// points have not arrived" by whether the row is there, so a run with no keyed
+/// block must still get one.
+#[test]
+fn a_run_with_no_addressable_block_still_gets_a_row() {
+    let mut log = open_with_run("quiet");
+    log.append(&ev(
+        "quiet",
+        1,
+        None,
+        Event::TurnStarted(TurnStarted { index: 0 }),
+    ))
+    .unwrap();
+    let points = log.fork_points(&[RunId::from("quiet")]).unwrap();
+    assert_eq!(points.len(), 1);
+    assert_eq!(points[0].run_id, RunId::from("quiet"));
+    assert!(points[0].blocks.is_empty());
+}
+
 fn assistant(message_id: &str, block_index: u32) -> Event {
     Event::AssistantMessage(AssistantMessage {
         text: "…".to_owned(),

@@ -4,6 +4,8 @@ import type { BootReport } from '@agent-workspace/shared-types/BootReport'
 import type { RawEvent } from '@agent-workspace/shared-types/RawEvent'
 import type { Run } from '@agent-workspace/shared-types/Run'
 import type { RunId } from '@agent-workspace/shared-types/RunId'
+import type { ForkPoints } from '@agent-workspace/shared-types/ForkPoints'
+import type { ForkRunRequest } from '@agent-workspace/shared-types/ForkRunRequest'
 import type { RunActivity } from '@agent-workspace/shared-types/RunActivity'
 import type { RunMetrics } from '@agent-workspace/shared-types/RunMetrics'
 import type { StartRunRequest } from '@agent-workspace/shared-types/StartRunRequest'
@@ -38,6 +40,33 @@ export const runMetrics = (runId: RunId) => invoke<RunMetrics>('run_metrics', { 
 // shell owns no logic. Plural because the graph needs a header per node.
 export const runActivity = (limit: number) =>
   invoke<RunActivity[]>('run_activity', { limit })
+
+// Which blocks of these runs can be forked at, and what a fork there inherits.
+//
+// The hover toolbar appears on a block if and only if its `seq` is in this
+// answer. `RawEvent.idempotency_key` is right here in the webview and deriving
+// forkability from it would cost one line and no round trip — and it would be
+// `normalizer::claude_code::fork_address`'s rule written a second time, in a
+// language no test in this workspace reaches, drifting silently towards
+// offering forks that `forkRun()` then refuses. So this is a call.
+//
+// By id rather than by window, unlike runActivity(): the answer is per block,
+// so ask for the runs a fork can actually be anchored in — the one being read,
+// the ones this session is supervising, and the parents of the children on
+// screen.
+export const forkPoints = (runIds: RunId[]) =>
+  invoke<ForkPoints[]>('fork_points', { runIds })
+
+// ⌘⇧F: a new run, branched from a block of an existing one (§19). Everything
+// that makes it a fork happens below the window — the address is resolved from
+// the parent's log, the child's worktree is checked out from the parent's
+// shadow commit at that `seq`, and both halves of the graph edge are written to
+// the child's row.
+//
+// An unaddressable block is refused here rather than rounded to a neighbour,
+// and the refusal costs no run: it happens before a process exists.
+export const forkRun = (request: ForkRunRequest) =>
+  invoke<StartedRun>('fork_run', { request })
 
 // Runs this process is supervising, which is not the same question as
 // runningRuns(): that one asks the log about rows, this one asks about

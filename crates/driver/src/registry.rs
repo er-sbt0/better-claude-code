@@ -127,31 +127,14 @@ impl Registry {
     /// that wants to push events at a webview has exactly one place to do it,
     /// and everything else about the run's lifetime stays here.
     ///
-    /// The run is inserted before the supervisor is spawned. The other order
-    /// has a real race in it — a stub agent, or a launch that fails
-    /// immediately, can end the stream before the insert lands, and the
-    /// supervisor would then find nothing to reap and leave the session in the
-    /// map forever.
+    /// The run is inserted before the supervisor is spawned; that ordering and
+    /// the race it avoids are described on [`adopt`](Self::adopt), which
+    /// [`fork`](Self::fork) shares.
     pub fn start<F>(&self, log: EventLog, spec: RunSpec, on_event: F) -> Result<Live>
     where
         F: FnMut(RawEvent) + Send + 'static,
     {
-        // The accept thread of a workspace MCP server holds a clone of the
-        // event sink for as long as the listener is up, and the listener only
-        // comes down inside `Session::wait`. Supervising such a run would
-        // deadlock: the supervisor waits for the channel to close, the channel
-        // waits for the wait that the supervisor has not reached. Permissions
-        // are a later piece (§12's V1 surface is a dialog and there is no
-        // `Decider` that is a person yet), so this is refused loudly rather
-        // than left as a hang for whoever builds it.
-        if spec.workspace_mcp.is_some() {
-            return Err(Error::NotSupervisable {
-                reason: "the workspace MCP server's accept thread holds a clone of the event \
-                         sink until the session is waited on, so the stream would never end \
-                         and the run would never be reaped"
-                    .to_owned(),
-            });
-        }
+        refuse_unsupervisable(spec.workspace_mcp.is_some())?;
 
         let run_id = spec.run_id.clone();
         let branch = spec.branch.clone();
@@ -159,6 +142,70 @@ impl Registry {
 
         let (tx, rx) = mpsc::channel();
         let started = crate::start(log, spec, &started_at, Some(tx))?;
+        Ok(self.adopt(run_id, branch, started_at, started, rx, on_event))
+    }
+
+    /// Fork a live or finished run, and supervise the child exactly like a root
+    /// run (§19, `docs/branching-surface.md`).
+    ///
+    /// The same three lines of translation as [`start`](Self::start) over
+    /// [`fork`](crate::fork), and that is the point: **a fork is a run**. It is
+    /// inserted into the same map, drained by the same supervisor, reaped by
+    /// the same rule and ended by the same [`shutdown`](Self::shutdown) — so
+    /// nothing downstream of here has to know which of the two started it.
+    ///
+    /// Everything that distinguishes a fork happens before this returns and is
+    /// [`fork`](crate::fork)'s: the branch point is resolved against the
+    /// parent's log, the child's tree is checked out from the parent's shadow
+    /// commit at that `seq`, and both halves of the graph edge are written to
+    /// the child's row. A fork that cannot be placed fails here rather than
+    /// starting a process, which is why this returns before there is anything
+    /// to supervise.
+    ///
+    /// What it does **not** promise is that the provider accepted the address.
+    /// A refused fork is a process that starts and exits cleanly, with an
+    /// `error_during_execution` result and a session id of its own
+    /// (`docs/verification/claude-code-fork-address.md`), so it arrives here as
+    /// a perfectly ordinary run that the supervisor reaps — and
+    /// [`finish`](Self::finish) files as `Failed`, because it reads the log
+    /// rather than the exit code.
+    pub fn fork<F>(&self, log: EventLog, spec: crate::ForkSpec, on_event: F) -> Result<Live>
+    where
+        F: FnMut(RawEvent) + Send + 'static,
+    {
+        refuse_unsupervisable(spec.workspace_mcp.is_some())?;
+
+        let run_id = spec.run_id.clone();
+        let branch = spec.branch.clone();
+        let started_at = self.clock.now();
+
+        let (tx, rx) = mpsc::channel();
+        let started = crate::fork(log, spec, &started_at, Some(tx))?;
+        Ok(self.adopt(run_id, branch, started_at, started, rx, on_event))
+    }
+
+    /// Take ownership of a run that has just been spawned: file it, watch it,
+    /// and describe it back to the caller.
+    ///
+    /// Shared by [`start`](Self::start) and [`fork`](Self::fork) because every
+    /// line of it is about supervision rather than about how the process came
+    /// to exist. The ordering inside it is the part that is load-bearing: the
+    /// run is inserted **before** the supervisor is spawned, since a stub agent
+    /// or a launch that fails immediately can end the stream before the insert
+    /// lands, and the supervisor would then find nothing to reap and leave the
+    /// session in the map forever.
+    fn adopt<F>(
+        &self,
+        run_id: RunId,
+        branch: String,
+        started_at: String,
+        started: crate::Started,
+        events: Receiver<RawEvent>,
+        on_event: F,
+    ) -> Live
+    where
+        F: FnMut(RawEvent) + Send + 'static,
+    {
         let live = Live {
             run_id: run_id.clone(),
             branch,
@@ -175,7 +222,7 @@ impl Registry {
             },
         );
 
-        let supervisor = self.clone().supervise(run_id.clone(), rx, on_event);
+        let supervisor = self.clone().supervise(run_id.clone(), events, on_event);
         // The supervisor may have reaped the run already — a run that fails in
         // its first millisecond is not hypothetical — in which case there is no
         // entry to file the handle against and joining it here costs nothing:
@@ -191,7 +238,7 @@ impl Registry {
             let _ = handle.join();
         }
 
-        Ok(live)
+        live
     }
 
     /// Send a follow-up user turn to a live run (§5: one process, many turns).
@@ -360,4 +407,27 @@ impl std::fmt::Debug for Registry {
             .field("live", &self.live())
             .finish_non_exhaustive()
     }
+}
+
+/// Refuse a run that would keep the event sink alive after its process ended.
+///
+/// The accept thread of a workspace MCP server holds a clone of the event sink
+/// for as long as the listener is up, and the listener only comes down inside
+/// `Session::wait`. Supervising such a run would deadlock: the supervisor waits
+/// for the channel to close, the channel waits for the wait the supervisor has
+/// not reached. Permissions are a later piece (§12's V1 surface is a dialog and
+/// there is no `Decider` that is a person yet), so this is refused loudly
+/// rather than left as a hang for whoever builds it — and it is refused for a
+/// fork as well as for a start, because a fork is supervised by the same
+/// thread with the same end condition.
+fn refuse_unsupervisable(hosts_workspace_mcp: bool) -> Result<()> {
+    if hosts_workspace_mcp {
+        return Err(Error::NotSupervisable {
+            reason: "the workspace MCP server's accept thread holds a clone of the event \
+                     sink until the session is waited on, so the stream would never end \
+                     and the run would never be reaped"
+                .to_owned(),
+        });
+    }
+    Ok(())
 }

@@ -314,20 +314,61 @@ ours to make true.
   compaction**, since the provider owns the file the chain lives in. Neither
   gates the fork path — both are things that would show up as a fork failing
   loudly, which the same spike proved is how forks fail.
-- **Concurrent forks**, still. The roadmap has carried this as an open unknown
-  since the fork spike ran its branches sequentially, and the prototype's central
-  image — `by-package` mid-edit while `big-bang` waits on a permission decision —
-  is precisely two live descendants of one trunk. A worktree per fork makes the
-  filesystem side of it safe — that is what §13 buys, and it is now bought at the
-  fork rather than deferred — and says nothing about whether the provider
-  tolerates it.
-- **How many feeds are live at once.** The prototype keeps every column mounted
-  and dims the unfocused ones to opacity .2. With §7's virtualized feed inside
-  each, that is N live feeds in focus view, and the WebKitGTK budget item in
-  §2 — already re-priced once for pan/zoom over a DAG — gets heavier again.
-  Unmounting or freezing unfocused feeds is the obvious answer and is not free
-  either: a frozen feed that resumes has to catch up on a stream. Measure before
-  choosing.
+- **Concurrent forks**, still — and the surface has now made the question
+  reachable by hand. ⌘⇧F is wired end to end, so two live descendants of one
+  trunk are two keystrokes rather than a thought experiment, and the registry
+  supervises a fork with the same map, supervisor and reaper as any other run:
+  nothing in this process serializes them. A worktree per fork makes the
+  filesystem side safe — that is what §13 buys, and it is now bought at the fork
+  rather than deferred — and still says nothing about whether the provider
+  tolerates two sessions branched from one transcript at once. What changed is
+  only who can find out: this was an unknown nobody could trip over, and it is
+  now an unknown a user can.
+- **How many feeds are live at once.** Unchanged as a question, and it has
+  acquired one lever and one new fact. Focus view keeps every column mounted, as
+  the prototype does — the unfocused ones are not dimmed here, because with a
+  real camera the thing that says *this one* is where the camera is pointed.
+  **Map view mounts no feed at all**: ⌘\ renders cards, so every body unmounts
+  and remounts across the toggle. That is not the answer to the budget question,
+  it is the same trade taken at a coarser grain — a remount has to catch up on a
+  stream exactly as a thawed feed would, and today's bodies are a flat list
+  cheap enough that nobody would notice either way. With §7's virtualized feed
+  inside each, N live feeds in focus view is still the number to measure, and
+  the WebKitGTK item in §2 — already re-priced once for pan/zoom over a DAG —
+  is still where it gets paid. Measure before choosing.
+- **Whether every *keyed* block is really forkable.** Recorded as observed
+  rather than decided, because it is the first thing the built surface turned up
+  and it points at a claim above. Two forks of one live run, from the window: at
+  the run's **first** block — a `system` / `hook_started` line, which carries a
+  `uuid`, is therefore keyed, and was therefore offered a toolbar — the provider
+  ran its `SessionStart:fork` hook and then refused with
+  `error_during_execution`, no turns, no cost. At the run's **assistant
+  message** it was accepted, and the branch ran a real turn in its own worktree.
+  So the address resolved in one case and not the other, and *every keyed block
+  is forkable* has a counter-example: the normalizer keys every uuid-bearing
+  stdout line, and the provider's own `system` lines carry uuids that are not
+  transcript chain entries. The spike could not have seen this — its trunk was
+  text-only and it read uuids off `assistant` and `user` messages. Nothing is
+  changed here on one observation: the failure is loud, free and immediate,
+  which is the property the spike bought and it held. What is not yet known is
+  the *rule* — whether "a chain entry" is exactly "a `user` or `assistant`
+  message", or something narrower — and that is a question for a spike rather
+  than for a filter written from one refused fork.
+
+- **What a fork's worktree is prepared with.** `ForkSpec::post_create_hook` was
+  left to the caller, and the first caller is the window, which passes `None`.
+  The reasoning is the shell's rather than this record's: a hook is arbitrary
+  user code, no run the window starts runs one, and a fork that ran a command
+  its parent never ran would be the shell deciding what builds someone's
+  repository. The consequence is the one flagged when the eager tree was built
+  — a shadow commit respects `.gitignore`, so the child's checkout holds the
+  parent's tracked files at the branch point and none of its `node_modules` or
+  `target` — and it is now a choice rather than an oversight. What this does not
+  decide is whether a fork of a real project *wants* the hook re-run: nothing
+  has forked a repository with a build step and tried to work in the result. The
+  answer arrives with a hook configuration surface, and the fork inherits it
+  then.
+
 ## Sequencing
 
 **A vertical slice, fork first.** One fork working end to end — ⌘⇧F, forked

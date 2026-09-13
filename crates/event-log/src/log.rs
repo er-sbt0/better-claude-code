@@ -17,7 +17,7 @@ fn from_i64(seq: i64) -> u64 {
 }
 
 use crate::error::{Error, Result};
-use crate::run::{Activity, Run, RunActivity, RunMetrics, RunStatus};
+use crate::run::{Activity, ForkBlock, ForkPoints, Run, RunActivity, RunMetrics, RunStatus};
 use crate::schema;
 
 /// What happened to an appended event.
@@ -511,6 +511,77 @@ impl EventLog {
                 run_id: RunId(id),
                 status: Activity::of(status, requested > resolved),
                 messages: messages as u32,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Which blocks of these runs can be forked at, and what each fork would
+    /// inherit ([`ForkPoints`]).
+    ///
+    /// The rule is one function — [`normalizer::claude_code::fork_address`] —
+    /// and this is the only thing between it and a surface: the hover toolbar
+    /// appears on a block if and only if that block's `seq` is in this answer.
+    /// Re-deriving it from the `idempotency_key` the webview already receives
+    /// would be a second copy of the rule in a language no test here reaches,
+    /// and the copy would drift towards offering forks the driver refuses.
+    ///
+    /// **Plural, and by name rather than by window.** [`recent_activity`] takes
+    /// a limit because every node needs a header; this takes the runs the
+    /// caller can actually fork in — the one being read, and the parents of the
+    /// children on screen — because the answer is per *block* rather than per
+    /// run, and a two-hundred-run window of it is most of the log.
+    ///
+    /// A run with no addressable block gets a row with an empty `blocks`, not
+    /// no row: "nothing here can be forked" is an answer, and a missing row
+    /// reads as "not loaded yet" on the surface that asks.
+    ///
+    /// [`recent_activity`]: Self::recent_activity
+    pub fn fork_points(&self, runs: &[RunId]) -> Result<Vec<ForkPoints>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, type, idempotency_key, json_extract(payload, '$.message_id')
+               FROM raw_events WHERE run_id = ?1 ORDER BY seq",
+        )?;
+        let mut out = Vec::with_capacity(runs.len());
+        for run in runs {
+            let rows = stmt.query_map(params![run.0], |r| {
+                Ok((
+                    from_i64(r.get::<_, i64>(0)?),
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            })?;
+
+            let mut blocks = Vec::new();
+            let mut messages: u32 = 0;
+            // Distinct `message_id`, exactly as `recent_activity` counts it:
+            // one API message fans out into one event per content block, and a
+            // strip that said "inherits 3 messages" over one three-paragraph
+            // answer would be the lie the no-snapping rule exists to prevent.
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for row in rows {
+                let (seq, ty, key, message_id) = row?;
+                match ty.as_str() {
+                    "user.message" => messages += 1,
+                    "assistant.message" => {
+                        let id = message_id.unwrap_or_else(|| format!("seq:{seq}"));
+                        if seen.insert(id) {
+                            messages += 1;
+                        }
+                    }
+                    _ => {}
+                }
+                if normalizer::claude_code::fork_address(key.as_deref()).is_some() {
+                    blocks.push(ForkBlock {
+                        seq,
+                        inherited_messages: messages,
+                    });
+                }
+            }
+            out.push(ForkPoints {
+                run_id: run.clone(),
+                blocks,
             });
         }
         Ok(out)
