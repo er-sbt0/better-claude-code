@@ -146,6 +146,39 @@ export function Canvas({
   // ------------------------------------------------------------ the camera --
 
   const anim = useRef<number | null>(null)
+
+  // ------------------------------------------------------- crisp when still --
+  //
+  // `transform: scale()` does not resize text, it resizes a *picture* of text:
+  // WebKit rasterizes the subtree once at its layout size and samples that
+  // bitmap at every other scale. Since the view fits the graph on load and
+  // never magnifies, the scale is below 1 almost always, and every glyph on the
+  // canvas is a downsampled bitmap. That is the fuzziness.
+  //
+  // `zoom` is the one that re-lays-out, so text is rasterized *at* the scale it
+  // is drawn — genuinely crisp. It is also the one that cannot be animated:
+  // re-layout is per frame, and the camera here is a `requestAnimationFrame`
+  // loop rather than a CSS transition, so zooming a graph of virtualized feeds
+  // would relayout every column sixty times a second.
+  //
+  // So: both. `transform` while the camera is moving, which is exactly when
+  // nobody is reading, and `zoom` the moment it stops. A pan changes no scale
+  // and so never leaves the crisp path at all — only zooming does, and only
+  // while it lasts.
+  const [settled, setSettled] = useState(true)
+  const settleTimer = useRef<number | null>(null)
+  const unsettle = useCallback(() => {
+    setSettled(false)
+    if (settleTimer.current !== null) window.clearTimeout(settleTimer.current)
+    settleTimer.current = null
+  }, [])
+  const settle = useCallback(() => {
+    if (settleTimer.current !== null) window.clearTimeout(settleTimer.current)
+    // A wheel is a stream of events, not a gesture with an end, so the only
+    // signal that a zoom is over is that another one has not arrived.
+    settleTimer.current = window.setTimeout(() => setSettled(true), 160)
+  }, [])
+
   const halt = useCallback(() => {
     if (anim.current !== null) cancelAnimationFrame(anim.current)
     anim.current = null
@@ -158,17 +191,33 @@ export function Canvas({
       const from = viewRef.current
       const to = { ...target, scale: clamp(target.scale) }
       const t0 = performance.now()
+      // Only a change of scale needs the blurry-but-fast path; a pure pan is
+      // crisp either way, and unsettling for one would flash the whole graph
+      // through a re-raster for nothing.
+      const zooming = Math.abs(to.scale - from.scale) > 0.001
+      if (zooming) unsettle()
       const step = (now: number) => {
         const t = ms <= 0 ? 1 : Math.min(1, (now - t0) / ms)
         setView(lerpView(from, to, ease(t)))
-        anim.current = t < 1 ? requestAnimationFrame(step) : null
+        if (t < 1) {
+          anim.current = requestAnimationFrame(step)
+          return
+        }
+        anim.current = null
+        if (zooming) settle()
       }
       anim.current = requestAnimationFrame(step)
     },
-    [halt],
+    [halt, unsettle, settle],
   )
 
   useEffect(() => halt, [halt])
+  useEffect(
+    () => () => {
+      if (settleTimer.current !== null) window.clearTimeout(settleTimer.current)
+    },
+    [],
+  )
 
   const fit = useCallback(() => {
     halt()
@@ -451,12 +500,15 @@ export function Canvas({
         const r = el.getBoundingClientRect()
         const px = e.clientX - r.left
         const py = e.clientY - r.top
+        unsettle()
         setView((v) => {
           const scale = clamp(v.scale * Math.exp(-e.deltaY / 320))
           const k = scale / v.scale
           return { x: px - (px - v.x) * k, y: py - (py - v.y) * k, scale }
         })
+        settle()
       } else {
+        // A pan changes no scale, so it never leaves the crisp path.
         setView((v) => ({ ...v, x: v.x - e.deltaX, y: v.y - e.deltaY }))
       }
     }
@@ -464,7 +516,7 @@ export function Canvas({
     // win the gesture before this handler ran.
     el.addEventListener('wheel', onWheel, { passive: false })
     return () => el.removeEventListener('wheel', onWheel)
-  }, [halt])
+  }, [halt, unsettle, settle])
 
   const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return
@@ -559,7 +611,25 @@ export function Canvas({
         <div
           className="absolute top-0 left-0 origin-top-left"
           style={{
-            transform: `translate(${view.x}px, ${view.y}px) scale(${view.scale})`,
+            // See "crisp when still" above. Both branches put the same pixels
+            // in the same place; they differ only in whether the text is
+            // rasterized at the scale it is drawn.
+            //
+            // `zoom` scales the used value of everything inside the element,
+            // the element's own `transform` included — so a translate of N
+            // moves N × scale on screen, and the offsets are divided by the
+            // scale to cancel that. Rounded, because a layer parked on a half
+            // pixel is blurred by the compositor however it was scaled.
+            ...(settled
+              ? {
+                  zoom: view.scale,
+                  transform: `translate(${Math.round(view.x) / view.scale}px, ${
+                    Math.round(view.y) / view.scale
+                  }px)`,
+                }
+              : {
+                  transform: `translate(${view.x}px, ${view.y}px) scale(${view.scale})`,
+                }),
             width: graph.width,
             height: graph.height,
           }}
