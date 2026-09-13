@@ -7,10 +7,16 @@ person's head rather than in the code. The design is
 of the design's ideas are real, which are next, and which must not be
 relitigated without new information.
 
-**Updated:** 2026-09-13 · **Branch:** `main` · **Head:** `2ee01e3`
+**Updated:** 2026-09-13 · **Branch:** `main`
 **Code:** six crates plus the desktop shell · CI green · 101 tests.
 **The headless spine is complete, and the semantic channel now exists:** a real
 run has both asked us for permission and reported a finding to us.
+
+*No commit hash here on purpose.* The previous version of this file carried one
+and was two commits stale within a day — it cannot be otherwise, since the
+commit that updates this line does not exist while the line is being written.
+`git log` already knows, and §8's rule against storing what can be recomputed is
+not only about the event log.
 
 ---
 
