@@ -244,7 +244,9 @@ that boundary explicit.
 
 ### Ubuntu-first development
 
-Develop against **Ubuntu 24.04 LTS** as the primary Linux environment.
+Develop against **Ubuntu 24.04 LTS** as the primary Linux environment. The
+concrete toolchain and system-library list — with the versions it was verified
+against — is `docs/development.md`.
 
 Initial distribution targets:
 
