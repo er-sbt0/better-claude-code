@@ -22,6 +22,11 @@ about the model is closed, and `role` is dropped with it. Argued under "The
 model is a column; `role` is not a thing", which is where the bullet that used
 to sit under "What this does not decide" went.
 
+Amended again 2026-09-13: the feed draws a user turn as a right-aligned bubble.
+The record had specified "message list" and "six block types" and never said how
+a speaker is drawn, so the built feed drew both sides alike. That is a gap being
+filled, not a decision being reversed — see "The conversation is the node".
+
 Amended again 2026-09-13: "a block whose `idempotency_key` is a bare uuid has an
 address" was wrong, and a spike says by how much
 (`docs/verification/claude-code-fork-anchor-types.md`). The sentence is corrected
@@ -67,6 +72,29 @@ The rule inverts for a reason that is mechanical rather than aesthetic. **Forkin
 is anchored to a message, so forking requires reading messages.** A surface whose
 default state hides messages makes its primary act cost a preliminary step, every
 time. That is the whole argument.
+
+### A user turn is a bubble; everything else is full width
+
+The table above says "message list" in one row and "§7's six block types" in the
+next, and says nothing about how a speaker is drawn. Built literally, that
+produced a feed where a user turn and an agent turn look alike — a uniform
+column of labelled blocks — and the prototype it was decided from does not look
+like that. Recorded now, because the gap is what let the two diverge quietly.
+
+**A user turn is right-aligned in a bubble at 78% width. Everything the agent
+produces is left-aligned and full width.** The asymmetry is not chat styling for
+its own sake, and it is deliberately the *only* one: a `Diff` or a `Terminal` in
+a bubble is a diff you cannot read, which is why the six block types keep the
+full column. What the bubble buys is that a user turn is the one shape in the
+feed meaning *you said this* — and since forking is anchored to a message and
+the reader returning to a column is looking for where they last steered, the
+blocks worth finding fastest are exactly the ones now shaped differently.
+
+Who spoke is a fact and lives in `document-model`; how a speaker is drawn is not
+and lives in `Blocks.tsx`. The windowing estimate is speaker-aware for the same
+reason the table exists at all — a bubble wraps sooner, and estimating both the
+same way makes the scrollbar lurch past precisely the blocks a reader scrolls
+back to find.
 
 §10's shape is not lost — it is relocated. Map view renders each column as a card
 carrying exactly what §10 listed: name, status, `model · N msgs`, and a

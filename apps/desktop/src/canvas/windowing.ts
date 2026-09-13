@@ -33,7 +33,14 @@ export function estimate(block: Block, collapsed: boolean): number {
   if (collapsed) return 22
   switch (block.type) {
     case 'text':
-      return 24 + Math.ceil(block.block.text.length / 64) * 18
+      // A user turn is a bubble at 78% width with no label above it, so it
+      // wraps sooner and starts lower than an agent turn. Estimating both the
+      // same way would make the scrollbar lurch on every scroll past a run's
+      // prompts — which is exactly the lurch this table exists to prevent, and
+      // the prompts are the blocks a reader scrolls back to find.
+      return block.block.speaker === 'user'
+        ? 12 + Math.ceil(block.block.text.length / 48) * 18
+        : 24 + Math.ceil(block.block.text.length / 64) * 18
     case 'code':
       return 34 + block.block.code.split('\n').length * 17
     case 'tool_call':

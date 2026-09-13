@@ -48,11 +48,28 @@ export function BlockView({ block }: { block: Block }) {
           </div>
         )
       }
+      // The one asymmetry in the feed, and the reason it is here rather than in
+      // the projection: who spoke is a fact (`document-model` decides it), how
+      // a speaker is drawn is not.
+      //
+      // A user turn is short, sparse and is the thing the reader is scanning
+      // *for* when they come back to a column — it is where they last steered.
+      // Everything an agent produces is left-aligned and full width, because a
+      // `Diff` or a `Terminal` in a bubble is a diff you cannot read. So the
+      // bubble is not "chat styling"; it is the one shape in the column that
+      // means *you said this*, which is what makes the branch points findable.
+      if (speaker === 'user') {
+        return (
+          <div className="flex justify-end px-3 py-1.5">
+            <p className="max-w-[78%] rounded-lg rounded-br-sm bg-selected px-2.5 py-1.5 whitespace-pre-wrap text-ui text-text select-text">
+              {text}
+            </p>
+          </div>
+        )
+      }
       return (
         <div className="px-3 py-1.5">
-          <Label className={speaker === 'user' ? 'text-accent' : 'text-muted'}>
-            {speaker === 'user' ? 'you' : 'agent'}
-          </Label>
+          <Label className="text-muted">agent</Label>
           <p className="mt-0.5 whitespace-pre-wrap text-ui text-text select-text">{text}</p>
         </div>
       )
