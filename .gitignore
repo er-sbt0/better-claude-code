@@ -7,3 +7,9 @@ node_modules/
 # tauri.conf.json and capabilities/.
 apps/desktop/dist/
 apps/desktop/src-tauri/gen/
+
+# The prototype the branching surface was decided from
+# (`docs/branching-surface.md`). Kept on disk because the record cites it by
+# name, not committed because it is a build artifact of another project — and
+# left untracked it has twice nearly been swept into a commit by `git add -A`.
+ai_coding_mgmt_prototype.zip
