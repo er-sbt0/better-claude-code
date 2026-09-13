@@ -10,10 +10,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agent_protocol::{
-    Event, ModelUsage, RawEvent, RunId, TurnFinished, TurnStarted, Unclassified,
-    UnclassifiedReason, Usage, SCHEMA_VERSION,
+    AssistantMessage, Event, ModelUsage, PermissionRequested, PermissionResolved, RawEvent, RunId,
+    ToolUseId, TurnFinished, TurnStarted, Unclassified, UnclassifiedReason, Usage, UserMessage,
+    SCHEMA_VERSION,
 };
-use event_log::{Appended, Error, EventLog, Run, RunStatus};
+use event_log::{Activity, Appended, Error, EventLog, Run, RunStatus};
 use normalizer::{ClaudeCodeNormalizer, FixedClock};
 
 fn fixture_dir() -> PathBuf {
@@ -44,6 +45,7 @@ fn run_row(id: &str) -> Run {
         branch: Some("feat/oauth".to_owned()),
         shadow_ref: Some(format!("refs/agent-workspace/runs/{id}")),
         prompt: Some("add refresh-token support".to_owned()),
+        model: Some("claude-sonnet-5".to_owned()),
         status: RunStatus::Running,
         started_at: "2026-09-12T14:22:00.000Z".to_owned(),
         finished_at: None,
@@ -710,6 +712,231 @@ fn an_existing_v1_database_migrates_and_keeps_its_runs() {
     drop(log);
     let reopened = EventLog::open(&path).unwrap();
     assert!(reopened.run(&RunId::from("after")).unwrap().is_some());
+}
+
+/// The V3 column lands on a database written by the build before it, too.
+///
+/// The V1 fixture above is frozen and stays frozen; V2 is that schema plus the
+/// one `ALTER` V2 shipped, which is the only honest way to build "what the
+/// previous release left on disk" without freezing a second copy of the whole
+/// thing. The upgrade path is the one that runs on a user's log and the one no
+/// other test in this file exercises.
+#[test]
+fn an_existing_v2_database_migrates_and_keeps_its_runs() {
+    use rusqlite::Connection;
+
+    let dir = tempdir();
+    let path = dir.join("log.sqlite");
+
+    {
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(V1_AS_SHIPPED).unwrap();
+        old.execute_batch("ALTER TABLE runs ADD COLUMN branch_point_seq INTEGER;")
+            .unwrap();
+        old.pragma_update(None, "user_version", 2u32).unwrap();
+        old.execute(
+            "INSERT INTO runs (id, agent, workspace_path, status, started_at)
+             VALUES ('before', 'claude-code', '/home/u/my-app', 'finished',
+                     '2026-09-12T14:22:00.000Z')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            old.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name = 'model'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0,
+            "the fixture is only meaningful if the old schema lacks the column"
+        );
+    }
+
+    let mut log = EventLog::open(&path).unwrap();
+
+    let before = log.run(&RunId::from("before")).unwrap().expect("kept");
+    assert_eq!(before.status, RunStatus::Finished);
+    assert_eq!(
+        before.model, None,
+        "a run recorded before the column existed names no model, and inventing \
+         the default it probably used would be a guess stored as a fact"
+    );
+
+    // The migrated database is the same database a fresh one would have been.
+    log.create_run(&Run {
+        model: Some("claude-opus-4-6".to_owned()),
+        ..run_row("after")
+    })
+    .unwrap();
+    assert_eq!(
+        log.run(&RunId::from("after"))
+            .unwrap()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("claude-opus-4-6")
+    );
+
+    // And the rest of the row still reads back: this ALTER lands in the middle
+    // of the column list every query names, so a mis-ordered `SELECT` would
+    // show up here as a status or a timestamp in the wrong field.
+    let after = log.run(&RunId::from("after")).unwrap().unwrap();
+    assert_eq!(after.status, RunStatus::Running);
+    assert_eq!(after.started_at, "2026-09-12T14:22:00.000Z");
+    assert_eq!(after.branch.as_deref(), Some("feat/oauth"));
+
+    log.append(&ev(
+        "after",
+        1,
+        None,
+        Event::TurnStarted(TurnStarted { index: 0 }),
+    ))
+    .unwrap();
+    assert_eq!(log.events(&RunId::from("after")).unwrap().len(), 1);
+
+    drop(log);
+    let reopened = EventLog::open(&path).unwrap();
+    assert!(reopened.run(&RunId::from("after")).unwrap().is_some());
+}
+
+// ---------------------------------------------------------------- activity ---
+
+/// The three-word vocabulary, reached without a database.
+///
+/// This is the decision `docs/branching-surface.md` fixes and the shell is not
+/// allowed to make: four run states, three words. `failed` and `abandoned`
+/// land on `idle` because the vocabulary answers "does this node want me now",
+/// and on that axis a run that is not running and not blocked is the same
+/// whatever became of it. Outcome is a second axis and `RunStatus` still
+/// carries it.
+#[test]
+fn four_run_states_collapse_into_three_words() {
+    assert_eq!(Activity::of(RunStatus::Running, false), Activity::Running);
+    assert_eq!(Activity::of(RunStatus::Running, true), Activity::NeedsYou);
+    assert_eq!(Activity::of(RunStatus::Finished, false), Activity::Idle);
+    assert_eq!(Activity::of(RunStatus::Failed, false), Activity::Idle);
+    assert_eq!(Activity::of(RunStatus::Abandoned, false), Activity::Idle);
+
+    // A dead process is not waiting for an answer. An unresolved request on a
+    // run that has ended is a record of how it ended, not a demand on anyone.
+    assert_eq!(Activity::of(RunStatus::Finished, true), Activity::Idle);
+    assert_eq!(Activity::of(RunStatus::Failed, true), Activity::Idle);
+    assert_eq!(Activity::of(RunStatus::Abandoned, true), Activity::Idle);
+}
+
+/// **needs you** is derived from the log, and answered permissions clear it.
+#[test]
+fn an_unanswered_permission_request_is_needs_you() {
+    let mut log = open_with_run("blocked");
+    log.append_all(&[ev(
+        "blocked",
+        1,
+        None,
+        Event::PermissionRequested(PermissionRequested {
+            tool_use_id: ToolUseId::from("toolu_01"),
+            tool_name: "Edit".to_owned(),
+            input: serde_json::json!({}),
+        }),
+    )])
+    .unwrap();
+    assert_eq!(activity(&log, "blocked").status, Activity::NeedsYou);
+
+    // Resolved without echoing the tool_use_id, which the provider is entitled
+    // to do — and which is why the pairing is by count and not by id. Pairing
+    // on the id would leave this run blocked forever.
+    log.append(&ev(
+        "blocked",
+        2,
+        None,
+        Event::PermissionResolved(PermissionResolved {
+            tool_use_id: None,
+            tool_name: "Edit".to_owned(),
+            allowed: true,
+            reason_type: None,
+            reason: None,
+        }),
+    ))
+    .unwrap();
+    assert_eq!(activity(&log, "blocked").status, Activity::Running);
+}
+
+/// Messages are not events, and one assistant message is not one per block.
+#[test]
+fn the_message_count_counts_messages() {
+    let mut log = open_with_run("chatty");
+    log.append_all(&[
+        ev(
+            "chatty",
+            1,
+            None,
+            Event::UserMessage(UserMessage {
+                text: "add refresh-token support".to_owned(),
+                // The only form our own prompt takes in the log: the driver
+                // passes `--replay-user-messages`, so this *is* the user's
+                // message rather than a second copy of one.
+                is_replay: true,
+            }),
+        ),
+        // One API message, three content blocks, one `message_id` (§5).
+        ev("chatty", 2, None, assistant("msg_01", 0)),
+        ev("chatty", 3, None, assistant("msg_01", 1)),
+        ev("chatty", 4, None, assistant("msg_01", 2)),
+        // Tool traffic is not conversation.
+        ev(
+            "chatty",
+            5,
+            None,
+            Event::PermissionRequested(PermissionRequested {
+                tool_use_id: ToolUseId::from("toolu_01"),
+                tool_name: "Edit".to_owned(),
+                input: serde_json::json!({}),
+            }),
+        ),
+        ev(
+            "chatty",
+            6,
+            None,
+            Event::PermissionResolved(PermissionResolved {
+                tool_use_id: Some(ToolUseId::from("toolu_01")),
+                tool_name: "Edit".to_owned(),
+                allowed: true,
+                reason_type: None,
+                reason: None,
+            }),
+        ),
+        ev("chatty", 7, None, assistant("msg_02", 0)),
+    ])
+    .unwrap();
+
+    let a = activity(&log, "chatty");
+    assert_eq!(
+        a.messages, 3,
+        "one prompt and two answers — not seven events, and not four blocks"
+    );
+    assert_eq!(a.status, Activity::Running);
+
+    // A run nobody has said anything to yet reads as zero rather than as
+    // missing: the query is a LEFT JOIN for exactly this row.
+    log.create_run(&run_row("silent")).unwrap();
+    assert_eq!(activity(&log, "silent").messages, 0);
+}
+
+fn assistant(message_id: &str, block_index: u32) -> Event {
+    Event::AssistantMessage(AssistantMessage {
+        text: "…".to_owned(),
+        message_id: Some(message_id.to_owned()),
+        block_index,
+        parent_tool_use_id: None,
+    })
+}
+
+fn activity(log: &EventLog, id: &str) -> event_log::RunActivity {
+    log.recent_activity(100)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.run_id == RunId::from(id))
+        .expect("every run in the window gets a row")
 }
 
 // --------------------------------------------------------------- lifecycle ---

@@ -12,14 +12,19 @@ import type { RunId } from '@agent-workspace/shared-types/RunId'
 // The shape is a forest, not a general DAG: a run has at most one parent
 // (`parent_run_id`), because a fork descends from exactly one point in exactly
 // one run. That is what makes fifty lines enough.
+//
+// Nothing here knows what a node *is*. It is handed `sizeOf` — which today
+// answers 560×620 for every run and under map view (⌘\, not built) will answer
+// with §10's shape card — and that seam is why a second representation of this
+// canvas costs no change to this file.
 // ---------------------------------------------------------------------------
 
 const GAP_X = 72
 const GAP_Y = 14
 
-/** What a node measures. An expanded one is wider as well as taller: its body
- *  is a stream of `seq · type · summary` lines, and the summary is the half
- *  worth reading. */
+/** What a node measures. A conversation column is 560 wide and a fixed height:
+ *  its body scrolls rather than the node growing
+ *  (`docs/branching-surface.md`). */
 export type Size = { w: number; h: number }
 
 export type Placed = {
@@ -47,9 +52,9 @@ export type Graph = {
 /**
  * Lay a set of runs out left to right, parents before children.
  *
- * `sizeOf` is passed in rather than computed here because an expanded node is
- * as large as what it is showing, and the packing below has to know that
- * before it can promise two nodes do not overlap.
+ * `sizeOf` is passed in rather than computed here because a node's size is a
+ * fact about what the node draws, and the packing below has to know it before
+ * it can promise two nodes do not overlap.
  */
 export function layout(runs: Run[], sizeOf: (run: Run) => Size): Graph {
   const byId = new Map<RunId, Run>(runs.map((r) => [r.id, r]))
@@ -82,8 +87,8 @@ export function layout(runs: Run[], sizeOf: (run: Run) => Size): Graph {
   roots.sort(chronological)
   for (const siblings of children.values()) siblings.sort(chronological)
 
-  // Columns are as wide as their widest node, so expanding one run never
-  // slides its children underneath it.
+  // Columns are as wide as their widest node, so a node that measures
+  // differently from its siblings never slides its children underneath it.
   const depthOf = new Map<RunId, number>()
   const rank = (run: Run): number => {
     const known = depthOf.get(run.id)

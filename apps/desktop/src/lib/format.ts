@@ -1,11 +1,13 @@
+import type { Activity } from '@agent-workspace/shared-types/Activity'
 import type { Run } from '@agent-workspace/shared-types/Run'
 import type { RunStatus } from '@agent-workspace/shared-types/RunStatus'
 
 // Presentation only. Nothing here asks the backend anything or decides what a
-// run *is* — `RunStatus` comes off the row, and the job of this file is to say
-// it in four characters and one colour.
+// run *is* — `RunStatus` comes off the row and `Activity` off a projection the
+// `event-log` crate computes, and the job of this file is to say either one in
+// a few characters and one colour.
 
-/** The status vocabulary, and the only place a status maps to a colour. */
+/** What the *row* says a run is, in four words. Not the graph's vocabulary. */
 export const STATUS: Record<RunStatus, { label: string; dot: string; text: string }> = {
   running: { label: 'running', dot: 'bg-accent', text: 'text-accent' },
   finished: { label: 'finished', dot: 'bg-ok', text: 'text-ok' },
@@ -14,6 +16,52 @@ export const STATUS: Record<RunStatus, { label: string; dot: string; text: strin
   // did anything wrong — so it is stated in grey rather than red.
   abandoned: { label: 'abandoned', dot: 'bg-faint', text: 'text-muted' },
 }
+
+/**
+ * The graph's vocabulary: three words, and the only place one maps to a colour.
+ *
+ * The keys come from `Activity`, which is **generated** — the collapse from
+ * four run states to three words happens in `event-log`, not here, because
+ * deriving **needs you** (a `permission.requested` with no matching
+ * `permission.resolved`) is deciding, and the shell owns no logic. What is left
+ * on this side is the part that genuinely is presentation: which colour.
+ *
+ * `STATUS` above survives alongside it and is not a duplicate. These answer
+ * different questions — *does this run want me now* against *what became of
+ * it* — and the second is why `failed` can collapse into `idle` here without
+ * the information going anywhere: the inspector, the runs list and the status
+ * bar still spell all four words.
+ */
+export const ACTIVITY: Record<
+  Activity,
+  { label: string; dot: string; text: string; border: string }
+> = {
+  idle: { label: 'idle', dot: 'bg-faint', text: 'text-muted', border: 'border-border' },
+  running: {
+    label: 'running',
+    dot: 'bg-accent',
+    text: 'text-accent',
+    border: 'border-accent/40',
+  },
+  // The record propagates this one to border, pill, sliver and card: a blocked
+  // run is the only thing on the canvas that is waiting for a person.
+  needs_you: {
+    label: 'needs you',
+    dot: 'bg-warn',
+    text: 'text-warn',
+    border: 'border-warn/60',
+  },
+}
+
+/**
+ * What to call a run in a node header.
+ *
+ * There is no `name` column and this does not invent one. A stored name is a
+ * product decision nobody has made, so the header uses the identity the run
+ * already has: its branch, which is what the work is called everywhere else in
+ * git, falling back to the run id for a row that has none.
+ */
+export const nameOf = (run: Run): string => run.branch ?? run.id
 
 /** The last path segment, which is what a workspace is called out loud. */
 export const basename = (path: string): string =>

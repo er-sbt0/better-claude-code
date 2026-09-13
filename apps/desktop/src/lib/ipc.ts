@@ -4,6 +4,7 @@ import type { BootReport } from '@agent-workspace/shared-types/BootReport'
 import type { RawEvent } from '@agent-workspace/shared-types/RawEvent'
 import type { Run } from '@agent-workspace/shared-types/Run'
 import type { RunId } from '@agent-workspace/shared-types/RunId'
+import type { RunActivity } from '@agent-workspace/shared-types/RunActivity'
 import type { RunMetrics } from '@agent-workspace/shared-types/RunMetrics'
 import type { StartRunRequest } from '@agent-workspace/shared-types/StartRunRequest'
 import type { StartedRun } from '@agent-workspace/shared-types/StartedRun'
@@ -29,6 +30,14 @@ export const runEvents = (runId: RunId) => invoke<RawEvent[]>('run_events', { ru
 // Cost, tokens and turns — a projection recomputed from `turn.finished` (§14),
 // never a column on the run row.
 export const runMetrics = (runId: RunId) => invoke<RunMetrics>('run_metrics', { runId })
+
+// The three-word status and the message count, for the same window the graph
+// draws. A projection like runMetrics(), and for the same reason it is a call
+// rather than a field: "needs you" is a permission request with no resolution
+// and a message count is not an event count, so both are derivations — and the
+// shell owns no logic. Plural because the graph needs a header per node.
+export const runActivity = (limit: number) =>
+  invoke<RunActivity[]>('run_activity', { limit })
 
 // Runs this process is supervising, which is not the same question as
 // runningRuns(): that one asks the log about rows, this one asks about

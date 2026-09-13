@@ -103,13 +103,19 @@ behind it, which is what carries the events produced at process exit: §8's trap
 is that `run.finished` is not a line of stdout, and a live view that loses it
 shows every run as unfinished forever.
 
-**What is on screen is scaffolding, and the component says so.** A form, the
-run's identity (id, branch, worktree, shadow ref), end and interrupt, and a flat
-list of one line per raw event — `driver/examples/run.rs`'s terminal output, in
-a window. It is explicitly not §7's feed: no block types, no virtualization, no
-collapse, no `(runId, seqRange)` addressing. It exists because until something
-rendered a live event nothing had demonstrated that the callback reached the
-webview at all, and it is meant to be replaced rather than grown.
+**A node on the graph is a conversation column; what is inside it is still
+scaffolding.** [`branching-surface.md`](branching-surface.md) decided what a
+node is and the window now draws it: 560 wide, a header carrying the name, the
+three-word status, the message count and the model, a scrolling body, and a
+composer pinned to the bottom edge that sends a real turn through `send_turn`.
+The status and the count are a projection in `event-log`
+(`EventLog::recent_activity`), not something the shell works out. The **body**
+is the old flat list of one line per raw event — `driver/examples/run.rs`'s
+terminal output, in a window — and it is explicitly not §7's feed: no block
+types, no virtualization, no collapse, no `(runId, seqRange)` addressing. It has
+been framed rather than grown, on purpose: the feed is the largest piece of
+work in V1's UI and is meant to be built against fork addresses a working fork
+is already resolving. Map view, ⌘\ and the fork gesture are not built either.
 
 **What does not exist.** No permission surface. A request is answered by a
 `Decider` the caller supplies and the only implementations are "allow
@@ -205,18 +211,18 @@ Also queued:
 The evidence is behavioral: branches taken that would not have been taken in a
 chain, points returned to, siblings compared. "It looks better" is not a result.
 
-Eleven features: four built, one verified but unbuilt, one half-built, and
-five that are screens.
+Eleven features: four built, one verified but unbuilt, two half-built, and
+four that are screens.
 
 | Feature | § | State |
 |---|---|---|
 | **Agent** — Claude Code only via `stream-json`, no adapter abstraction | §5, §16 | **done** — detect, launch, prompt, interrupt, resume; fixtures replay in CI |
 | **Forking** — `--fork-session` + `--session-id`, `--resume-session-at` for a mid-conversation branch point | §19 | **built in the driver, no UI** — `driver::fork` spawns `--fork-session` with a `--session-id` we assign and a `--resume-session-at` resolved from `raw_events.idempotency_key` (`ForkPoint::resolve`, stripped at the `#`), writes the child's row with both halves of the graph edge, and creates the child's worktree from the parent's shadow commit at the branch-point `seq` — its own branch, its own tree, its own `shadow_ref`, so its writes are snapshotted and attributable like any other run's. A parent with no shadow ref is refused rather than placed against the repo's `HEAD` or the parent's tree. Still missing: any way to fork from the UI |
 | **Worktrees** — run-per-worktree, create/list/clean up | §13 | **done**, fork-at-`seq` included — `ShadowHistory::commit_at` resolves a branch-point `seq` to the newest snapshot at or before it (§13.1 never commits an unchanged tree, so most `seq` values have no commit of their own and `<=` is the correct rule, not a lenient one), and a test forks a parent mid-edits and asserts the child's tree holds the parent's content *as of that seq* rather than as of its tip |
-| **Persistence** — SQLite, `runs` + `raw_events` only; projections recomputed on load | §14 | **done** — the whole graph edge is now in the schema: `parent_run_id` plus `branch_point_seq` (migration V2), the only record the graph will ever have, since the provider records no parentage. A root run has neither half and a fork has both; the pairing is enforced in `Run::check_fork_pairing`, not in SQL, so a test reaches it without a database. `driver::fork` writes both halves, and a fork's tree is checked out from the parent's shadow commit at that `seq` |
+| **Persistence** — SQLite, `runs` + `raw_events` only; projections recomputed on load | §14 | **done** — the whole graph edge is now in the schema: `parent_run_id` plus `branch_point_seq` (migration V2), the only record the graph will ever have, since the provider records no parentage. A root run has neither half and a fork has both; the pairing is enforced in `Run::check_fork_pairing`, not in SQL, so a test reaches it without a database. `driver::fork` writes both halves, and a fork's tree is checked out from the parent's shadow commit at that `seq`. V3 adds `model` — the second thing the log cannot recompute, since what a run was *launched* with is not what the stream reports: `run.started` names one only sometimes and `turn.finished` names what a turn billed. A fork inherits its parent's by copy, so a branch can differ from it. Each migration has a test that an existing database of the previous version keeps its rows |
 | **Workspace MCP server** — `report_finding`, `open_plan`, `record_test_run` | §6 | **done** for `request_permission` + `report_finding`; the other four tools are unbuilt |
 | **Run feed** — six block types plus `Raw`, virtualized, every block carrying `(runId, seqRange)`, **collapse/expand first-class** | §7 | not started — the window's flat event list is bridge scaffolding, not a first draft of this. Second in the slice, built against fork addresses a working fork is already resolving |
-| **The run graph** — the home screen: nodes are runs, edges are `parentRunId` + branch `seq`; generated layout, no drawing library | §10, §19 | not started — *the thesis*. Layout and pan/zoom exist; what it *is* is now decided in [`branching-surface.md`](branching-surface.md), which moves §10's "expanding is a deliberate act" |
+| **The run graph** — the home screen: nodes are runs, edges are `parentRunId` + branch `seq`; generated layout, no drawing library | §10, §19 | **half-built** — *the thesis*. Layout, pan/zoom and anchored edges exist, and a node is now the conversation column [`branching-surface.md`](branching-surface.md) decided on rather than §10's card: 560 wide, header (name · status · message count, then the model), a scrolling body, a composer that sends. The chevron is gone because §10's "expanding is a deliberate act" is overturned — forking is anchored to a message, so a default state that hides messages taxes the primary act every time. The three-word vocabulary and the message count are a projection in `event-log` and not shell logic: `RunStatus`'s four values collapse to three because the words answer *does this want me now*, so `failed` and `abandoned` read as `idle` and outcome stays on the row. Missing: map view and ⌘\, the fork gesture, and §7's feed inside the body |
 | **Review** — the diff surface with reasoning attached to hunks, a branch diffed against its fork point | §13.1 | not started — *the one screen that must be excellent* |
 | **Compare siblings** — two branches off one point, side by side | §19 | not started — last in, first cut if V1 runs long |
 | **Runs list** — a cross-workspace index and launcher, deliberately thin | §10 | not started — demoted from home screen |

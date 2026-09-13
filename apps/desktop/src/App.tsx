@@ -3,6 +3,7 @@ import type { BootReport } from '@agent-workspace/shared-types/BootReport'
 import type { RawEvent } from '@agent-workspace/shared-types/RawEvent'
 import type { Run } from '@agent-workspace/shared-types/Run'
 import type { RunId } from '@agent-workspace/shared-types/RunId'
+import type { RunActivity } from '@agent-workspace/shared-types/RunActivity'
 import type { RunMetrics } from '@agent-workspace/shared-types/RunMetrics'
 import type { StartRunRequest } from '@agent-workspace/shared-types/StartRunRequest'
 import type { UnlistenFn } from '@tauri-apps/api/event'
@@ -13,8 +14,10 @@ import {
   liveRuns,
   onRunEvent,
   recentRuns,
+  runActivity,
   runEvents,
   runMetrics,
+  sendTurn,
   startRun,
 } from './lib/ipc'
 import { Canvas, type CanvasHandle } from './canvas/Canvas'
@@ -31,10 +34,15 @@ import { Toasts, toast, type Toast } from './shell/Toasts'
 // them. It owns the state every surface reads and none of the logic — the
 // commands in `lib/ipc.ts` are the whole of what this app can do.
 //
+// The three-word status and the message count each node's header shows are a
+// projection this file *fetches* rather than computes (`runActivity`), for the
+// same reason metrics are: deriving "needs you" from the log is deciding, and
+// the shell owns no logic.
+//
 // What is *not* built is as load-bearing as what is. The node bodies still
-// hold a flat list of raw events rather than §7's blocks, and nothing forks, so
-// the graph is a forest of roots. Both are marked at the point of use rather
-// than here, so that whoever replaces one finds the note attached to it.
+// hold a flat list of raw events rather than §7's blocks, nothing forks, and
+// there is no map view. All three are marked at the point of use rather than
+// here, so that whoever replaces one finds the note attached to it.
 
 /** Events keyed by run, because one channel carries every run's stream. */
 type Streams = Record<RunId, RawEvent[]>
@@ -58,8 +66,8 @@ export default function App() {
   const [runs, setRuns] = useState<Run[]>([])
   const [live, setLive] = useState<RunId[]>([])
   const [metrics, setMetrics] = useState<Record<RunId, RunMetrics>>({})
+  const [activity, setActivity] = useState<Record<RunId, RunActivity>>({})
   const [selected, setSelected] = useState<RunId | null>(null)
-  const [expanded, setExpanded] = useState<Set<RunId>>(new Set())
   const [starting, setStarting] = useState(false)
 
   const [leftOpen, setLeftOpen] = useState(true)
@@ -117,6 +125,14 @@ export default function App() {
     liveRuns().then(setLive).catch(fail('Could not list supervised runs'))
   }, [fail])
 
+  // One call for every node's header, not one per node: `recent_activity` is a
+  // single grouped query over the same window the graph is drawn from.
+  const refreshActivity = useCallback(() => {
+    runActivity(WINDOW)
+      .then((rows) => setActivity(Object.fromEntries(rows.map((a) => [a.run_id, a]))))
+      .catch(fail('Could not read run activity'))
+  }, [fail])
+
   useEffect(() => {
     bootReport()
       .then((report) => {
@@ -152,6 +168,18 @@ export default function App() {
   useEffect(() => {
     refreshRuns()
   }, [terminal, refreshRuns])
+
+  // Every event changes a header: a message moves the count, a permission
+  // request moves the status. The log is written before the event reaches this
+  // webview (`pipeline.rs` appends, then the supervisor emits), so a refresh
+  // triggered by an arrival always sees the arrival.
+  const eventCount = useMemo(
+    () => Object.values(streams).reduce((n, events) => n + events.length, 0),
+    [streams],
+  )
+  useEffect(() => {
+    refreshActivity()
+  }, [eventCount, runs, refreshActivity])
 
   const current = useMemo(
     () => runs.find((r) => r.id === selected) ?? null,
@@ -189,7 +217,6 @@ export default function App() {
       const started = await startRun(request)
       setDialogOpen(false)
       setSelected(started.run_id)
-      setExpanded((prev) => new Set(prev).add(started.run_id))
       refreshRuns()
     } catch (e: unknown) {
       fail('The run did not start')(e)
@@ -206,13 +233,16 @@ export default function App() {
       .catch(fail(what === 'end' ? 'Could not end the run' : 'Could not interrupt the run'))
   }
 
-  const toggle = (id: RunId) =>
-    setExpanded((prev) => {
-      const next = new Set(prev)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
-      return next
-    })
+  // A turn, through the process that is already running (§5). The rejection is
+  // re-thrown after the toast so the composer can keep what was typed.
+  const send = useCallback(
+    (id: RunId, text: string) =>
+      sendTurn(id, text).catch((e: unknown) => {
+        fail('The turn was not sent')(e)
+        throw e
+      }),
+    [fail],
+  )
 
   usePaletteShortcut(useCallback(() => setPaletteOpen((open) => !open), []))
 
@@ -232,13 +262,6 @@ export default function App() {
       title: 'Interrupt the selected run — stop now',
       disabled: !isLive,
       run: () => steer('interrupt'),
-    },
-    {
-      id: 'run.expand',
-      group: 'Run',
-      title: selected !== null && expanded.has(selected) ? 'Collapse the selected run' : 'Expand the selected run',
-      disabled: selected === null,
-      run: () => selected !== null && toggle(selected),
     },
     { id: 'view.fit', group: 'View', title: 'Fit the graph to the window', run: () => canvas.current?.fit() },
     { id: 'view.in', group: 'View', title: 'Zoom in', run: () => canvas.current?.zoomIn() },
@@ -273,11 +296,11 @@ export default function App() {
         <Canvas
           runs={runs}
           events={streams}
-          metrics={metrics}
+          activity={activity}
           selected={selected}
-          expanded={expanded}
+          live={live}
           onSelect={setSelected}
-          onToggle={toggle}
+          onSend={send}
           viewportRef={canvas}
         />
 

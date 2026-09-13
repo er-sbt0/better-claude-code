@@ -56,6 +56,7 @@ fn main() {
                 branch: None,
                 shadow_ref: None,
                 prompt: None,
+                model: None,
                 status: RunStatus::Running,
                 started_at: "2026-09-12T00:00:00.000Z".to_owned(),
                 finished_at: None,

@@ -455,6 +455,7 @@ fn every_recorded_fixture_survives_the_pipeline() {
             branch: None,
             shadow_ref: None,
             prompt: None,
+            model: None,
             status: RunStatus::Running,
             started_at: "2026-09-13T09:00:00.000Z".to_owned(),
             finished_at: None,
@@ -633,6 +634,8 @@ fn parent_that_edited_twice(db: &Path, repo: &Path, run: &RunId) -> (PathBuf, Ev
         branch: Some(format!("agent/{}", run.0)),
         shadow_ref: Some(tree.shadow.ref_name().to_owned()),
         prompt: Some("make it retry".to_owned()),
+        // The fork below inherits this, and asserts it.
+        model: Some("claude-opus-4-6".to_owned()),
         status: RunStatus::Finished,
         started_at: "2026-09-13T09:00:00.000Z".to_owned(),
         finished_at: Some("2026-09-13T09:01:00.000Z".to_owned()),
@@ -826,6 +829,12 @@ fn a_fork_gets_its_own_tree_holding_the_parent_as_of_the_branch_point() {
     assert_eq!(row.shadow_ref.as_deref(), Some(child_ref.as_str()));
     assert_eq!(row.provider_session_id.as_ref(), Some(&child_session));
     assert_eq!(row.workspace_path, repo.display().to_string());
+    assert_eq!(
+        row.model.as_deref(),
+        Some("claude-opus-4-6"),
+        "`branching-surface.md`: a fork inherits its parent's model, and it is \
+         copied onto the child's own row rather than read back through the edge"
+    );
 
     // §13.1 on the fork: its edit is attributable to the tool call that made it,
     // by `seq`, back into the *child's* log.
@@ -1000,6 +1009,7 @@ fn a_fork_of_a_run_with_no_shadow_ref_is_refused_and_writes_nothing() {
         branch: Some("agent/run_refless".to_owned()),
         shadow_ref: None,
         prompt: None,
+        model: None,
         status: RunStatus::Finished,
         started_at: "2026-09-13T09:00:00.000Z".to_owned(),
         finished_at: Some("2026-09-13T09:01:00.000Z".to_owned()),
@@ -1087,6 +1097,7 @@ fn in_memory_run(run: &RunId) -> EventLog {
         branch: None,
         shadow_ref: None,
         prompt: None,
+        model: None,
         status: RunStatus::Running,
         started_at: "2026-09-13T09:00:00.000Z".to_owned(),
         finished_at: None,

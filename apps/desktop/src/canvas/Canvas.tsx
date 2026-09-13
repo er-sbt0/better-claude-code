@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import type { RawEvent } from '@agent-workspace/shared-types/RawEvent'
 import type { Run } from '@agent-workspace/shared-types/Run'
 import type { RunId } from '@agent-workspace/shared-types/RunId'
-import type { RunMetrics } from '@agent-workspace/shared-types/RunMetrics'
+import type { RunActivity } from '@agent-workspace/shared-types/RunActivity'
 import { layout } from './layout'
 import { RunNode, sizeOf } from './RunNode'
 
@@ -12,6 +12,12 @@ import { RunNode, sizeOf } from './RunNode'
 // they do not place nodes. A layout pass plus a pan/zoom transform, no drawing
 // library (§19)." That is exactly what this is — `layout.ts` returns
 // coordinates, and everything here is one CSS transform over them.
+//
+// "Collapses" is the one word of that which has moved. `branching-surface.md`
+// makes a node a conversation column and relocates §10's shape card to **map
+// view**, a second representation of this same canvas reached with ⌘\. Map view
+// is not built: when it is, it changes the `sizeOf` this file passes to
+// `layout` and the component it renders, and nothing else here.
 //
 // What is *not* here yet, and is not hidden: forking. Nothing in the app
 // creates a child run, so `parent_run_id` is null on every row and the graph
@@ -28,26 +34,27 @@ export type Viewport = { x: number; y: number; scale: number }
 export function Canvas({
   runs,
   events,
-  metrics,
+  activity,
   selected,
-  expanded,
+  live,
   onSelect,
-  onToggle,
+  onSend,
   viewportRef,
 }: {
   runs: Run[]
   events: Record<RunId, RawEvent[]>
-  metrics: Record<RunId, RunMetrics>
+  activity: Record<RunId, RunActivity>
   selected: RunId | null
-  expanded: Set<RunId>
+  /** Runs this process is supervising — the ones a composer can send to. */
+  live: RunId[]
   onSelect: (id: RunId) => void
-  onToggle: (id: RunId) => void
+  onSend: (id: RunId, text: string) => Promise<void>
   /** Filled with the imperative handle, so the palette can drive the view. */
   viewportRef: React.MutableRefObject<CanvasHandle | null>
 }) {
   const frame = useRef<HTMLDivElement | null>(null)
   const [view, setView] = useState<Viewport>({ x: PAD, y: PAD, scale: 1 })
-  const graph = layout(runs, (run) => sizeOf(expanded.has(run.id), (events[run.id] ?? []).length))
+  const graph = layout(runs, sizeOf)
 
   const fit = useCallback(() => {
     const box = frame.current?.getBoundingClientRect()
@@ -100,6 +107,18 @@ export function Canvas({
     const el = frame.current
     if (el === null) return
     const onWheel = (e: WheelEvent) => {
+      // A node is a conversation column with a scrolling body, and this
+      // handler is on the frame every one of them bubbles to. Without the
+      // check the canvas pans and the body never scrolls at all — the gesture
+      // is swallowed one level above the element it was aimed at.
+      const target = e.target
+      if (
+        !(e.ctrlKey || e.metaKey) &&
+        target instanceof Element &&
+        target.closest('[data-scrollable]') !== null
+      ) {
+        return
+      }
       e.preventDefault()
       if (e.ctrlKey || e.metaKey) {
         const box = el.getBoundingClientRect()
@@ -190,12 +209,12 @@ export function Canvas({
             >
               <RunNode
                 run={node.run}
-                metrics={metrics[node.run.id] ?? null}
+                activity={activity[node.run.id] ?? null}
                 events={events[node.run.id] ?? []}
                 selected={selected === node.run.id}
-                expanded={expanded.has(node.run.id)}
+                live={live.includes(node.run.id)}
                 onSelect={() => onSelect(node.run.id)}
-                onToggle={() => onToggle(node.run.id)}
+                onSend={(text) => onSend(node.run.id, text)}
               />
             </div>
           ))}

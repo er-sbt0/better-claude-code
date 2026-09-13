@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use agent_protocol::{RawEvent, RunId};
 use driver::{LaunchSpec, Permission, Registry, RunSpec};
-use event_log::{EventLog, Run, RunMetrics};
+use event_log::{EventLog, Run, RunActivity, RunMetrics};
 use normalizer::{Clock, SystemClock};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -188,6 +188,29 @@ fn run_metrics(state: State<'_, AppState>, run_id: RunId) -> Result<RunMetrics, 
         .map_err(|e| e.to_string())
 }
 
+/// The three-word status and the message count, per run, for the graph's
+/// headers.
+///
+/// A projection recomputed from the log ([`EventLog::recent_activity`]) and not
+/// a field on [`Run`], for the same reason [`run_metrics`] is a command: **needs
+/// you** is a `permission.requested` with no matching `permission.resolved`,
+/// and a message count is not an event count. Both are derivations, and the
+/// rule at the top of this file is that a derivation belongs in a crate where a
+/// test can reach it without a window — so what the shell receives is three
+/// words to colour.
+///
+/// The limit is the caller's and means what it means on [`recent_runs`]: the
+/// same window, so every node the graph drew has a header.
+#[tauri::command]
+fn run_activity(state: State<'_, AppState>, limit: u32) -> Result<Vec<RunActivity>, String> {
+    state
+        .log
+        .lock()
+        .map_err(|_| "event log lock poisoned".to_owned())?
+        .recent_activity(limit)
+        .map_err(|e| e.to_string())
+}
+
 /// The runs *this process* is supervising.
 ///
 /// Not the same question as [`running_runs`], which asks the log. These two
@@ -328,6 +351,7 @@ pub fn run() {
             recent_runs,
             run_events,
             run_metrics,
+            run_activity,
             live_runs,
             start_run,
             send_turn,

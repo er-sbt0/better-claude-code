@@ -9,7 +9,7 @@ use crate::Result;
 
 /// Bump when adding a migration; `migrate` applies everything above the
 /// database's current `user_version`.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Apply every migration the database has not seen.
 pub fn migrate(conn: &Connection) -> Result<()> {
@@ -22,6 +22,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     }
     if current < 2 {
         conn.execute_batch(V2)?;
+    }
+    if current < 3 {
+        conn.execute_batch(V3)?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
@@ -134,4 +137,31 @@ const V2: &str = r#"
 -- which starts deciding belongs where a test can reach it without a database
 -- points the same way.
 ALTER TABLE runs ADD COLUMN branch_point_seq INTEGER;
+"#;
+
+const V3: &str = r#"
+-- Which model the run was launched with (§5, `LaunchSpec::model`).
+--
+-- The driver has always been able to vary this per run and nothing ever stored
+-- it, so the model was knowable only while the process was alive. That was
+-- tolerable while the surface had no header; `docs/branching-surface.md` gives
+-- every node one, and a header that states a model it cannot read is
+-- decoration. This is the column that makes it real.
+--
+-- Not a projection, and the §8 rule is why rather than why not: the model is
+-- *not* recomputable from the log. `run.started` carries one when the provider
+-- announces it and `turn.finished` carries the models a turn actually billed,
+-- but neither is what we asked for — a run that failed before its first turn
+-- billed nothing and announced nothing, and a turn that fell back to a
+-- different model would rewrite history if it were read as the request. This
+-- records the launch, which is a fact only the launcher has.
+--
+-- Nullable, because `LaunchSpec::model` is: a run launched without `--model`
+-- gets the provider's own default, and naming a model we did not choose would
+-- be a guess stored as a fact.
+--
+-- A fork inherits its parent's value at `driver::fork` rather than by reading
+-- through the edge at query time, so a later UI can change one branch's model
+-- without rewriting what the parent was launched with.
+ALTER TABLE runs ADD COLUMN model TEXT;
 "#;

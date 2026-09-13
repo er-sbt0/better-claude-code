@@ -329,6 +329,10 @@ pub fn start(
                 branch: Some(spec.branch.clone()),
                 shadow_ref: Some(shadow_ref.clone()),
                 prompt: Some(spec.prompt.clone()),
+                // What we asked for, not what the provider announces. A run
+                // launched without `--model` records `None` rather than the
+                // default we would have to guess at (`schema.rs`, V3).
+                model: spec.launch.model.clone(),
                 status: RunStatus::Running,
                 started_at: started_at.to_owned(),
                 finished_at: None,
@@ -432,6 +436,11 @@ pub fn ensure_tree(spec: &TreeSpec) -> Result<Tree> {
 /// `branching-surface.md`'s reading of `pipeline.rs` shows would mis-attribute
 /// the *parent's* hunks as well as the child's.
 ///
+/// What it *does* inherit is the model, unless the caller named one — a fork is
+/// a continuation of a conversation, and the conversation was had with a model.
+/// It is copied onto the child's own row rather than read back through the edge,
+/// so changing one branch's model later changes only that branch.
+///
 /// # A parent with no shadow ref cannot be forked
 ///
 /// Refused, loudly, rather than quietly substituted for. The two available
@@ -494,6 +503,15 @@ pub fn fork(
     spec.launch.resume = Some(parent_session);
     spec.launch.fork_at = Some(spec.at.address.clone());
 
+    // `branching-surface.md`: a fork inherits its parent's model. Inherited
+    // here rather than read through the edge at query time, so the child gets
+    // its own value in its own column and a surface that changes one branch's
+    // model changes nothing about the parent. A caller that names a model is
+    // making exactly that change, so its choice wins.
+    if spec.launch.model.is_none() {
+        spec.launch.model = parent.model.clone();
+    }
+
     let session = spawn_run(
         log,
         SpawnSpec {
@@ -509,6 +527,8 @@ pub fn fork(
                 branch: Some(spec.branch.clone()),
                 shadow_ref: Some(shadow_ref.clone()),
                 prompt: Some(spec.prompt.clone()),
+                // Inherited above unless the caller named one.
+                model: spec.launch.model.clone(),
                 status: RunStatus::Running,
                 started_at: started_at.to_owned(),
                 finished_at: None,

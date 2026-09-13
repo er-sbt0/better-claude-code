@@ -16,6 +16,11 @@ reversed. Building it produced the new information, which is the only thing that
 lets a record contradict itself. The reversal is argued under "What this
 overturns"; the prose it replaced is described there rather than deleted
 silently, because the wrong version is the one that will be re-proposed.
+
+Amended again 2026-09-13, on the commit that built the column: the open question
+about the model is closed, and `role` is dropped with it. Argued under "The
+model is a column; `role` is not a thing", which is where the bullet that used
+to sit under "What this does not decide" went.
 -->
 
 # The branching surface — what the run graph actually is
@@ -36,7 +41,7 @@ answers move two things the design had written down.
 | **Fork anchor** | A message, and only where a provider chain entry actually resolves. No snapping to a nearby address. |
 | **Filesystem** | **Eager.** The fork is created with its worktree, checked out from the parent's shadow commit at the branch-point `seq`. Reversed from "lazy" once it was built — see "What this overturns". |
 | **The feed** | §7's six block types plus `Raw`, virtualized, `(runId, seqRange)` on every block. `EventStream.tsx` is replaced, as its own comment demands. |
-| **Fork config** | Immediate. Inherit the parent's model and role; edit the header afterwards. |
+| **Fork config** | Immediate. Inherit the parent's model; edit the header afterwards. (`role` is gone — see below.) |
 
 Carried over from the prototype without argument: edges anchored to the forked
 message rather than to the node, the inherited-context strip on a child, fork
@@ -57,7 +62,7 @@ default state hides messages makes its primary act cost a preliminary step, ever
 time. That is the whole argument.
 
 §10's shape is not lost — it is relocated. Map view renders each column as a card
-carrying exactly what §10 listed: name, status, `role · model · N msgs`, and a
+carrying exactly what §10 listed: name, status, `model · N msgs`, and a
 one-line summary. The shape became a zoom level instead of a collapse state, and
 the thing §10 was protecting (that you can see the work without reading it)
 is protected by ⌘\ rather than by a chevron.
@@ -268,6 +273,37 @@ one of this record's own**, which is what the third entry is.
    now costs a `worktree add`, and that is the price of a fork that is about the
    conversation it claims to be about.
 
+## The model is a column; `role` is not a thing
+
+The header showed `role · model` and neither half was real. One of them is now.
+
+**The model is stored.** `LaunchSpec.model` has been per-run since the driver
+existed — it could always vary, and nothing ever wrote it down, so a run's model
+was knowable only while its process was alive. It is a column as of schema V3,
+written at launch from what we *asked for* rather than from what the provider
+announces: `run.started` names a model only sometimes and `turn.finished` names
+the models a turn actually billed, so a fallback would rewrite the request and a
+run that failed before its first turn would have no answer at all. A fork
+inherits its parent's, which is what the Fork config row above always meant, and
+it inherits it by copy — onto the child's own row — so that changing one
+branch's model later changes one branch. That copy is the whole content of
+"whether a branch can differ in model from its parent": it can, because the
+answer lives per run rather than being read back through the edge.
+
+**`role` is dropped.** There is no such concept anywhere under the window —
+not in `LaunchSpec`, not in the run row, not in the provider's stream. The
+prototype's `planner` and `coder` are labels typed into a mock, and the only
+place a role could have come from is the shell inventing one. That is the
+failure §8's table names: a shell that starts deciding is deciding where no test
+can reach it, and a made-up field is worse than a wrong one because it renders
+as a feature and features acquire users. If roles turn out to be right they
+arrive the way the model did — a launch-time concept in the driver, a column of
+its own — and the header reads them instead of authoring them.
+
+What this costs is the prototype's most legible image, `planner · opus` forking
+into `coder · sonnet`. Half of it survives, and it is the half that was ever
+ours to make true.
+
 ## What this does not decide
 
 - ~~**Whether the stream `uuid` is the fork address.**~~ Settled: it is, for
@@ -292,12 +328,6 @@ one of this record's own**, which is what the third entry is.
   Unmounting or freezing unfocused feeds is the obvious answer and is not free
   either: a frozen feed that resumes has to catch up on a stream. Measure before
   choosing.
-- **Whether a branch can differ in model from its parent.** The header shows
-  `role · model` per column and the prototype forks `planner · opus` into
-  `coder · sonnet`, but nothing in the driver varies model per run today. The
-  header is currently decoration; either make it real or drop it before it reads
-  as a feature.
-
 ## Sequencing
 
 **A vertical slice, fork first.** One fork working end to end — ⌘⇧F, forked

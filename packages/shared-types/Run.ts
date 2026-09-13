@@ -16,7 +16,18 @@ export type Run = { id: RunId, agent: string, agent_version: string | null, prov
  * `refs/agent-workspace/runs/<id>` (design §13.1). `None` means Review has
  * no attribution for this run and must say so.
  */
-shadow_ref: string | null, prompt: string | null, status: RunStatus, started_at: string, finished_at: string | null, 
+shadow_ref: string | null, prompt: string | null, 
+/**
+ * The model the run was launched with (`LaunchSpec::model`), or `None`
+ * when the launch named none and the provider used its own default.
+ *
+ * Stored rather than derived, and `schema.rs`'s V3 comment carries the
+ * argument: the model is a fact about the *launch*, which the log never
+ * sees. A fork inherits its parent's at `driver::fork`, so the column is
+ * per-run and a later surface can change one branch's without touching
+ * what the parent was launched with.
+ */
+model: string | null, status: RunStatus, started_at: string, finished_at: string | null, 
 /**
  * Which run this one was forked from (§19). `None` for a root run.
  */

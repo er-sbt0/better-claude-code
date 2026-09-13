@@ -24,6 +24,15 @@ pub struct Run {
     /// no attribution for this run and must say so.
     pub shadow_ref: Option<String>,
     pub prompt: Option<String>,
+    /// The model the run was launched with (`LaunchSpec::model`), or `None`
+    /// when the launch named none and the provider used its own default.
+    ///
+    /// Stored rather than derived, and `schema.rs`'s V3 comment carries the
+    /// argument: the model is a fact about the *launch*, which the log never
+    /// sees. A fork inherits its parent's at `driver::fork`, so the column is
+    /// per-run and a later surface can change one branch's without touching
+    /// what the parent was launched with.
+    pub model: Option<String>,
     pub status: RunStatus,
     pub started_at: String,
     pub finished_at: Option<String>,
@@ -158,6 +167,83 @@ impl RunMetrics {
                 e.cost_usd += m.cost_usd;
             }
             None => self.by_model.push(m.clone()),
+        }
+    }
+}
+
+/// The three-word status vocabulary, and the message count beside it.
+///
+/// A projection like [`RunMetrics`] and for the same reason: recomputed from
+/// the log, never stored. It lives here rather than in the shell because
+/// deriving it is *deciding*, and the shell owns no logic — "anything there
+/// that starts deciding belongs in a crate, where a test can reach it without a
+/// window" (roadmap §8). What the shell is left with is a map from three values
+/// to three colours.
+///
+/// `docs/branching-surface.md` fixes the vocabulary at three words and
+/// propagates them to border, pill, sliver and card, so this is what a node's
+/// header says about itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RunActivity {
+    pub run_id: RunId,
+    pub status: Activity,
+    /// **Messages, not events.** A run with 200 events does not have 200
+    /// messages: most of a log is tool traffic, permission decisions and
+    /// lifecycle, and one assistant message fans out into one event per content
+    /// block. [`EventLog::recent_activity`](crate::EventLog::recent_activity)
+    /// carries the counting rule; what it counts is what a reader means by "how
+    /// long is this conversation", and what §10's card spells `N msgs`.
+    ///
+    /// Thinking is deliberately not counted. It belongs to the message it
+    /// precedes, and a run that thought four times before answering once has
+    /// had one exchange with you, not five.
+    pub messages: u32,
+}
+
+/// Idle, running, or needs you.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum Activity {
+    Idle,
+    Running,
+    NeedsYou,
+}
+
+impl Activity {
+    /// Collapse a [`RunStatus`] and the log into the three words the surface
+    /// has.
+    ///
+    /// **Four states, three words, and `failed` and `abandoned` land on
+    /// `Idle`.** The vocabulary is not an outcome vocabulary — it answers "does
+    /// this node want me *now*", which is the only question a canvas of a dozen
+    /// columns can answer at a glance. On that axis a failed run and an
+    /// abandoned one are the same as a finished one: nothing is working and
+    /// nothing is blocked on a decision. Outcome is a second axis and it has
+    /// not moved — `RunStatus` is still on the row, and the inspector, the runs
+    /// list and the status bar still spell all four words. What this must not
+    /// do is smuggle outcome in by routing `Failed` to `NeedsYou`, which would
+    /// make the pill mean two unrelated things and destroy the one state whose
+    /// derivation the record actually specifies.
+    ///
+    /// `NeedsYou` is that state: a `permission.requested` with no matching
+    /// `permission.resolved`. It is scoped to a *running* run on purpose — a
+    /// dead process is not waiting for an answer, so an unresolved request on a
+    /// finished run is a record of how it ended, not a demand on the reader.
+    pub fn of(status: RunStatus, awaiting_permission: bool) -> Self {
+        match status {
+            RunStatus::Running if awaiting_permission => Activity::NeedsYou,
+            RunStatus::Running => Activity::Running,
+            RunStatus::Finished | RunStatus::Failed | RunStatus::Abandoned => Activity::Idle,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Activity::Idle => "idle",
+            Activity::Running => "running",
+            Activity::NeedsYou => "needs you",
         }
     }
 }
