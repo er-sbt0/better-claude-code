@@ -127,6 +127,17 @@ export function Feed({
   )
   const hidden = allBlocks.length - blocks.length
 
+  /** Which branches left from each `seq`, so a row can render its own. */
+  const branchesAt = useMemo(() => {
+    const by = new Map<number, Branch[]>()
+    for (const b of branches) {
+      const at = by.get(b.seq)
+      if (at === undefined) by.set(b.seq, [b])
+      else at.push(b)
+    }
+    return by
+  }, [branches])
+
   const keys = useMemo(() => blocks.map((b, i) => keyOf(b, i, blocks)), [blocks])
   const isOpen = useCallback(
     (index: number): boolean => open[keys[index]!] ?? !collapsedByDefault(blocks[index]!),
@@ -148,7 +159,15 @@ export function Feed({
   // of the key because a collapsed block and an expanded one are two heights of
   // the same block, and remembering one as the other makes every collapse jump.
   const measured = useRef(new Map<string, number>())
-  const sizeKey = (index: number) => `${keys[index]}|${isOpen(index) ? 1 : 0}`
+  // The branch count is part of the key because a breadcrumb is real height in
+  // the row: fork from a block already measured and the cached value is a
+  // height that block no longer has, which would seat the next row on top of
+  // this one until something happened to re-measure it. Forking re-projects the
+  // parent, so this is the ordinary path rather than a corner.
+  const sizeKey = (index: number) =>
+    `${keys[index]}|${isOpen(index) ? 1 : 0}|${
+      (blocks[index]?.seqs ?? []).reduce((n, seq) => n + (branchesAt.get(seq)?.length ?? 0), 0)
+    }`
 
   // Re-seat the table whenever the run moves.
   if (sizes.current.length !== blocks.length) {
@@ -269,6 +288,8 @@ export function Feed({
     const key = keys[i]!
     const expanded = isOpen(i)
     const forkAt = block.fork_seq
+    // A block covers several events; a branch left from exactly one of them.
+    const rowBranches = block.seqs.flatMap((seq) => branchesAt.get(seq) ?? [])
     items.push(
       <div
         key={key}
@@ -344,6 +365,44 @@ export function Feed({
             >
               ⑂ fork here ⌘⇧F
             </button>
+          </div>
+        )}
+
+        {/* In-parent fork breadcrumbs, in the flow of the block they left from
+            (carried over from the prototype). This is the parent half of the
+            edge the canvas draws: the graph says a branch left here, and the
+            feed says it left *from this message*.
+
+            In the flow, and not absolutely positioned at the measured anchor,
+            which is what this was first: an overlay pinned to the branch point
+            lands on top of the message it is about and hides the words the
+            reader forked at. The row is measured, so occupying real space is
+            what keeps the two from colliding at any block height. The *edge*
+            still anchors to the measured `y` — that is `marks`, untouched,
+            because a wire must meet the message and not the note under it. */}
+        {rowBranches.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1 py-1 pr-2 pl-5">
+            <span className="font-mono text-micro text-faint">
+              {rowBranches.length === 1
+                ? 'a branch continues from here'
+                : `${rowBranches.length} branches continue from here`}
+            </span>
+            {rowBranches.map(({ child }) => (
+              <button
+                key={child.id}
+                type="button"
+                data-fork-ui="true"
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  onSelect()
+                }}
+                title={`A branch left this message: ${nameOf(child)}`}
+                className="rounded-sm border border-alt/50 px-1.5 font-mono text-micro text-alt hover:bg-hover"
+              >
+                ⑂ {nameOf(child)}
+              </button>
+            ))}
           </div>
         )}
       </div>,
@@ -439,30 +498,6 @@ export function Feed({
         ) : (
           <div style={{ height: total, position: 'relative' }}>
             {items}
-
-            {/* In-parent fork breadcrumbs, at the branch point (carried over
-                from the prototype without argument). This is the parent half of
-                the edge the canvas draws: the graph says a branch left here, and
-                the feed says it left *from this block*. */}
-            {branches.map(({ seq, child }) =>
-              marks[seq] === undefined ? null : (
-                <button
-                  key={child.id}
-                  type="button"
-                  data-fork-ui="true"
-                  onPointerDown={(e) => e.stopPropagation()}
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    onSelect()
-                  }}
-                  style={{ position: 'absolute', top: marks[seq], left: 0 }}
-                  title={`A branch left this message: ${nameOf(child)}`}
-                  className="-translate-y-1/2 rounded-r-sm border-y border-r border-alt/50 bg-panel px-1.5 font-mono text-micro text-alt"
-                >
-                  ⑂ {nameOf(child)}
-                </button>
-              ),
-            )}
           </div>
         )}
       </div>
