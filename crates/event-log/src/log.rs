@@ -249,7 +249,20 @@ impl EventLog {
     /// normal result of a resume rather than evidence of loss. Ordering is what
     /// `seq` is actually good for.
     pub fn append_all(&mut self, events: &[RawEvent]) -> Result<Vec<Appended>> {
-        let tx = self.conn.transaction()?;
+        // IMMEDIATE, not the default DEFERRED, and this is the difference
+        // between two concurrent runs and one. A deferred transaction that
+        // reads first — `last_seq_tx` below, on every batch — holds a read
+        // snapshot, and SQLite refuses to upgrade it to a write while another
+        // connection is writing. It refuses *without consulting the busy
+        // handler*, because waiting there could deadlock two connections
+        // against each other, so [`BUSY_TIMEOUT`] does not apply and the loser
+        // fails instantly with "database is locked". Taking the write lock up
+        // front is the case the busy handler does cover. Found by running two
+        // supervised runs at once (`driver/tests/registry.rs`), which is the
+        // product case and not an exotic one.
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut out = Vec::with_capacity(events.len());
         let mut high: BTreeMap<&RunId, u64> = BTreeMap::new();
         for ev in events {

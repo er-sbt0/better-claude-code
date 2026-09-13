@@ -19,12 +19,19 @@
 //! everything about git in `worktree`. This crate is the wiring, and
 //! [`Pipeline`] is that wiring without the process — which is what lets a
 //! recorded fixture test it.
+//!
+//! [`start`] hands the caller a live [`Session`] and forgets about it, which is
+//! all a one-shot CLI needs. An app needs to find that session again, steer it
+//! and reap it, so [`Registry`] owns those runs and the threads that end them.
+//! It is in this crate rather than in the shell because it decides when a run
+//! is over, and a decision has to be somewhere a test reaches without a window.
 
 mod error;
 mod launch;
 mod permission;
 mod pipeline;
 mod process;
+mod registry;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -36,10 +43,11 @@ use event_log::{EventLog, Run, RunStatus};
 use worktree::{ShadowHistory, Worktree};
 
 pub use error::{Error, Result};
-pub use launch::{new_session_id, user_message, LaunchSpec, Permission, Thinking};
+pub use launch::{new_run_id, new_session_id, user_message, LaunchSpec, Permission, Thinking};
 pub use permission::{Decider, DenyEverything, RunWorkspace};
 pub use pipeline::{Ingested, Pipeline};
 pub use process::{Outcome, Session};
+pub use registry::{Live, Registry};
 
 /// `seq` 0 is the run's state before anything happened.
 ///

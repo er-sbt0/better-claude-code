@@ -645,6 +645,57 @@ fn a_write_waits_out_the_other_connections_transaction() {
     );
 }
 
+/// The same promise, for the write that actually runs concurrently: two live
+/// runs appending on their own connections.
+///
+/// This is not covered by the test above, and the difference is the whole
+/// finding. `append_all` reads before it writes — `last_seq` for the batch's
+/// run — so a DEFERRED transaction would be holding a read lock at the moment
+/// it asks for the write lock, and SQLite refuses to promote a read lock while
+/// another connection holds a reserved one *without calling the busy handler*:
+/// two connections doing that to each other would deadlock, so it returns
+/// `SQLITE_BUSY` instantly and hopes someone backs off. The timeout is real and
+/// simply never consulted, which is why this failed for a run started while
+/// another was writing and looked exactly like a five-second timeout that had
+/// been ignored.
+///
+/// The sleep has the same role as above: it widens the overlap and nothing is
+/// asserted about it. A scheduling accident can only make this pass without
+/// contending.
+#[test]
+fn an_append_waits_out_another_connections_write_instead_of_failing() {
+    use rusqlite::Connection;
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    let dir = tempdir();
+    let path = dir.join("log.sqlite");
+
+    let mut a = EventLog::open(&path).unwrap();
+    a.create_run(&run_row("r")).unwrap();
+    let mut b = EventLog::open(&path).unwrap();
+
+    let holder = Connection::open(&path).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let gate = Arc::new(Barrier::new(2));
+    let theirs = Arc::clone(&gate);
+    let appending = std::thread::spawn(move || {
+        theirs.wait();
+        b.append_all(&[ev("r", 1, None, turn(0, 0.01, vec![]))])
+    });
+
+    gate.wait();
+    std::thread::sleep(Duration::from_millis(200));
+    holder.execute_batch("COMMIT").unwrap();
+
+    appending
+        .join()
+        .unwrap()
+        .expect("the append should have waited for the lock, not failed");
+    assert_eq!(a.events(&RunId::from("r")).unwrap().len(), 1);
+}
+
 fn tempdir() -> PathBuf {
     let p = std::env::temp_dir().join(format!(
         "event-log-test-{}-{:?}",

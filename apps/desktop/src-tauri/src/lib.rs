@@ -5,21 +5,31 @@
 //! `driver` the process — and everything here is the translation of that spine
 //! into what a webview can call and be told. Anything in this file that starts
 //! deciding something belongs in a crate instead, where a test can reach it
-//! without a window.
+//! without a window. The run registry is the worked example: it decides when a
+//! run is over and what happens to live runs at exit, so it lives in `driver`
+//! and every command below is three lines of translation over it.
 //!
-//! One obligation is already real rather than scaffolding: **the app reconciles
-//! orphaned runs before it shows anything** (§8). Every run the log still calls
-//! `Running` at startup is a run whose process died with the last session, and
-//! the log cannot work that out on its own — it has no processes. Doing it in
-//! `setup`, not lazily in a command, is what guarantees the UI never renders a
-//! run that looks alive and is not.
+//! Two obligations here are real rather than scaffolding.
+//!
+//! **The app reconciles orphaned runs before it shows anything** (§8). Every run
+//! the log still calls `Running` at startup is a run whose process died with the
+//! last session, and the log cannot work that out on its own — it has no
+//! processes. Doing it in `setup`, not lazily in a command, is what guarantees
+//! the UI never renders a run that looks alive and is not.
+//!
+//! **The app ends every live run before it exits.** A run started here holds a
+//! live `claude` process until it is ended on purpose (see
+//! [`driver::Registry`]), so an exit that skipped this would leave one agent per
+//! run running on the machine — every `tauri dev` reload, forever.
 
-use std::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use agent_protocol::RunId;
+use driver::{LaunchSpec, Permission, Registry, RunSpec};
 use event_log::{EventLog, Run};
 use normalizer::{Clock, SystemClock};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
 use ts_rs::TS;
 
@@ -37,12 +47,52 @@ pub struct BootReport {
     pub abandoned: Vec<RunId>,
 }
 
+/// What the UI has to say to start a run.
+///
+/// Deliberately short of a permission policy. §12's V1 surface is a dialog and
+/// the `Decider` behind it does not exist, so a run started from here hosts no
+/// workspace MCP server and nothing may prompt: every tool is either in
+/// `allowed_tools` up front or denied outright. That is an honest run rather
+/// than the product, and it is why this struct has no field that would suggest
+/// otherwise.
+#[derive(Debug, Clone, Deserialize, TS)]
+#[ts(export)]
+pub struct StartRunRequest {
+    /// The user's repository. The run gets a worktree of its own (§13); this is
+    /// never the agent's cwd.
+    pub repo: String,
+    pub prompt: String,
+    pub model: Option<String>,
+    /// Pre-granted tools, e.g. `Read`, `Edit`. Anything absent is denied.
+    pub allowed_tools: Vec<String>,
+    pub max_turns: Option<u32>,
+    pub max_budget_usd: Option<f64>,
+}
+
+/// Where a started run landed.
+///
+/// All of it is in the run's row as well. It comes back on the call because the
+/// UI has just started the run and should not have to query for what it just
+/// caused.
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
+pub struct StartedRun {
+    pub run_id: RunId,
+    pub branch: String,
+    pub worktree_path: String,
+    /// `refs/agent-workspace/runs/<id>`: what Review attributes against (§13.1).
+    pub shadow_ref: String,
+    pub started_at: String,
+}
+
 pub struct AppState {
     /// One connection, serialized. The log is single-writer by design (§14);
     /// when a live run needs its own handle, the driver takes one — this is
     /// the UI's, not the runtime's.
     pub log: Mutex<EventLog>,
     pub boot: BootReport,
+    /// The runs this process is holding open, and the threads that end them.
+    pub runs: Registry,
 }
 
 #[tauri::command]
@@ -66,6 +116,92 @@ fn running_runs(state: State<'_, AppState>) -> Result<Vec<Run>, String> {
         .map_err(|e| e.to_string())
 }
 
+/// The runs *this process* is supervising.
+///
+/// Not the same question as [`running_runs`], which asks the log. These two
+/// agree only because the app reconciles at boot and reaps at exit; the log's
+/// answer is about rows and this one is about processes.
+#[tauri::command]
+fn live_runs(state: State<'_, AppState>) -> Vec<RunId> {
+    state.runs.live()
+}
+
+/// Start a run and hand it to the registry.
+///
+/// The one thing worth reading twice: `EventLog::open` here is a **second**
+/// connection to the same file. `driver::start` takes an `EventLog` by value
+/// and gives it back only from `Session::wait()`, so lending the UI's would
+/// mean the UI could not read while a run was writing — WAL and the two
+/// connections are what make a live feed possible at all.
+#[tauri::command]
+fn start_run(state: State<'_, AppState>, request: StartRunRequest) -> Result<StartedRun, String> {
+    let repo = PathBuf::from(&request.repo)
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", request.repo))?;
+    let log = EventLog::open(&state.boot.log_path).map_err(|e| e.to_string())?;
+
+    let run_id = driver::new_run_id();
+    let mut launch = LaunchSpec::new(&repo, driver::new_session_id(), Permission::DenyPrompts);
+    launch.model = request.model;
+    launch.allowed_tools = request.allowed_tools;
+    launch.max_turns = request.max_turns;
+    launch.max_budget_usd = request.max_budget_usd;
+
+    let spec = RunSpec {
+        run_id: run_id.clone(),
+        repo,
+        branch: format!("agent/{}", run_id.0),
+        base: "HEAD".to_owned(),
+        prompt: request.prompt,
+        post_create_hook: None,
+        launch,
+        // §12 option A needs a `Decider` that is a person, and there is not one
+        // yet. Without the server nothing can prompt, which is the only honest
+        // posture until there is.
+        workspace_mcp: None,
+    };
+
+    let live = state
+        .runs
+        .start(log, spec, move |_event| {
+            // The live feed goes here, and only here: one `app.emit` of the
+            // event, on the run's supervisor thread. Everything else about the
+            // run's lifetime is already handled below this line.
+        })
+        .map_err(|e| e.to_string())?;
+
+    Ok(StartedRun {
+        run_id: live.run_id,
+        branch: live.branch,
+        worktree_path: live.worktree_path.display().to_string(),
+        shadow_ref: live.shadow_ref,
+        started_at: live.started_at,
+    })
+}
+
+/// A follow-up turn, through the process that is already running (§5).
+#[tauri::command]
+fn send_turn(state: State<'_, AppState>, run_id: RunId, text: String) -> Result<(), String> {
+    state.runs.send(&run_id, &text).map_err(|e| e.to_string())
+}
+
+/// End a run: close its stdin, and let the agent finish the turn it is in.
+///
+/// Nothing else ends a run. The agent waits for another turn until stdin
+/// closes, and this shell — unlike `driver/examples/run.rs`, which closes on
+/// every `turn.finished` and is single-turn as a result — never closes it on
+/// the user's behalf.
+#[tauri::command]
+fn end_run(state: State<'_, AppState>, run_id: RunId) -> Result<(), String> {
+    state.runs.end(&run_id).map_err(|e| e.to_string())
+}
+
+/// Stop a run now. Everything already logged stays logged (§8).
+#[tauri::command]
+fn interrupt_run(state: State<'_, AppState>, run_id: RunId) -> Result<(), String> {
+    state.runs.interrupt(&run_id).map_err(|e| e.to_string())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -82,10 +218,31 @@ pub fn run() {
                     abandoned,
                 },
                 log: Mutex::new(log),
+                // §8: timestamps come from our runtime, and this is the one
+                // place the app names which clock that is.
+                runs: Registry::with_clock(Arc::new(SystemClock)),
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![boot_report, running_runs])
-        .run(tauri::generate_context!())
-        .expect("failed to start the Agent Workspace window");
+        .invoke_handler(tauri::generate_handler![
+            boot_report,
+            running_runs,
+            live_runs,
+            start_run,
+            send_turn,
+            end_run,
+            interrupt_run
+        ])
+        .build(tauri::generate_context!())
+        .expect("failed to start the Agent Workspace window")
+        // `build` + this loop rather than `run`, for the sake of one event:
+        // without it, every live run outlives the window as an orphaned
+        // `claude` process, because nothing in this app closes an agent's stdin
+        // on its own. Interrupt rather than end: the app is going away, and
+        // waiting for each agent to finish its turn would be a hang.
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                app.state::<AppState>().runs.shutdown();
+            }
+        });
 }

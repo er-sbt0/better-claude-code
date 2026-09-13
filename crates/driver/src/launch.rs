@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use agent_protocol::SessionId;
+use agent_protocol::{RunId, SessionId};
 
 use crate::error::{Error, Result};
 
@@ -256,4 +256,16 @@ pub fn user_message(text: &str) -> String {
 /// A fresh session id for a run. We assign it; §14 explains why.
 pub fn new_session_id() -> SessionId {
     SessionId(uuid::Uuid::new_v4().to_string())
+}
+
+/// A fresh run id.
+///
+/// Ours rather than the provider's (§14), and it names things a user reads: the
+/// run's branch is `agent/<run_id>` and its shadow ref ends in it, so it is
+/// prefixed and shortened rather than left as a bare UUID. Every caller that
+/// starts a run needs one, and a caller inventing its own is a caller deciding
+/// what our identifiers look like.
+pub fn new_run_id() -> RunId {
+    let uuid = uuid::Uuid::new_v4().simple().to_string();
+    RunId(format!("run_{}", &uuid[..12]))
 }
