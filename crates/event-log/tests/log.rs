@@ -514,6 +514,137 @@ fn an_event_for_an_unknown_run_is_refused() {
     assert!(matches!(err, Error::Sqlite(_)), "got {err:?}");
 }
 
+// ------------------------------------------------------- two connections --
+
+/// The WAL claim in `EventLog::from_conn`, exercised instead of asserted.
+///
+/// Two connections to one file is not an edge case but the shape of the app:
+/// `driver::start` consumes an `EventLog` by value and gives it back only from
+/// `Session::wait()`, so the shell cannot lend the UI's log to a run and keeps
+/// its own. Everything the UI does to a live run — the run row, the first
+/// render, the tail — happens on a connection that never sees the writer's
+/// transactions except as committed data.
+#[test]
+fn a_second_connection_reads_a_run_the_first_is_still_writing() {
+    let dir = tempdir();
+    let path = dir.join("log.sqlite");
+
+    // A is the run's writer, as `driver::start` would hold it; B is the UI's,
+    // opened separately and never closed or reopened while A works.
+    let mut writer = EventLog::open(&path).unwrap();
+    let reader = EventLog::open(&path).unwrap();
+
+    let run = RunId::from("live");
+    writer.create_run(&run_row("live")).unwrap();
+    writer
+        .append(&ev(
+            "live",
+            1,
+            None,
+            Event::TurnStarted(TurnStarted { index: 0 }),
+        ))
+        .unwrap();
+
+    // The run is visible on B as running, which is the state the UI renders it
+    // in for as long as A is alive.
+    let seen = reader.run(&run).unwrap().expect("run not visible on B");
+    assert_eq!(seen.status, RunStatus::Running);
+    assert_eq!(seen.prompt.as_deref(), Some("add refresh-token support"));
+
+    let events = reader.events(&run).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].seq, 1);
+    assert_eq!(reader.last_seq(&run).unwrap(), 1);
+
+    // And the tail advances: B does not have to reopen to see A's later
+    // appends, which is the whole of §7's live feed.
+    writer
+        .append(&ev(
+            "live",
+            2,
+            None,
+            Event::TurnStarted(TurnStarted { index: 1 }),
+        ))
+        .unwrap();
+    let tail = reader.events_after(&run, 1, u32::MAX).unwrap();
+    assert_eq!(tail.len(), 1);
+    assert_eq!(tail[0].seq, 2);
+    assert_eq!(reader.last_seq(&run).unwrap(), 2);
+
+    writer
+        .finish_run(&run, RunStatus::Finished, "2026-09-12T14:30:00.000Z")
+        .unwrap();
+    assert_eq!(
+        reader.run(&run).unwrap().unwrap().status,
+        RunStatus::Finished
+    );
+}
+
+/// The other direction: a write that loses the race must wait for the winner,
+/// not fail. With `BUSY_TIMEOUT` at zero this is an instant `SQLITE_BUSY` and
+/// the user sees "database is locked" on a database that is merely busy —
+/// checked by hand against this test, which is how the value earns a name.
+///
+/// What it does *not* catch is deleting the `busy_timeout` call outright:
+/// rusqlite's own `Connection::open` sets 5s, so the behaviour survives. That
+/// is the point of asserting the behaviour rather than the setting — this
+/// passes whoever supplies the timeout, and fails the moment nobody does.
+///
+/// The lock is taken with a raw `BEGIN IMMEDIATE` because `EventLog` exposes
+/// no way to hold a transaction open across calls. It stands in for the
+/// in-flight `append_all` of a running run — the real collision being §8's
+/// boot reconcile, which `finish_run`s orphans while a started run appends.
+///
+/// **On the sleep:** it only widens the window in which the two overlap, and
+/// nothing is asserted about any duration. The failing direction is
+/// deterministic — a connection that will not wait fails the instant it
+/// touches the held lock, so the join below returns `Err` and the test fails.
+/// A scheduling accident can only make the test pass without having contended;
+/// it cannot make it fail spuriously, which is the tradeoff worth having when
+/// the alternative is a test that asserts on wall-clock time.
+#[test]
+fn a_write_waits_out_the_other_connections_transaction() {
+    use rusqlite::Connection;
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    let dir = tempdir();
+    let path = dir.join("log.sqlite");
+
+    let mut a = EventLog::open(&path).unwrap();
+    a.create_run(&run_row("r")).unwrap();
+    let mut b = EventLog::open(&path).unwrap();
+
+    // Hold the write lock. An empty IMMEDIATE transaction is enough: it is the
+    // lock, not the work under it, that the other connection collides with.
+    let holder = Connection::open(&path).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let gate = Arc::new(Barrier::new(2));
+    let theirs = Arc::clone(&gate);
+    let writing = std::thread::spawn(move || {
+        theirs.wait();
+        b.finish_run(
+            &RunId::from("r"),
+            RunStatus::Finished,
+            "2026-09-12T14:30:00.000Z",
+        )
+    });
+
+    gate.wait();
+    std::thread::sleep(Duration::from_millis(200));
+    holder.execute_batch("COMMIT").unwrap();
+
+    writing
+        .join()
+        .unwrap()
+        .expect("the write should have waited for the lock, not failed");
+    assert_eq!(
+        a.run(&RunId::from("r")).unwrap().unwrap().status,
+        RunStatus::Finished
+    );
+}
+
 fn tempdir() -> PathBuf {
     let p = std::env::temp_dir().join(format!(
         "event-log-test-{}-{:?}",

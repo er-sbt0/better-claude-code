@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
 use agent_protocol::{Event, RawEvent, RunId, SessionId};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -60,6 +61,35 @@ impl Health {
     }
 }
 
+/// How long a write waits for another connection's transaction before giving
+/// up with "database is locked".
+///
+/// The log is single-writer per *connection*, but the app runs two of them by
+/// design: the shell keeps one `EventLog` for the UI, and `driver::start`
+/// takes an `EventLog` **by value** — returning it only from `Session::wait()`
+/// — so a run's writer is necessarily a second connection to the same file.
+/// WAL (below) lets those two read past each other; it does not queue their
+/// writes. The collision that actually happens is §8's boot reconcile:
+/// `driver::reconcile_after_restart` writing `finish_run` for every orphan
+/// while a freshly started run does `create_run` / `append` on its own
+/// connection. With no busy handler the loser gets `SQLITE_BUSY` on its first
+/// attempt, and a database that is busy for a millisecond is reported to the
+/// user as a database that is locked.
+///
+/// **This is set explicitly even though rusqlite already does it.**
+/// `Connection::open` installs `sqlite3_busy_timeout(db, 5000)` itself
+/// (`rusqlite::inner_connection`), which is why nothing has gone wrong so far
+/// — the two-connection story has been working on a library default that is
+/// documented nowhere in this crate and that a version bump is free to drop or
+/// change. Naming the value makes it ours: if it moves, it moves here, and
+/// `tests/log.rs` fails when it is zero.
+///
+/// Five seconds, which is also what we were silently getting: three orders of
+/// magnitude above a `synchronous = FULL` commit's 1.2ms fsync, so no honest
+/// contention reaches it, and short enough that a real deadlock fails a call
+/// instead of hanging the UI behind it forever.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The append-only run event log.
 ///
 /// One database per installation. `runs` holds identity and lifecycle;
@@ -79,6 +109,11 @@ impl EventLog {
     }
 
     fn from_conn(conn: Connection) -> Result<Self> {
+        // First, so that it covers the migration below as well as every later
+        // write: `migrate` runs on whichever connection opens the file next,
+        // which may well be the second one.
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+
         // WAL so that the UI can read a run while the driver is writing it.
         //
         // `synchronous = FULL` rather than the usual NORMAL: §8 names crash
