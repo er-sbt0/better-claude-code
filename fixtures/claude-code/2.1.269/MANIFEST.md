@@ -462,19 +462,21 @@ or just take the totals from `result`.
 
 ## Not captured
 
-* **`permission.requested` via `--permission-prompt-tool`.** Needs the workspace
-  MCP server from §6, which does not exist yet. `permission-denied.ndjson`
-  captures the *deny* path via `--permission-prompts none` instead, which is the
-  same tool_result/`permission_denials` plumbing minus the round trip to the
-  host. The `system/permission_denied` shape recorded here is very likely what
-  the approve/deny outcome looks like either way, but the *request* leg is
-  unrecorded.
+* **`permission.requested` via `--permission-prompt-tool`.** Unrecorded here,
+  and now known to be **unrecordable anywhere**: the provider's permission layer
+  calls the tool itself, so the request is never a `tool_use` block and never
+  reaches stdout. `permission-denied.ndjson` captures the *deny* path via
+  `--permission-prompts none`, which is the same tool_result/`permission_denials`
+  plumbing minus the round trip to the host — that much was right. See
+  `../2.1.270/MANIFEST.md` and
+  `docs/verification/claude-code-permission-prompt-tool.md`.
 * **`workspace.report`** (§6 source 3 — `report_finding`, `open_plan`,
   `record_test_run`, `attach_artifact`, `attach_diagram`, `note_decision`).
-  Needs the same MCP server. Nothing was built to fake it. On the wire these
-  will be ordinary `assistant(tool_use:mcp__workspace__…)` /
-  `user(tool_result)` pairs, so `tool-edit.ndjson` is a structural stand-in, but
-  no real capture exists.
+  **Now recorded, in `../2.1.270/workspace-mcp.ndjson`.** The prediction below
+  held: they are ordinary `assistant(tool_use:mcp__agent-workspace__…)` /
+  `user(tool_result)` pairs. Note the server is named `agent-workspace` —
+  `workspace` is reserved by Claude Code and a config claiming it is silently
+  not loaded.
 * **`process.output` / tier 3 (PTY).** Out of scope for stream-json.
 * **Subagent traffic** (`--forward-subagent-text`, non-null
   `parent_tool_use_id`). No fixture spawns a `Task`. Worth adding next; the

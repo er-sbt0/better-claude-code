@@ -18,25 +18,64 @@ use std::path::{Path, PathBuf};
 use agent_protocol::{Event, RawEvent};
 use normalizer::{ClaudeCodeNormalizer, FixedClock};
 
-fn fixture_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/claude-code/2.1.269")
+/// The version the named regression tests below are about.
+///
+/// Those tests assert facts about *particular recorded streams* — that this
+/// `thinking` fixture has empty thinking text, that this `result` reports
+/// success on a permission-blocked turn. They are pinned deliberately: a
+/// regression test that silently followed the newest recording would stop being
+/// a regression test.
+const BASELINE: &str = "2.1.269";
+
+fn fixture_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/claude-code")
 }
 
-fn golden_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden")
+fn fixture_dir(version: &str) -> PathBuf {
+    fixture_root().join(version)
 }
 
-fn fixtures() -> Vec<(String, PathBuf)> {
-    let mut out: Vec<(String, PathBuf)> = fs::read_dir(fixture_dir())
-        .expect("fixtures/claude-code/2.1.269 is missing — see MANIFEST.md")
+fn golden_dir(version: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden")
+        .join(version)
+}
+
+/// Every recorded version, oldest first.
+///
+/// §16 keeps fixtures *per provider version* rather than replacing them,
+/// because the thing worth knowing is the diff between versions. Adding a
+/// directory here is all it takes to enrol one — and a version whose goldens
+/// are missing fails loudly rather than being skipped.
+fn versions() -> Vec<String> {
+    let mut out: Vec<String> = fs::read_dir(fixture_root())
+        .expect("fixtures/claude-code is missing — see MANIFEST.md")
         .filter_map(Result::ok)
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "ndjson"))
-        .map(|p| {
-            let name = p.file_stem().unwrap().to_string_lossy().into_owned();
-            (name, p)
-        })
+        .filter(|p| p.is_dir())
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
         .collect();
+    out.sort();
+    assert!(
+        out.contains(&BASELINE.to_owned()),
+        "the baseline set is gone"
+    );
+    out
+}
+
+/// `(version, name, path)` for every recorded stream, across every version.
+fn fixtures() -> Vec<(String, String, PathBuf)> {
+    let mut out = Vec::new();
+    for version in versions() {
+        for entry in fs::read_dir(fixture_dir(&version)).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|x| x != "ndjson") {
+                continue;
+            }
+            let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+            out.push((version.clone(), name, path));
+        }
+    }
     out.sort();
     assert!(!out.is_empty(), "no fixtures found");
     out
@@ -54,7 +93,7 @@ fn replay(path: &Path) -> (Vec<RawEvent>, normalizer::Stats) {
 }
 
 fn events_of(name: &str) -> Vec<RawEvent> {
-    replay(&fixture_dir().join(format!("{name}.ndjson"))).0
+    replay(&fixture_dir(BASELINE).join(format!("{name}.ndjson"))).0
 }
 
 fn type_counts(events: &[RawEvent]) -> BTreeMap<&'static str, usize> {
@@ -163,13 +202,13 @@ fn arg_keys(v: &serde_json::Value) -> String {
 #[test]
 fn golden_output_for_every_fixture() {
     let update = std::env::var("UPDATE_GOLDEN").is_ok();
-    fs::create_dir_all(golden_dir()).unwrap();
 
     let mut stale = Vec::new();
-    for (name, path) in fixtures() {
+    for (version, name, path) in fixtures() {
+        fs::create_dir_all(golden_dir(&version)).unwrap();
         let (events, stats) = replay(&path);
         let actual = render(&events, &stats);
-        let golden = golden_dir().join(format!("{name}.txt"));
+        let golden = golden_dir(&version).join(format!("{name}.txt"));
 
         if update {
             fs::write(&golden, &actual).unwrap();
@@ -177,10 +216,10 @@ fn golden_output_for_every_fixture() {
         }
 
         let expected = fs::read_to_string(&golden).unwrap_or_else(|_| {
-            panic!("no golden for {name}; regenerate with UPDATE_GOLDEN=1 cargo test")
+            panic!("no golden for {version}/{name}; regenerate with UPDATE_GOLDEN=1 cargo test")
         });
         if expected != actual {
-            stale.push(name);
+            stale.push(format!("{version}/{name}"));
         }
     }
 
@@ -197,7 +236,8 @@ fn golden_output_for_every_fixture() {
 /// preserved, or accounted for as transient — never silently lost.
 #[test]
 fn every_line_is_accounted_for() {
-    for (name, path) in fixtures() {
+    for (version, name, path) in fixtures() {
+        let name = format!("{version}/{name}");
         let (_, stats) = replay(&path);
         assert!(
             stats.balances(),
@@ -212,7 +252,8 @@ fn every_line_is_accounted_for() {
 
 #[test]
 fn seq_is_monotonic_and_starts_at_one() {
-    for (name, path) in fixtures() {
+    for (version, name, path) in fixtures() {
+        let name = format!("{version}/{name}");
         let (events, _) = replay(&path);
         assert!(!events.is_empty(), "{name}: produced no events");
         for (i, e) in events.iter().enumerate() {
@@ -225,7 +266,8 @@ fn seq_is_monotonic_and_starts_at_one() {
 /// The log is forever, so everything in it has to survive a round-trip (§7).
 #[test]
 fn every_event_round_trips_through_json() {
-    for (name, path) in fixtures() {
+    for (version, name, path) in fixtures() {
+        let name = format!("{version}/{name}");
         let (events, _) = replay(&path);
         for e in &events {
             let json = serde_json::to_string(e).unwrap();
@@ -239,7 +281,8 @@ fn every_event_round_trips_through_json() {
 /// Every run has exactly one start and exactly one end.
 #[test]
 fn exactly_one_run_lifecycle_per_fixture() {
-    for (name, path) in fixtures() {
+    for (version, name, path) in fixtures() {
+        let name = format!("{version}/{name}");
         let (events, _) = replay(&path);
         let counts = type_counts(&events);
         assert_eq!(
@@ -532,12 +575,25 @@ fn a_stream_that_never_starts_is_a_failure() {
 #[test]
 fn a_completion_names_the_tool_that_produced_it() {
     let mut checked = 0;
-    for (name, _) in fixtures() {
-        let events = events_of(&name);
+    for (version, name, path) in fixtures() {
+        let name = format!("{version}/{name}");
+        let (events, _) = replay(&path);
+        // Two event types open a tool call, not one. A call to our own MCP
+        // server becomes `workspace.report` *instead of* `tool.started` (§8:
+        // emitting both would make one recomputable from the other), so a map
+        // built only from `tool.started` has a hole exactly where a workspace
+        // call was — and the completion still arrives, still needing a name.
+        //
+        // `workspace.report` carries the bare tool name and the completion
+        // carries the provider's wire spelling, so the prefix goes back on here.
         let started: BTreeMap<String, String> = events
             .iter()
             .filter_map(|e| match &e.event {
                 Event::ToolStarted(p) => Some((p.tool_use_id.0.clone(), p.name.clone())),
+                Event::WorkspaceReport(p) => Some((
+                    p.tool_use_id.0.clone(),
+                    format!("{}{}", agent_protocol::WORKSPACE_TOOL_PREFIX, p.tool),
+                )),
                 _ => None,
             })
             .collect();
