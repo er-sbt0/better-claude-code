@@ -56,10 +56,19 @@ either, and §13.1's edge cases already list non-Linux platforms as an open debt
 ## Running it
 
 ```sh
+./run.sh                     # everything above, checked first (see below)
 pnpm install                 # once
 pnpm dev                     # vite on :1420, then the Tauri window
 pnpm build                   # .deb and AppImage into target/release/bundle/
 ```
+
+`./run.sh` is `pnpm install` (only when there is no `node_modules`) plus
+`pnpm dev`, with one thing in front of them: it checks every row of the two
+tables above before starting anything. That check is not ceremony. A missing
+system library does not fail at startup, it fails as a `pkg-config` error
+part-way through `cargo build`, one library at a time, several minutes in —
+which is exactly how the `libgtk-3-dev` and `libdbus-1-dev` gap above was found.
+`./run.sh --check` runs only the check; `SKIP_PREFLIGHT=1` skips it.
 
 Under it, unchanged:
 
