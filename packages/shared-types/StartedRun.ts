@@ -10,13 +10,16 @@ import type { RunId } from "./RunId";
  */
 export type StartedRun = { run_id: RunId, branch: string, 
 /**
- * `null` for a run with no worktree of its own — a fork that has not
- * written yet works in an ancestor's tree until it acquires one.
+ * The agent's cwd. Never the user's own checkout, and never absent: §13
+ * creates a run with its worktree, forks included.
  */
-worktree_path: string | null, 
+worktree_path: string, 
 /**
  * `refs/agent-workspace/runs/<id>`: what Review attributes against (§13.1).
- * `null` means there is nothing to attribute against yet, and §13.1
- * requires Review to say so rather than omit it.
+ *
+ * Always present on a run that has just started. [`Run::shadow_ref`] on the
+ * stored row is nullable for the other case — a ref that is gone — where
+ * §13.1 requires Review to report attribution as unavailable rather than
+ * omit it.
  */
-shadow_ref: string | null, started_at: string, };
+shadow_ref: string, started_at: string, };

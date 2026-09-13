@@ -192,16 +192,9 @@ fn main() {
         Ok(s) => s,
         Err(e) => return die(&format!("start: {e}")),
     };
-    // This example only ever calls `driver::start`, which always makes a tree;
-    // a treeless run comes from `driver::fork`.
-    let wt_path = match &started.tree {
-        Some(tree) => {
-            println!("worktree {}", tree.worktree.path().display());
-            println!("shadow   {}\n", tree.shadow_ref);
-            tree.worktree.path().to_path_buf()
-        }
-        None => return die("start returned a run with no worktree"),
-    };
+    println!("worktree {}", started.tree.worktree.path().display());
+    println!("shadow   {}\n", started.tree.shadow_ref);
+    let wt_path = started.tree.worktree.path().to_path_buf();
 
     for ev in rx {
         println!("{:>4}  {}", ev.seq, describe(&ev.event));

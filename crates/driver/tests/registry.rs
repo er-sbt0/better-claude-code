@@ -232,8 +232,8 @@ fn a_run_is_reaped_when_its_stream_ends() {
     assert_eq!(live.run_id, run);
     assert_eq!(live.branch, "agent/run_reap");
     assert!(
-        live.worktree_path.is_some_and(|p| p.exists()),
-        "a run started from nothing has a worktree (§13); only a fork lacks one"
+        live.worktree_path.exists(),
+        "a run is created with its worktree (§13), forks included"
     );
 
     // The tail events a process exit produces reach the callback, not only the

@@ -10,6 +10,12 @@ toggle in its own title bar. That toggle is the question it was built to ask.
 Decided: 2026-09-13 · supersedes parts of §10 and §19. Every contradiction is
 listed under "What this overturns" with the new information that earned it,
 because §8's table says decisions are not relitigated without any.
+
+Amended 2026-09-13, on the commit that built the fork path: the Filesystem row
+reversed. Building it produced the new information, which is the only thing that
+lets a record contradict itself. The reversal is argued under "What this
+overturns"; the prose it replaced is described there rather than deleted
+silently, because the wrong version is the one that will be re-proposed.
 -->
 
 # The branching surface — what the run graph actually is
@@ -28,7 +34,7 @@ answers move two things the design had written down.
 | **The view** | Two representations of one canvas. `focus` is the default; ⌘\ pulls back to `map`, where columns re-render as §10's shape cards. |
 | **Fork motion** | **B — split in place.** The child starts translated onto the parent at `scale(.88)` and peels out of it while the camera fits both. ~900ms. |
 | **Fork anchor** | A message, and only where a provider chain entry actually resolves. No snapping to a nearby address. |
-| **Filesystem** | Lazy. The fork spawns a session with no git work; the worktree materializes on the child's first mutating tool call. |
+| **Filesystem** | **Eager.** The fork is created with its worktree, checked out from the parent's shadow commit at the branch-point `seq`. Reversed from "lazy" once it was built — see "What this overturns". |
 | **The feed** | §7's six block types plus `Raw`, virtualized, `(runId, seqRange)` on every block. `EventStream.tsx` is replaced, as its own comment demands. |
 | **Fork config** | Immediate. Inherit the parent's model and role; edit the header afterwards. |
 
@@ -136,10 +142,10 @@ Three things the spike did not prove, and none of them blocks the fork path:
 - **Concurrency**, still, and for the fourth time. Every run in the spike was
   sequential.
 
-## The worktree arrives late
+## The worktree is forked with the conversation
 
-The first version of this argument was wrong and is worth recording as wrong,
-because it is the intuitive version and it will be re-proposed.
+Two intuitions about this are wrong, and both are worth recording as wrong,
+because both will be re-proposed.
 
 **Wrong:** two `claude` processes in one directory corrupt each other's work.
 They do not. Disjoint files are fine, Claude Code requires a Read before an Edit
@@ -156,61 +162,111 @@ Nothing filters by who wrote the bytes, and nothing can: git sees a tree, not an
 author. (`Ingested::snapshot_covers` already reports when one snapshot stood for
 several completions, so a snapshot standing for more than its `Cause` says is an
 existing condition — but within one run, where the extra causes are at least the
-same run's.) Two runs
-in one tree means run A's shadow commit absorbs whatever B changed during the
-window, recorded as caused by A's edit. §13.1 blames against that ref, so Review
-attaches A's reasoning to B's hunk. That is deterministic, not racy, and it
-contaminates the **trunk** as much as the fork — a child writing while the parent
-snapshots poisons the parent's history.
+same run's.) Two runs in one tree means run A's shadow commit absorbs whatever B
+changed during the window, recorded as caused by A's edit. §13.1 blames against
+that ref, so Review attaches A's reasoning to B's hunk. That is deterministic,
+not racy, and it contaminates the **trunk** as much as the fork — a child writing
+while the parent snapshots poisons the parent's history.
 
-So the tree is what a run needs in order to *write*, not what a fork needs in
-order to *exist*. Splitting those:
+That analysis is unchanged and it is the reason a fork cannot share its parent's
+tree. What changed is what follows from it. It was read as *the tree is what a
+run needs in order to write, not what a fork needs in order to exist*, and
+therefore as a licence to defer the tree to the child's first mutating tool
+call. Building that produced the second wrong intuition:
+
+**Wrong:** a worktree created later can be the tree a running child writes into.
+It cannot. **A process's cwd is fixed at spawn.** A treeless child starts in some
+ancestor's worktree, and by the time it asks to write it has already read files
+and computed absolute paths under that root. Holding its first `Edit` at the
+permission boundary, making the worktree and letting the call through writes into
+the ancestor's tree anyway: the new tree materializes correctly and stays empty
+of the run's work. There is no gate that fixes this, because the gate fires after
+the decision it would have to change.
+
+And the wart the lazy design recorded as tolerable is not. A treeless child reads
+its **ancestor's tree now**, not the tree at the branch point — and "now" is a
+moving target in exactly the case this surface exists for. `by-package` mid-edit
+while `big-bang` waits is two live descendants of one trunk; a child forked at an
+early `seq` greps files the branch point never saw. Reading ahead of the branch
+point was priced as a cosmetic loss. For a fork whose whole claim is *this
+conversation, from here*, it is the product.
+
+So the tree is forked with the conversation, at the same `seq`:
 
 ```
-⌘⇧F  ──▶  --fork-session --session-id <ours>     no git, column appears at once
-           │
-           │  reads, greps, reasons               still no worktree
-           │
-           │  first Edit / Write / Bash
+⌘⇧F  ──▶  ShadowHistory::commit_at(branch-point seq)
+           │      the newest snapshot at or before it -- and `seq` 0, the
+           │      tree as the agent found it, when there is none before
            ▼
-          worktree from the parent's shadow commit at the fork seq
-          └──▶ writes isolated, attribution clean, Review has an input
+          worktree add -b agent/<child> <that commit>
+           │      own branch, own tree, own refs/agent-workspace/runs/<child>
+           ▼
+          --fork-session --session-id <ours> --resume-session-at <uuid>
+                  cwd is the child's own tree from its first syscall
 ```
 
-Forking to think is free, which is the behavior the thesis wants to encourage and
-which an eager worktree taxes on every branch. Forking to work is isolated
-exactly as §13 intends. `driver::start` — today one unit that creates the tree,
-roots the shadow history, records the run and spawns — splits into a spawn and an
-ensure-tree.
+Forking to think is no longer free; it costs a `worktree add`. That price was
+argued against and the argument was right about the price and wrong about what it
+was buying. `driver::start`'s git half is still split out as `ensure_tree` — not
+so a run can skip it, but because a fork's `base` is the one thing `start` could
+never compute.
 
 Two consequences, neither of them free:
 
-- **A fork that never writes has no worktree and no shadow ref.** Review must
-  report attribution as unavailable for it. §13.1 already requires that behavior
-  for a missing ref, so this is a new path into an existing branch rather than a
-  new state — but the path is new and nothing exercises it.
-- **`runs.worktree_path` is nullable already** (`event-log/src/schema.rs:44`), so
-  the record survives without a migration. The comment above it
-  (`schema.rs:42`) — "a run is created *with* its worktree, so cwd is never the
-  user's own checkout" — no longer describes the fork case and needs amending. The *invariant* it protects
-  still holds: a run that writes never writes into the user's checkout.
+- **A parent with no shadow ref cannot be forked.** There is no tree to place the
+  child in, and both available substitutes are wrong in the same direction: the
+  repository's `HEAD` is a tree the conversation never saw, and the parent's
+  worktree *now* is the tree this section just rejected. `driver::fork` refuses,
+  loudly.
+- **`runs.worktree_path` and `runs.shadow_ref` stay nullable**
+  (`event-log/src/schema.rs:51`), and not because a run might start without
+  them. A worktree can be removed after the fact — §13 makes cleanup ordinary —
+  while the run and its history survive, and §13.1 requires that state to be
+  representable so Review can report attribution as *unavailable* rather than
+  omit it. The comment above the column (`schema.rs:45`) now says both: what the
+  invariant is, and why the column contradicts it in shape.
 
 ## What this overturns
 
-Three recorded positions move. §8's table forbids relitigating a decision without
-new information, so each is paired with the information.
+§8's table forbids relitigating a decision without new information, so each
+position that moves is paired with the information that moved it — **including
+one of this record's own**, which is what the third entry is.
 
 1. **§10: "expanding is a deliberate act, not the default state."**
    New information: the node acquired a composer, and fork is anchored to a
    message. The default state must therefore show messages. §10's shape survives
    as map view.
-2. **§13 / `driver/src/lib.rs:6`: "a run is created *with* its worktree."**
-   New information: the cost of an eager tree is paid by every fork, and the
-   benefit it buys — clean shadow attribution — is only owed once a run writes.
-   Now: a run that *writes* is created with its worktree.
-3. **§19: "each fork pairs with a worktree forked at the same `seq`."**
-   New information: none, and this one is not really overturned. Same `seq`,
-   later moment. Recorded only so the wording does not read as violated.
+2. **§19: "each fork pairs with a worktree forked at the same `seq`."**
+   New information: none, and this was never really overturned. It is now
+   implemented exactly as written — `ShadowHistory::commit_at` resolves the
+   `seq`, `driver::fork` checks the child out from it — and the entry stays only
+   because the version below briefly made it "same `seq`, later moment".
+3. **This record's own: "a run that *writes* is created with its worktree."**
+   ~~§13 / `driver/src/lib.rs:6`: "a run is created *with* its worktree"~~ was
+   overturned above on the grounds that an eager tree is a cost every fork pays
+   for a benefit only a writing run collects. **Reinstated, unconditionally.**
+   The new information is what building the fork path turned up, and it is
+   correctness where the original argument was cost:
+
+   - **A process's cwd is fixed at spawn.** The lazy design spawned the child in
+     its nearest ancestor's worktree and planned to make the real tree at the
+     permission boundary, on the first `Edit`/`Write`/`Bash`. A tree made then
+     redirects nothing — the child has already computed absolute paths under the
+     old root — so the write lands in the ancestor's tree and the new tree is
+     correct and empty. The gate fires after the decision it would have to
+     change, which means no gate works.
+   - **A treeless child reads the wrong tree.** "The parent's tree *now*, not at
+     the branch point" was recorded above as one tolerable wart. It is not
+     tolerable for the central case: fork mid-conversation, or leave the parent
+     running — this record's own image, `by-package` mid-edit while `big-bang`
+     waits — and the child greps files the branch point never saw.
+   - **It was live.** As shipped, a `Permission::Mode` fork had no gate at all
+     and would write into its ancestor's worktree, unattributed and silent,
+     because a treeless run's `Pipeline` carries no `ShadowHistory`.
+
+   The cost argument survives intact and is simply outranked: forking to think
+   now costs a `worktree add`, and that is the price of a fork that is about the
+   conversation it claims to be about.
 
 ## What this does not decide
 
@@ -225,8 +281,9 @@ new information, so each is paired with the information.
 - **Concurrent forks**, still. The roadmap has carried this as an open unknown
   since the fork spike ran its branches sequentially, and the prototype's central
   image — `by-package` mid-edit while `big-bang` waits on a permission decision —
-  is precisely two live descendants of one trunk. Lazy worktrees make the
-  filesystem side of it safe; they say nothing about whether the provider
+  is precisely two live descendants of one trunk. A worktree per fork makes the
+  filesystem side of it safe — that is what §13 buys, and it is now bought at the
+  fork rather than deferred — and says nothing about whether the provider
   tolerates it.
 - **How many feeds are live at once.** The prototype keeps every column mounted
   and dims the unfocused ones to opacity .2. With §7's virtualized feed inside
@@ -244,12 +301,13 @@ new information, so each is paired with the information.
 ## Sequencing
 
 **A vertical slice, fork first.** One fork working end to end — ⌘⇧F, forked
-session, branch `seq` stored, child column, anchored edge, lazy tree on first
-write — against a deliberately thin feed. Then §7's six blocks widen underneath
-it.
+session, branch `seq` stored, child column, anchored edge, worktree forked at the
+same `seq` — against a deliberately thin feed. Then §7's six blocks widen
+underneath it.
 
-The order is not arbitrary. All three overturned positions live on the fork path,
-which makes it the part most likely to be wrong; and the feed is the largest
+The order is not arbitrary. Every overturned position lives on the fork path,
+which makes it the part most likely to be wrong — and one of them turned out to
+be, which is entry 3 above; and the feed is the largest
 single piece of work in V1's UI, which makes it the worst thing to build against
 a guess. Built second, it is built against `(runId, seqRange)` addresses that a
 working fork is already resolving against for real.

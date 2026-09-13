@@ -140,6 +140,71 @@ impl ShadowHistory {
         }
     }
 
+    /// Whether there is a history here to attribute against at all.
+    ///
+    /// §13.1's answer for a run whose ref is missing or has been removed is
+    /// *attribution unavailable*, and a caller can only say that if it can ask.
+    /// The question exists as its own method because the two ways of getting it
+    /// wrong both look like working software: treating an empty
+    /// [`ShadowHistory::attribute`] result as "nothing to attribute" conflates a
+    /// file this run never touched with a history that is gone, and treating the
+    /// error [`ShadowHistory::attribute`] raises on a missing ref as a git
+    /// failure reports a bug where there is only a cleaned-up run.
+    pub fn is_available(&self) -> Result<bool> {
+        Ok(self.tip()?.is_some())
+    }
+
+    /// The snapshot this history stood at when the parent's log reached `seq`.
+    ///
+    /// The newest commit whose `seq` trailer is **at or before** `seq`, which is
+    /// what makes this a usable branch point rather than a lookup that mostly
+    /// misses. Snapshots are taken after every completed tool call but
+    /// [`ShadowHistory::snapshot`] commits nothing when the tree is unchanged,
+    /// so most `seq` values have no commit of their own; an exact match would
+    /// answer `None` for almost every block a user can click on. At or before is
+    /// also the *correct* answer and not merely the available one — the tree did
+    /// not change between the last snapshot and `seq`, which is precisely why
+    /// there is no commit in between.
+    ///
+    /// A `seq` before the run's first snapshot therefore resolves to the root
+    /// commit, which the driver roots at `seq` 0 after §13's post-create hook:
+    /// the tree as the agent found it. That falls out of the `<=` rule rather
+    /// than being special-cased, which is the point — there is no boundary to
+    /// get wrong.
+    ///
+    /// `None` means this run has no history to fork from at all. It is not the
+    /// same answer as "nothing had happened yet by then", and a caller that
+    /// treats it as one will silently branch from somewhere else.
+    pub fn commit_at(&self, seq: u64) -> Result<Option<String>> {
+        if self.tip()?.is_none() {
+            return Ok(None);
+        }
+        // The history is linear and `seq` rises along it, so `git log`'s
+        // newest-first walk is a descending scan and the first hit is the
+        // answer.
+        let out = git(
+            &self.worktree,
+            [
+                "log",
+                "--format=%H%x09%(trailers:key=seq,valueonly,separator=)",
+                &self.ref_name,
+            ],
+        )?;
+        for line in out.lines() {
+            let (id, trailer) = line
+                .split_once('\t')
+                .ok_or_else(|| Error::BadTrailer(line.to_owned()))?;
+            let trailer = trailer.trim();
+            let at: u64 = trailer
+                .parse()
+                .map_err(|_| Error::BadTrailer(trailer.to_owned()))?;
+            if at <= seq {
+                return Ok(Some(id.to_owned()));
+            }
+        }
+        Ok(None)
+    }
+
     /// Snapshot the worktree after a tool call.
     ///
     /// Returns `None` when the tool changed nothing, which is the common case —

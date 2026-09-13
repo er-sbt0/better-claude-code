@@ -42,8 +42,12 @@ CREATE TABLE runs (
     -- resume; we never claim to be able to rebuild the session ourselves.
     provider_session_id TEXT,
     workspace_path      TEXT NOT NULL,
-    -- §13: a run is created *with* its worktree, so cwd is never the user's own
-    -- checkout.
+    -- §13: a run is created *with* its worktree — forks included, since a
+    -- process's cwd is fixed at spawn — so cwd is never the user's own
+    -- checkout. Nullable anyway, and not by oversight: a worktree can be
+    -- removed after the run ends (§13 makes cleanup ordinary) while the run
+    -- and its shadow ref survive, and §13.1 needs that state representable so
+    -- Review can say attribution is unavailable rather than silently omit it.
     worktree_path       TEXT,
     branch              TEXT,
     -- §13.1: refs/agent-workspace/runs/<id>. Review's attribution is blame

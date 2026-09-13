@@ -393,3 +393,143 @@ fn a_run_that_changes_nothing_has_only_its_root() {
         "1"
     );
 }
+
+/// The lookup a fork is built on: the parent's tree as it stood at a `seq`.
+///
+/// The `<=` rule is the whole of it. §13.1 never commits an unchanged tree, so
+/// most `seq` values have no commit of their own and an exact match would answer
+/// `None` for almost every block a user can click on — while the tree at those
+/// values is, precisely because nothing was committed, the one the last snapshot
+/// holds.
+#[test]
+fn the_commit_at_a_seq_is_the_newest_snapshot_at_or_before_it() {
+    let f = Fixture::new("commit-at");
+    let run = RunId::from("run_5");
+    let wt = Worktree::create(&f.repo, &run, "run/5", "HEAD").unwrap();
+    let w = wt.path().to_path_buf();
+
+    // The post-create hook, then the root: `seq` 0 is the tree as the agent
+    // found it, hook output included.
+    write(&w, ".cache/build-info", "hook\n");
+    let (mut shadow, root) = ShadowHistory::begin(&wt, &run, 0).unwrap();
+
+    // A branch point *before the first snapshot* resolves to the root. Not a
+    // special case in the implementation and not one here either: 0 <= n for
+    // every n, so the root answers for everything until something else commits.
+    for seq in [0, 1, 3, 7] {
+        assert_eq!(
+            shadow.commit_at(seq).unwrap().as_deref(),
+            Some(root.id.as_str()),
+            "seq {seq} is before the run's first snapshot, so the tree is as the \
+             agent found it"
+        );
+    }
+
+    append(&w, "src/auth.ts", "// eight\n");
+    let eight = shadow
+        .snapshot(&Cause::tool(8, "Edit", "toolu_01"))
+        .unwrap()
+        .expect("a changed tree commits");
+    append(&w, "src/auth.ts", "// twenty\n");
+    let twenty = shadow
+        .snapshot(&Cause::tool(20, "Edit", "toolu_02"))
+        .unwrap()
+        .expect("a changed tree commits");
+
+    // A read between the two writes changed nothing, so it has no commit -- and
+    // the answer for its `seq` is the snapshot before it rather than nothing.
+    assert_eq!(
+        shadow
+            .snapshot(&Cause::tool(14, "Read", "toolu_03"))
+            .unwrap(),
+        None
+    );
+
+    assert_eq!(
+        shadow.commit_at(7).unwrap().as_deref(),
+        Some(root.id.as_str())
+    );
+    assert_eq!(
+        shadow.commit_at(8).unwrap().as_deref(),
+        Some(eight.id.as_str())
+    );
+    for seq in [9, 14, 19] {
+        assert_eq!(
+            shadow.commit_at(seq).unwrap().as_deref(),
+            Some(eight.id.as_str()),
+            "seq {seq} has no snapshot of its own, so the tree is the one seq 8 left"
+        );
+    }
+    assert_eq!(
+        shadow.commit_at(20).unwrap().as_deref(),
+        Some(twenty.id.as_str())
+    );
+    assert_eq!(
+        shadow.commit_at(9_999).unwrap().as_deref(),
+        Some(twenty.id.as_str()),
+        "past the tip is the tip, not an error"
+    );
+
+    // And the commits actually carry the content their `seq` claims, which is
+    // what a fork checked out from one of them depends on.
+    assert!(!shadow
+        .tree_at(&root.id, "src/auth.ts")
+        .unwrap()
+        .contains("eight"));
+    assert!(shadow
+        .tree_at(&eight.id, "src/auth.ts")
+        .unwrap()
+        .contains("eight"));
+    assert!(!shadow
+        .tree_at(&eight.id, "src/auth.ts")
+        .unwrap()
+        .contains("twenty"));
+    assert!(shadow
+        .tree_at(&twenty.id, "src/auth.ts")
+        .unwrap()
+        .contains("twenty"));
+}
+
+/// §13.1: a run whose shadow ref is gone reports attribution as *unavailable*,
+/// which is a different answer from "this file has nothing attributed".
+///
+/// The distinction is the test. A Review that reads an empty result as "no
+/// attribution here" will look correct on every run anyone tries it on, because
+/// the runs anyone tries it on still have their refs.
+#[test]
+fn a_run_whose_shadow_ref_is_gone_is_unavailable_not_empty() {
+    let f = Fixture::new("unavailable");
+    let run = RunId::from("run_6");
+    let wt = Worktree::create(&f.repo, &run, "run/6", "HEAD").unwrap();
+    let (mut shadow, _) = ShadowHistory::begin(&wt, &run, 0).unwrap();
+    append(wt.path(), "src/auth.ts", "// edited by the agent\n");
+    shadow
+        .snapshot(&Cause::tool(4, "Edit", "toolu_01"))
+        .unwrap();
+
+    assert!(shadow.is_available().unwrap());
+    assert!(!shadow.attribute("src/auth.ts").unwrap().is_empty());
+    assert_eq!(shadow.commit_at(4).unwrap(), shadow.tip().unwrap());
+
+    // The run is cleaned up: worktree gone, ref gone. The row in the log still
+    // points at both.
+    let ref_name = shadow.ref_name().to_owned();
+    git(&f.repo, &["update-ref", "-d", &ref_name]);
+
+    let orphan = ShadowHistory::open(&wt, &run).unwrap();
+    assert!(
+        !orphan.is_available().unwrap(),
+        "a missing ref is the state Review has to report, so it has to be askable"
+    );
+    assert_eq!(
+        orphan.commit_at(4).unwrap(),
+        None,
+        "there is no tree to fork from either, and that is not `seq` 0"
+    );
+    assert!(
+        orphan.attribute("src/auth.ts").is_err(),
+        "attribution against a ref that is gone must fail rather than come back \
+         empty, which would read as `nothing here was written by this run`"
+    );
+    assert!(orphan.removed_at("src/auth.ts", "agent").is_err());
+}

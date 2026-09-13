@@ -60,14 +60,14 @@ pub struct Live {
     pub branch: String,
     /// The agent's cwd, which is never the user's own checkout (§13).
     ///
-    /// `None` for a run that has no worktree of its own — a fork that has not
-    /// written. It works in an ancestor's tree until it acquires one, so this
-    /// is "the tree this run owns", not "where the process is".
-    pub worktree_path: Option<PathBuf>,
+    /// Not an `Option`: a run has its tree before it has a process, because a
+    /// cwd cannot be changed afterwards. `runs.worktree_path` is nullable for a
+    /// different question — a tree removed after the fact — which this type,
+    /// describing a run that has just started, cannot be in.
+    pub worktree_path: PathBuf,
     /// `refs/agent-workspace/runs/<id>` — what Review attributes against
-    /// (§13.1). `None` means there is nothing to attribute against yet and
-    /// Review must say so rather than omit it.
-    pub shadow_ref: Option<String>,
+    /// (§13.1).
+    pub shadow_ref: String,
     /// The timestamp the run row carries, taken from this registry's clock.
     pub started_at: String,
 }
@@ -162,11 +162,8 @@ impl Registry {
         let live = Live {
             run_id: run_id.clone(),
             branch,
-            worktree_path: started
-                .tree
-                .as_ref()
-                .map(|t| t.worktree.path().to_path_buf()),
-            shadow_ref: started.tree.map(|t| t.shadow_ref),
+            worktree_path: started.tree.worktree.path().to_path_buf(),
+            shadow_ref: started.tree.shadow_ref,
             started_at,
         };
 

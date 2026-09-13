@@ -3,14 +3,16 @@
 //! It owns the four things only the component that launches the process can
 //! own, and each of them is a rule from the design rather than a convenience:
 //!
-//! - **A run that *writes* is created with its worktree** (§13). The user's own
-//!   checkout is never an agent's working directory, and nothing an agent
-//!   writes lands outside the tree its own run owns. The rule used to read "the
-//!   worktree comes first"; `docs/branching-surface.md` overturned that wording
-//!   and left the invariant standing, because the tree buys clean shadow
-//!   attribution (§13.1) and that is only owed once a run writes. [`start`]
-//!   still makes the tree up front. [`fork`] makes none at all, and
-//!   [`ensure_tree`] is the seam a treeless run acquires one through.
+//! - **A run is created *with* its worktree** (§13). Unconditionally, forks
+//!   included. The user's own checkout is never an agent's working directory,
+//!   and nothing an agent writes lands outside the tree its own run owns.
+//!   `docs/branching-surface.md` briefly made this conditional — a tree only
+//!   once a run writes — and reversed itself: a process's cwd is fixed at
+//!   spawn, so a tree created later cannot redirect writes that are already
+//!   addressed at the old root. What distinguishes a fork is not *whether* it
+//!   has a tree but *what that tree is based on*: [`start`] branches from
+//!   whatever the caller chose, [`fork`] from the parent's shadow commit at the
+//!   branch point. [`ensure_tree`] is the one seam both go through.
 //! - **The shadow history is rooted after the post-create hook and before the
 //!   first tool call** (§13.1). Any earlier and every file the hook wrote is
 //!   attributed to the run's first `Edit`.
@@ -46,7 +48,7 @@ use std::sync::{Arc, Mutex};
 
 use agent_protocol::{RawEvent, RunId};
 use event_log::{EventLog, Run, RunStatus};
-use worktree::{ShadowHistory, Worktree};
+use worktree::{shadow_ref, ShadowHistory, Worktree};
 
 pub use error::{Error, Result};
 pub use launch::{new_run_id, new_session_id, user_message, LaunchSpec, Permission, Thinking};
@@ -103,12 +105,28 @@ impl RunSpec {
 }
 
 /// Everything needed to fork a run, above the launch flags.
+///
+/// Note what is *not* here: a `repo` and a `base`. Both are read off the parent
+/// — the repository because a fork works on the same one by definition, and the
+/// base because it is the parent's shadow commit at [`ForkPoint::seq`], which
+/// only the parent's history knows.
 #[derive(Debug, Clone)]
 pub struct ForkSpec {
     /// The child's run id. Ours, like every run id (§14).
     pub run_id: RunId,
     /// Where the branch is anchored, resolved by [`ForkPoint::resolve`].
     pub at: ForkPoint,
+    /// The child's own git branch. A fork does not share the parent's: two
+    /// worktrees cannot check out one branch, and §13.1's history is per run.
+    pub branch: String,
+    /// §13's post-create hook, for the child's tree.
+    ///
+    /// Left to the caller rather than inherited, and worth a thought either way:
+    /// a shadow commit respects `.gitignore`, so the parent's `node_modules` and
+    /// build output are *not* in the tree the child is checked out from even
+    /// though the parent has them on disk. A fork of a real project usually
+    /// wants the hook to run again.
+    pub post_create_hook: Option<Vec<String>>,
     pub prompt: String,
     /// Launch flags. `cwd`, `resume` and `fork_at` are overwritten by [`fork`]
     /// — the first because §13 does not leave a working directory to the
@@ -224,19 +242,16 @@ pub fn default_runtime_dir() -> PathBuf {
         .join("agent-workspace")
 }
 
-/// A started run: the live process, and the git half of it if it has one yet.
+/// A started run: the live process, and the git half of it.
+///
+/// Not an `Option`, and that is the invariant made structural: every run this
+/// crate starts has a tree before its process exists, because a cwd cannot be
+/// changed afterwards. `runs.worktree_path` and `runs.shadow_ref` are still
+/// nullable, for the different question of a run whose tree was cleaned up
+/// later — see [`event_log::Run::shadow_ref`].
 pub struct Started {
     pub session: Session,
-    /// `None` for a [`fork`] that has not written anything: it has no worktree
-    /// and no shadow ref, and acquires neither until [`ensure_tree`] is called
-    /// on its first mutating tool call.
-    ///
-    /// An `Option` rather than a placeholder path and an empty string, because
-    /// §13.1 requires Review to *say* attribution is unavailable for such a
-    /// run, and it can only say that if the absence survives being written
-    /// down. A fake path would be indistinguishable from a real one exactly
-    /// where it matters.
-    pub tree: Option<StartedTree>,
+    pub tree: StartedTree,
 }
 
 /// Where a started run's git state landed.
@@ -250,9 +265,9 @@ pub struct StartedTree {
 /// Everything [`ensure_tree`] needs: what a run is about git, and nothing about
 /// a process.
 ///
-/// Separate from [`RunSpec`] because the two halves are no longer made at the
-/// same moment. A forked run is spawned now and given a tree later, and the
-/// later caller has a run row and a branch point rather than a `RunSpec`.
+/// Separate from [`RunSpec`] because two different specs reach it. A root run
+/// arrives with a `base` the caller chose; a fork arrives with one only the
+/// parent's shadow history could compute, and carries no [`RunSpec`] at all.
 #[derive(Debug, Clone)]
 pub struct TreeSpec {
     pub run_id: RunId,
@@ -260,8 +275,7 @@ pub struct TreeSpec {
     pub repo: PathBuf,
     pub branch: String,
     /// Commit-ish the worktree branches from. For a root run, whatever the user
-    /// chose; for a fork acquiring its tree late, the parent's shadow commit at
-    /// the branch point (§19).
+    /// chose; for a fork, the parent's shadow commit at the branch point (§19).
     pub base: String,
     pub post_create_hook: Option<Vec<String>>,
 }
@@ -282,11 +296,11 @@ pub struct Tree {
 /// event is appended, because the log refuses events for a run it does not
 /// know.
 ///
-/// What the split buys is that the second half can run without the first.
-/// [`fork`] calls only [`spawn_run`], so a fork costs no git at all, and a
-/// forked run calls [`ensure_tree`] later — on its first mutating tool call —
-/// with a `base` it could not have known here. See `docs/branching-surface.md`,
-/// "The worktree arrives late".
+/// What the split buys is a second caller for each half. [`fork`] runs the same
+/// two steps in the same order; what it supplies in between is a `base` that
+/// only the parent's shadow history can compute. The split is therefore about
+/// *where the base comes from*, not about deferring the tree — deferring it was
+/// tried and does not work, for the reason in [`fork`].
 pub fn start(
     log: EventLog,
     mut spec: RunSpec,
@@ -333,21 +347,20 @@ pub fn start(
 
     Ok(Started {
         session,
-        tree: Some(StartedTree {
+        tree: StartedTree {
             worktree: tree.worktree,
             shadow_ref,
-        }),
+        },
     })
 }
 
 /// The git half of starting a run: worktree, post-create hook, shadow root.
 ///
-/// This is a seam, not a step. [`start`] calls it first and always; [`fork`]
-/// never calls it, and a forked run calls it the first time it is about to
-/// write — which is the whole of `branching-surface.md`'s "the worktree arrives
-/// late". Keeping the three operations in one function rather than three calls
-/// at each site is deliberate, because their order is load-bearing and only one
-/// of the two orderings is obvious:
+/// This is a seam, not a step: [`start`] and [`fork`] both call it first and
+/// always, and differ only in the `base` they hand it. Keeping the three
+/// operations in one function rather than three calls at each site is
+/// deliberate, because their order is load-bearing and only one of the two
+/// orderings is obvious:
 ///
 /// - The **hook runs before the shadow root**. [`SEQ_BEFORE_RUN`] labels the
 ///   root "the worktree as the agent found it", and the agent finds it after
@@ -373,58 +386,59 @@ pub fn ensure_tree(spec: &TreeSpec) -> Result<Tree> {
     Ok(Tree { worktree, shadow })
 }
 
-/// Fork a run: a new session branched at a message, and **no git work at all**.
+/// Fork a run: a new session branched at a message, in a worktree branched at
+/// the same moment.
 ///
 /// `--fork-session`, a `--session-id` we assign like every other run's (§14),
 /// and a `--resume-session-at` resolved from the parent's own log
 /// ([`ForkPoint::resolve`]). The child's row carries both halves of the graph
 /// edge — `parent_run_id` and `branch_point_seq`, which the provider records
-/// nowhere and which cannot be reconstructed later — and carries **no**
-/// `worktree_path` and **no** `shadow_ref`, because it has neither yet.
+/// nowhere and which cannot be reconstructed later — and, like every other
+/// run's row, a `worktree_path`, a `branch` and a `shadow_ref` of its own.
 ///
-/// # Where a treeless fork works
+/// # The tree, and why it is made here rather than on the first write
 ///
-/// The child's cwd is the **nearest ancestor's worktree**: its parent's, or
-/// that run's parent's, up the chain to a root run, which always has one. Never
-/// the user's own checkout, and never an empty directory.
+/// The child's `base` is the parent's shadow commit at [`ForkPoint::seq`]
+/// ([`ShadowHistory::commit_at`]): the newest snapshot at or before the branch
+/// point, which for a branch point before the parent's first snapshot is the
+/// root commit — the tree as the parent's agent found it. §19's "each fork pairs
+/// with a worktree forked at the same `seq`" is that sentence, and this is where
+/// the pairing is made.
 ///
-/// §13's invariant, as `branching-surface.md` restates it, is that *a run that
-/// writes never writes into the user's checkout*. A fork that has only read is
-/// not violating it even if the user's checkout is its cwd — but that makes the
-/// invariant conditional on a gate, and an invariant that holds only while
-/// something else works is one nobody can check. The ancestor's worktree keeps
-/// it unconditional: no run of ours ever has the user's checkout as its cwd,
-/// which is exactly what [`LaunchSpec::cwd`] has claimed since §13.
+/// `branching-surface.md` decided the opposite for one commit — spawn now, make
+/// the tree on the child's first mutating tool call — and this reverses it. Two
+/// things kill the lazy version, and both are about the moment of `spawn`:
 ///
-/// It is also the right content. A fork of a conversation is a fork of what
-/// that conversation was looking at, so the parent's tree is the one where the
-/// child's `Read`s and `Grep`s find what its inherited context refers to. One
-/// wart, recorded rather than hidden: that is the parent's tree *now*, not at
-/// the branch point, so a child forked at an early `seq` can read a file the
-/// parent has since changed. Reading ahead of the branch point is tolerable.
-/// Writing from there is not, which is the next paragraph.
+/// - **A process's cwd is fixed at spawn.** A treeless child would start in
+///   some ancestor's worktree, and by the time it asks to write it has already
+///   computed absolute paths under that root. Making a worktree at that point
+///   redirects nothing: the write lands in the ancestor's tree and the new tree
+///   is correct and empty. There is no gate that fixes this, because the gate
+///   fires after the decision it would have to change.
+/// - **A treeless child reads the wrong tree.** An ancestor's worktree is that
+///   run's tree *now*, not at the branch point — and "now" is a moving target
+///   precisely in the case the surface is built for, a parent left running while
+///   a child explores. The child would grep files the branch point never saw.
 ///
-/// # What stops a write from the wrong cwd
+/// The cost the lazy version was buying — a fork that only thinks pays for no
+/// git — was real. It was priced against corruption, and this is correctness.
 ///
-/// Not this function, deliberately — the stop belongs at the moment the answer
-/// changes rather than at the moment the question is asked. The tree has to
-/// exist *before* the first mutating tool call runs, not after, so the
-/// permission boundary is the hook: hold the child's first `Edit`/`Write`/
-/// `Bash`, call [`ensure_tree`] with the parent's shadow commit at
-/// [`ForkPoint::seq`] as its `base`, install the [`ShadowHistory`] on the
-/// pipeline, and only then let the call through.
+/// # What a fork does not inherit
 ///
-/// Until that exists, a treeless fork is only honest under a posture that
-/// cannot approve a mutating tool without us: [`Permission::DenyPrompts`],
-/// which denies anything that would prompt, or [`Permission::AskVia`], which is
-/// that hook. A [`Permission::Mode`] fork has no gate at all and will write
-/// into its ancestor's worktree.
+/// Its branch and its shadow ref are its own, from [`ForkSpec::branch`] and
+/// [`shadow_ref`](ShadowHistory::ref_name). Sharing either would mean two
+/// worktrees on one branch, which git refuses, and two runs writing one
+/// attribution history, which nothing refuses and which
+/// `branching-surface.md`'s reading of `pipeline.rs` shows would mis-attribute
+/// the *parent's* hunks as well as the child's.
 ///
-/// The second consequence is quieter and is the reason the first is a
-/// correctness requirement rather than tidiness: a treeless run's [`Pipeline`]
-/// has no [`ShadowHistory`], so nothing it writes is snapshotted. Its edits
-/// would not merely land in the wrong tree — they would land unattributed, and
-/// §13.1 has no way to notice afterwards.
+/// # A parent with no shadow ref cannot be forked
+///
+/// Refused, loudly, rather than quietly substituted for. The two available
+/// substitutes are both wrong in the same direction: the repository's `HEAD` is
+/// a tree the conversation never saw, and the parent's worktree *now* is the
+/// tree the lazy design was rejected for handing over. A fork whose content
+/// cannot be placed at the branch point is not a fork.
 ///
 /// # A refused fork is a finished process, not a failed spawn
 ///
@@ -459,10 +473,24 @@ pub fn fork(
         });
     };
 
-    // See "Where a treeless fork works" above. Resolved before anything is
-    // written down, because a fork we cannot place is a fork we must refuse
+    // Everything that can refuse the fork refuses it here, before a worktree
+    // exists or a row is written: a fork we cannot place is one we must refuse
     // rather than place badly.
-    spec.launch.cwd = inherited_cwd(&log, &parent)?;
+    let base = branch_point_commit(&parent, spec.at.seq)?;
+
+    let tree = ensure_tree(&TreeSpec {
+        run_id: spec.run_id.clone(),
+        // The same repository, necessarily: a fork of a conversation about this
+        // checkout is a fork about this checkout.
+        repo: PathBuf::from(&parent.workspace_path),
+        branch: spec.branch.clone(),
+        base,
+        post_create_hook: spec.post_create_hook.clone(),
+    })?;
+    let shadow_ref = tree.shadow.ref_name().to_owned();
+
+    // §13, and not left to the caller for a fork any more than for a start.
+    spec.launch.cwd = tree.worktree.path().to_path_buf();
     spec.launch.resume = Some(parent_session);
     spec.launch.fork_at = Some(spec.at.address.clone());
 
@@ -475,14 +503,11 @@ pub fn fork(
                 agent_version: None,
                 provider_session_id: Some(spec.launch.session_id.clone()),
                 workspace_path: parent.workspace_path.clone(),
-                // Both absent, and both for the same reason: this run has done
-                // no git. `Run::check_fork_pairing` has nothing to say about
-                // these two — it guards the edge below — but Review does, and
-                // §13.1's answer for a missing ref is "attribution
-                // unavailable", not silence.
-                worktree_path: None,
-                branch: None,
-                shadow_ref: None,
+                // A fork's git state is its own, and differs from a root run's
+                // only in what it was branched from.
+                worktree_path: Some(tree.worktree.path().display().to_string()),
+                branch: Some(spec.branch.clone()),
+                shadow_ref: Some(shadow_ref.clone()),
                 prompt: Some(spec.prompt.clone()),
                 status: RunStatus::Running,
                 started_at: started_at.to_owned(),
@@ -495,8 +520,9 @@ pub fn fork(
                 branch_point_seq: Some(spec.at.seq),
             },
             launch: spec.launch,
-            // No tree, so no shadow history, so no snapshots. See above.
-            shadow: None,
+            // Its own history, rooted at its own tree. A fork's writes are
+            // snapshotted and attributable exactly like any other run's.
+            shadow: Some(tree.shadow),
             prompt: &spec.prompt,
             workspace_mcp: spec.workspace_mcp.as_ref(),
             sink,
@@ -505,8 +531,43 @@ pub fn fork(
 
     Ok(Started {
         session,
-        tree: None,
+        tree: StartedTree {
+            worktree: tree.worktree,
+            shadow_ref,
+        },
     })
+}
+
+/// The commit a fork's worktree is checked out from: the parent's tree as it
+/// stood at the branch point.
+///
+/// Read through the parent's **repository** rather than its worktree, because
+/// the shadow ref lives in the shared ref namespace and outlives the checkout it
+/// was written from (§13.1, verified against `gc --prune=now`). A parent whose
+/// worktree has been cleaned up is still forkable; a parent whose ref is gone is
+/// not, and says so.
+fn branch_point_commit(parent: &Run, seq: u64) -> Result<String> {
+    if parent.shadow_ref.is_none() {
+        return Err(Error::CannotFork {
+            run: parent.id.0.clone(),
+            reason: "it has no shadow ref, so nothing records what its tree held at the \
+                     branch point — and neither the repository's HEAD nor the parent's \
+                     tree as it stands now is that tree"
+                .to_owned(),
+        });
+    }
+
+    let repo = Worktree::open(Path::new(&parent.workspace_path))?;
+    ShadowHistory::open(&repo, &parent.id)?
+        .commit_at(seq)?
+        .ok_or_else(|| Error::CannotFork {
+            run: parent.id.0.clone(),
+            reason: format!(
+                "its shadow ref {} holds no snapshot at or before seq {seq}, so there is \
+                 no recorded tree to branch from",
+                shadow_ref(&parent.id),
+            ),
+        })
 }
 
 /// The non-git half of starting a run.
@@ -546,45 +607,6 @@ fn spawn_run(mut log: EventLog, spec: SpawnSpec<'_>) -> Result<Session> {
         sink.as_ref(),
     )?;
     process::spawn(&launch, pipeline, prompt, sink, mcp)
-}
-
-/// The directory a run with no worktree of its own works in.
-///
-/// Walks `parent_run_id` until it finds a run that has one. A root run always
-/// does, so this terminates on any chain this driver produced; the bound and
-/// the refusal below exist because the log is data, and data outlives the code
-/// that wrote it.
-///
-/// It never falls back to `workspace_path`. That column is the user's own
-/// checkout, and handing it to an agent is the one thing §13 exists to prevent
-/// — so an unplaceable fork is refused rather than placed there.
-fn inherited_cwd(log: &EventLog, parent: &Run) -> Result<PathBuf> {
-    /// Longer than any fork chain a human produces, short enough that a cycle
-    /// in `parent_run_id` ends as an error instead of a hang.
-    const MAX_DEPTH: usize = 64;
-
-    let mut run = parent.clone();
-    for _ in 0..MAX_DEPTH {
-        if let Some(path) = &run.worktree_path {
-            return Ok(PathBuf::from(path));
-        }
-        let Some(next) = run.parent_run_id.clone() else {
-            break;
-        };
-        let Some(ancestor) = log.run(&next)? else {
-            return Err(Error::CannotFork {
-                run: parent.id.0.clone(),
-                reason: format!("its ancestor {} is not in the log", next.0),
-            });
-        };
-        run = ancestor;
-    }
-    Err(Error::CannotFork {
-        run: parent.id.0.clone(),
-        reason: "no run in its ancestry has a worktree, so the fork has nowhere to work \
-                 that is not the user's own checkout"
-            .to_owned(),
-    })
 }
 
 /// Resume a run the provider still holds.

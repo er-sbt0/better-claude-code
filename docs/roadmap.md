@@ -155,11 +155,13 @@ mid-conversation. In rough order:
 - **Prove concurrent forks.** Two branches of one trunk running at the same time
   is the product case and the spike only tested them sequentially. Cheap, and it
   would be expensive to discover late.
-- **Fork a run that already edited files** — the conversation fork paired with a
-  worktree forked at the same `seq`. §13.1 makes it possible; nothing has
-  exercised the two together. Lazy worktrees make *when* the tree appears a
-  separate question from *what* it is forked from; this debt is about the
-  latter and is unchanged.
+- ~~**Fork a run that already edited files.**~~ Done, 2026-09-13. The
+  conversation fork is paired with a worktree forked at the same `seq`:
+  `ShadowHistory::commit_at` resolves the branch point to the newest snapshot at
+  or before it, and `driver::fork` checks the child out from that commit. Doing
+  it is what overturned `branching-surface.md`'s lazy-worktree decision — *when*
+  the tree appears turned out not to be separable from *what* it is forked from,
+  because a process's cwd is fixed at spawn.
 - **Then build the surface, fork first.** A vertical slice — one fork working
   end to end against a thin feed — then §7's six blocks widen underneath it.
   The fork path carries every position the prototype overturned, so it is the
@@ -209,8 +211,8 @@ five that are screens.
 | Feature | § | State |
 |---|---|---|
 | **Agent** — Claude Code only via `stream-json`, no adapter abstraction | §5, §16 | **done** — detect, launch, prompt, interrupt, resume; fixtures replay in CI |
-| **Forking** — `--fork-session` + `--session-id`, `--resume-session-at` for a mid-conversation branch point | §19 | **built in the driver, no UI and no tree yet** — `driver::fork` spawns `--fork-session` with a `--session-id` we assign and a `--resume-session-at` resolved from `raw_events.idempotency_key` (`ForkPoint::resolve`, stripped at the `#`), and writes the child's row with both halves of the graph edge. It does **no git at all**: a forked run has no worktree and no `shadow_ref`, works in its nearest ancestor's tree meanwhile, and `driver::start`'s git half is split out as `ensure_tree` for the first-write path to call. Still missing: that lazy-tree call, and any way to fork from the UI |
-| **Worktrees** — run-per-worktree, create/list/clean up | §13 | **done** — fork-at-`seq` not yet exercised |
+| **Forking** — `--fork-session` + `--session-id`, `--resume-session-at` for a mid-conversation branch point | §19 | **built in the driver, no UI** — `driver::fork` spawns `--fork-session` with a `--session-id` we assign and a `--resume-session-at` resolved from `raw_events.idempotency_key` (`ForkPoint::resolve`, stripped at the `#`), writes the child's row with both halves of the graph edge, and creates the child's worktree from the parent's shadow commit at the branch-point `seq` — its own branch, its own tree, its own `shadow_ref`, so its writes are snapshotted and attributable like any other run's. A parent with no shadow ref is refused rather than placed against the repo's `HEAD` or the parent's tree. Still missing: any way to fork from the UI |
+| **Worktrees** — run-per-worktree, create/list/clean up | §13 | **done**, fork-at-`seq` included — `ShadowHistory::commit_at` resolves a branch-point `seq` to the newest snapshot at or before it (§13.1 never commits an unchanged tree, so most `seq` values have no commit of their own and `<=` is the correct rule, not a lenient one), and a test forks a parent mid-edits and asserts the child's tree holds the parent's content *as of that seq* rather than as of its tip |
 | **Persistence** — SQLite, `runs` + `raw_events` only; projections recomputed on load | §14 | **done** — the whole graph edge is now in the schema: `parent_run_id` plus `branch_point_seq` (migration V2), the only record the graph will ever have, since the provider records no parentage. A root run has neither half and a fork has both; the pairing is enforced in `Run::check_fork_pairing`, not in SQL, so a test reaches it without a database. Nothing writes a fork yet — the driver does not fork |
 | **Workspace MCP server** — `report_finding`, `open_plan`, `record_test_run` | §6 | **done** for `request_permission` + `report_finding`; the other four tools are unbuilt |
 | **Run feed** — six block types plus `Raw`, virtualized, every block carrying `(runId, seqRange)`, **collapse/expand first-class** | §7 | not started — the window's flat event list is bridge scaffolding, not a first draft of this. Second in the slice, built against fork addresses a working fork is already resolving |
@@ -386,15 +388,30 @@ entries never reach stdout, so **every keyed block is forkable** is true while
 *every chain entry is keyed* is false, and forking at a user message would be
 back to reading provider files.
 
+**Also discharged: a fork of a run that already edited files** — §19's pairing of
+the conversation fork with a worktree forked at the same `seq`. Not a live-run
+record this time but a test, because nothing about it needs the provider: a
+parent edits one file twice and creates a second on the way, the fork is anchored
+at the assistant message *between* the two edits, and the child's checkout is
+asserted to hold the first edit and not the second, and not the file that
+appeared after it. Three trees are in play and two of them are plausible wrong
+answers — the parent's tree now, and the repository's `HEAD` — which is why this
+had to be exercised rather than reasoned about. What it bought is the reversal of
+this record's own lazy-worktree decision, argued in `branching-surface.md`: the
+pairing is only achievable at the fork, because a process's cwd is fixed at
+spawn. The lookup it rests on is `ShadowHistory::commit_at`, and the finding that
+shaped it is that the branch point usually has no snapshot of its own — §13.1
+never commits an unchanged tree — so the rule is the newest snapshot *at or
+before* the `seq`, with a branch point before the parent's first snapshot falling
+out as `seq` 0, the tree as the agent found it.
+
 **Remaining:**
 
 - **Concurrent forks.** The spike ran branches sequentially; two branches of one
   trunk running at the same time is the actual product case, it is cheap, and it
-  would be expensive to discover late. Lazy worktrees remove the filesystem half
-  of the question and say nothing about the provider half.
-- **A fork of a run that already edited files.** The conversation fork has to
-  pair with a worktree forked at the same `seq`. §13.1 makes it possible and
-  nothing has exercised the two together.
+  would be expensive to discover late. A worktree per fork removes the filesystem
+  half of the question — and now removes it at the fork, where a concurrent
+  sibling needs it — and says nothing about the provider half.
 - **Whether Codex forks at all.** Folded into the Codex debt below, but called
   out separately because the thesis now depends on it: if it does not, the graph
   is a tier-1 capability that must degrade (§5).
@@ -453,6 +470,7 @@ back to reading provider files.
 | The run graph is generated layout, not a drawing surface | §10, §19 | new; the user forks and navigates but never places a node, so it needs a layout pass and a transform — not tldraw, and not §9.1's "second editor technology" budget |
 | A node is a conversation column, and §10's "shape" is a zoom level | `branching-surface.md` | new; forking is anchored to a message, so forking requires reading messages — a default state that hides them taxes the primary act every time. Map view still renders exactly the shape §10 specified |
 | A fork's worktree is lazy — created on the child's first write, not at the fork | `branching-surface.md`, §13 | new; the tree buys clean shadow attribution, which is only owed once a run writes. Not a corruption argument: `pipeline.rs:171` snapshots the whole tree and stamps it with one run's `Cause`, so two runs in one tree mis-attribute deterministically — and poison the trunk, not just the fork |
+| **Supersedes the row above: a fork is created with its worktree, checked out from the parent's shadow commit at the branch-point `seq`** | `branching-surface.md`, §13, §19 | new, and it is correctness where the row above was cost. A process's cwd is fixed at spawn, so a worktree made on the first write cannot redirect a child that has already computed paths under its ancestor's root — the write lands there anyway and the new tree is correct and empty. Nor can a treeless child *read* the right tree: an ancestor's tree is that run's tree now, not at the branch point, which is wrong precisely when the parent is still running. The `pipeline.rs:171` argument is unchanged and now argues for the eager tree: two runs must not share one, so the fork gets its own from `ShadowHistory::commit_at` |
 | Fork is offered only where a chain-entry uuid resolves | `branching-surface.md` | new; the inherited-context strip states a message count out loud, so snapping backwards to a nearby address makes the one surface whose job is to say where you came from lie about it |
 | The shell owns no logic | `apps/desktop` | anything there that starts deciding belongs in a crate, where a test can reach it without a window |
 
@@ -478,12 +496,17 @@ back to reading provider files.
 
 ### Traps that are easy to re-introduce
 
-- **A fork that never writes has no worktree and no shadow ref**, now that the
-  tree is lazy. Review must report attribution as *unavailable* for it, which
-  §13.1 already requires when a ref is missing — so the branch exists and
-  nothing exercises it. A Review that assumes every run has a shadow ref will
-  not fail on the runs anyone tests it with; it will fail on the cheap
-  exploratory forks the surface is designed to encourage.
+- **A run whose shadow ref is missing must read as *unavailable*, not as
+  *nothing*.** ~~A fork that never writes has no worktree and no shadow ref~~ —
+  that state is gone: the tree is eager again, so every run has a ref from the
+  moment it starts. The requirement it was an instance of is not gone and never
+  depended on forking. `runs.shadow_ref` is nullable because a ref can be
+  *removed* after the fact, and §13.1's answer for a missing one is attribution
+  unavailable rather than silence. A Review that reads an empty blame as "nothing
+  here was written by this run" will not fail on the runs anyone tests it with,
+  because those still have their refs; it will fail on a cleaned-up one.
+  `ShadowHistory::is_available` exists so the question can be asked rather than
+  inferred, and a test asserts the removed-ref case answers it.
 - **Review must run a second query for deleted hunks.** `blame` only sees lines
   that survived; deletions come from `removed_at` (the pickaxe). A UI that only
   blames silently shows no attribution for removals, which looks like working

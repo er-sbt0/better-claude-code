@@ -12,7 +12,7 @@ use std::process::Command;
 
 use agent_protocol::{Event, RunId};
 use driver::{LaunchSpec, Permission, Pipeline, RunSpec, Thinking};
-use event_log::{EventLog, RunStatus};
+use event_log::{EventLog, Run, RunStatus};
 use worktree::{ShadowHistory, Worktree};
 
 // ------------------------------------------------------------------ helpers --
@@ -270,7 +270,7 @@ fn a_run_produces_a_log_and_an_attributable_diff() {
         None,
     )
     .unwrap();
-    let wt_path = started.tree.as_ref().unwrap().worktree.path().to_path_buf();
+    let wt_path = started.tree.worktree.path().to_path_buf();
     let (outcome, log) = started.session.wait().unwrap();
 
     assert_eq!(outcome.exit_code, Some(0));
@@ -383,7 +383,7 @@ fn post_create_hook_output_is_attributed_to_the_run_not_to_a_tool_call() {
         "echo 'installed by the hook' > vendor.lock".to_owned(),
     ]);
     let started = driver::start(log, s, "2026-09-13T09:00:00.000Z", None).unwrap();
-    let wt_path = started.tree.as_ref().unwrap().worktree.path().to_path_buf();
+    let wt_path = started.tree.worktree.path().to_path_buf();
     let (_, _log) = started.session.wait().unwrap();
 
     let wt = Worktree::open(&wt_path).unwrap();
@@ -562,107 +562,168 @@ const EDIT_THEN_REPORT_LINES: &[&str] = &[
 
 // ------------------------------------------------------------------- forks --
 
-/// A parent worth forking: one provider line that fans out into two events, so
-/// its `idempotency_key` carries our `#i` suffix and the address has to be
-/// stripped out of it.
-const FORK_PARENT: &str = r#"#!/usr/bin/env bash
-cat > /dev/null &
-emit() { printf '%s\n' "$1"; }
-emit '{"type":"system","subtype":"init","uuid":"u0","session_id":"s","cwd":"'"$PWD"'","tools":["Read"],"mcp_servers":[],"model":"claude-sonnet-5","permissionMode":"default"}'
-emit '{"type":"assistant","uuid":"u1","message":{"id":"m1","content":[{"type":"text","text":"let me look"},{"type":"tool_use","id":"toolu_01","name":"Read","input":{"file_path":"src/auth.ts"}}]}}'
-emit '{"type":"user","uuid":"u2","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"export const a = 1;"}]}}'
-emit '{"type":"assistant","uuid":"u3","message":{"id":"m2","content":[{"type":"text","text":"it returns 1"}]}}'
-emit '{"type":"result","uuid":"u4","subtype":"success","result_index":0,"is_error":false,"num_turns":1,"duration_ms":10,"total_cost_usd":0.01,"modelUsage":{"claude-sonnet-5":{"inputTokens":10,"outputTokens":5,"costUSD":0.01}},"permission_denials":[]}'
-"#;
+/// A parent worth forking: it edits one file **twice**, so its shadow history
+/// has two snapshots and the tree at a branch point between them differs from
+/// the tree at its tip. That difference is what a fork-at-`seq` has to get
+/// right, and it is invisible in a parent that edits once.
+///
+/// `u1` is also one provider line carrying text *and* a tool call, so it fans
+/// out into two events keyed `u1#0` and `u1#1` — the suffix is ours, and the CLI
+/// refuses it by name.
+const PARENT_TWO_EDITS: &[&str] = &[
+    r#"{"type":"system","subtype":"init","uuid":"u0","session_id":"s","cwd":"/wt","tools":["Edit"],"mcp_servers":[],"model":"claude-sonnet-5","permissionMode":"default"}"#,
+    r#"{"type":"assistant","uuid":"u1","message":{"id":"m1","content":[{"type":"text","text":"first pass"},{"type":"tool_use","id":"toolu_01","name":"Edit","input":{"file_path":"src/auth.ts"}}]}}"#,
+    // -- the first edit lands here --
+    r#"{"type":"user","uuid":"u2","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"ok"}]}}"#,
+    r#"{"type":"assistant","uuid":"u3","message":{"id":"m2","content":[{"type":"text","text":"now the second pass"}]}}"#,
+    r#"{"type":"assistant","uuid":"u4","message":{"id":"m3","content":[{"type":"tool_use","id":"toolu_02","name":"Edit","input":{"file_path":"src/auth.ts"}}]}}"#,
+    // -- the second edit lands here --
+    r#"{"type":"user","uuid":"u5","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_02","content":"ok"}]}}"#,
+    r#"{"type":"assistant","uuid":"u6","message":{"id":"m4","content":[{"type":"text","text":"done"}]}}"#,
+];
 
-/// A forked child. Writes its own argv and cwd out so the flags the driver
-/// chose are an assertion rather than an inspection, then runs a turn that
-/// completes a tool call without touching a file — which is a snapshot the
-/// driver would take if this run had a shadow history, and does not.
-const FORK_CHILD: &str = r#"#!/usr/bin/env bash
+/// A forked child. Writes its own argv and cwd out so the flags and the working
+/// directory the driver chose are assertions rather than inspections, then
+/// **appends** to the file its parent was editing — a fork's writes are
+/// snapshotted and attributable like any other run's, and nothing but a real
+/// edit proves that. Appending rather than overwriting leaves the inherited
+/// lines in place, so blame has both to tell apart.
+const FORK_CHILD_EDITS: &str = r#"#!/usr/bin/env bash
 { printf '%s\n' "$PWD"; printf '%s\n' "$@"; } > __DUMP__
 cat > /dev/null &
 emit() { printf '%s\n' "$1"; }
-emit '{"type":"system","subtype":"init","uuid":"c0","session_id":"s","cwd":"'"$PWD"'","tools":["Read"],"mcp_servers":[],"model":"claude-sonnet-5","permissionMode":"default"}'
-emit '{"type":"assistant","uuid":"c1","message":{"id":"m1","content":[{"type":"tool_use","id":"toolu_02","name":"Read","input":{"file_path":"src/auth.ts"}}]}}'
-emit '{"type":"user","uuid":"c2","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_02","content":"export const a = 1;"}]}}'
-emit '{"type":"result","uuid":"c3","subtype":"success","result_index":0,"is_error":false,"num_turns":1,"duration_ms":10,"total_cost_usd":0.01,"modelUsage":{"claude-sonnet-5":{"inputTokens":10,"outputTokens":5,"costUSD":0.01}},"permission_denials":[]}'
+emit '{"type":"system","subtype":"init","uuid":"c0","session_id":"s","cwd":"'"$PWD"'","tools":["Edit"],"mcp_servers":[],"model":"claude-sonnet-5","permissionMode":"default"}'
+emit '{"type":"assistant","uuid":"c1","message":{"id":"m1","content":[{"type":"tool_use","id":"toolu_09","name":"Edit","input":{"file_path":"src/auth.ts"}}]}}'
+printf 'export const b = 2; // the child\n' >> src/auth.ts
+emit '{"type":"user","uuid":"c2","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_09","content":"ok"}]}}'
+emit '{"type":"assistant","uuid":"c3","message":{"id":"m2","content":[{"type":"text","text":"forked and edited"}]}}'
+emit '{"type":"result","uuid":"c4","subtype":"success","result_index":0,"is_error":false,"num_turns":1,"duration_ms":10,"total_cost_usd":0.01,"modelUsage":{"claude-sonnet-5":{"inputTokens":10,"outputTokens":5,"costUSD":0.01}},"permission_denials":[]}'
 "#;
 
-/// §19's fork, end to end: the address comes out of the parent's log, the edge
-/// goes into the child's row, and **git is not touched**.
+/// Build a parent run that edited a file twice: its tree, its shadow history,
+/// its row and its log — with the worktree mutated between lines exactly where
+/// the agent would have mutated it.
 ///
-/// The last part is the one that would rot quietly, so it is asserted against
-/// the repository itself rather than against a mock: the full worktree list and
-/// the full set of `refs/agent-workspace/` refs are compared before and after.
-/// Re-eagerizing the tree would add a directory and a ref, and both sides of
-/// that comparison would move.
+/// Driven through [`Pipeline`] rather than by spawning a stub, and the reason is
+/// the thing under test. A snapshot is taken when the *driver* reaches a line,
+/// not when the agent emits it, so a stub's writes race its own stdout: both
+/// edits can land in one snapshot, and there is no point in the stream a test
+/// could wait on to stop it. `Pipeline` is the same code path per line with the
+/// process — and therefore the timing — taken out. The fork below spawns a real
+/// one.
+fn parent_that_edited_twice(db: &Path, repo: &Path, run: &RunId) -> (PathBuf, EventLog) {
+    let tree = driver::ensure_tree(&driver::TreeSpec {
+        run_id: run.clone(),
+        repo: repo.to_path_buf(),
+        branch: format!("agent/{}", run.0),
+        base: "HEAD".to_owned(),
+        post_create_hook: None,
+    })
+    .unwrap();
+    let wt = tree.worktree.path().to_path_buf();
+
+    let mut log = EventLog::open(db).unwrap();
+    log.create_run(&Run {
+        id: run.clone(),
+        agent: "claude-code".to_owned(),
+        agent_version: None,
+        provider_session_id: Some(agent_protocol::SessionId::from("parent-session")),
+        workspace_path: repo.display().to_string(),
+        worktree_path: Some(wt.display().to_string()),
+        branch: Some(format!("agent/{}", run.0)),
+        shadow_ref: Some(tree.shadow.ref_name().to_owned()),
+        prompt: Some("make it retry".to_owned()),
+        status: RunStatus::Finished,
+        started_at: "2026-09-13T09:00:00.000Z".to_owned(),
+        finished_at: Some("2026-09-13T09:01:00.000Z".to_owned()),
+        parent_run_id: None,
+        branch_point_seq: None,
+    })
+    .unwrap();
+
+    let mut pipeline = Pipeline::new(run.clone(), log, Some(tree.shadow));
+    let mut snapshots = 0;
+    for (i, line) in PARENT_TWO_EDITS.iter().enumerate() {
+        // The agent writes, *then* reports. The snapshot rule depends on that
+        // order and so does this test.
+        if i == 2 {
+            fs::write(wt.join("src/auth.ts"), "export const a = 1; // FIRST\n").unwrap();
+        }
+        if i == 5 {
+            fs::write(wt.join("src/auth.ts"), "export const a = 2; // SECOND\n").unwrap();
+            fs::write(wt.join("src/late.ts"), "export const late = true;\n").unwrap();
+        }
+        if pipeline.ingest(line).unwrap().snapshot.is_some() {
+            snapshots += 1;
+        }
+    }
+    assert_eq!(snapshots, 2, "two edits, two snapshots");
+
+    (wt, pipeline.into_log())
+}
+
+/// The `seq` of the first `tool.completed` in a run's log — the event a snapshot
+/// is stamped with.
+fn first_completion_seq(log: &EventLog, run: &RunId) -> u64 {
+    log.events(run)
+        .unwrap()
+        .iter()
+        .find(|e| matches!(e.event, Event::ToolCompleted(_)))
+        .expect("a completed tool call")
+        .seq
+}
+
+/// The `seq` of the event carrying a given provider uuid.
+fn seq_of(log: &EventLog, run: &RunId, key: &str) -> u64 {
+    log.events(run)
+        .unwrap()
+        .iter()
+        .find(|e| e.idempotency_key.as_deref() == Some(key))
+        .unwrap_or_else(|| panic!("no event keyed {key}"))
+        .seq
+}
+
+/// §19's pairing, which nothing had exercised: **the conversation fork and the
+/// worktree fork are taken at the same `seq`**.
+///
+/// The parent edits `src/auth.ts` twice and creates a second file on the way.
+/// The fork is anchored between the two edits, so three trees are in play and
+/// only one of them is right: the parent's tree *now* (`SECOND`, plus
+/// `src/late.ts`), the repository's `HEAD` (neither edit), and the parent's tree
+/// **at the branch point** (`FIRST`, no `src/late.ts`). The lazy design this
+/// replaced would have handed the child the first of those.
 #[test]
-fn a_fork_branches_a_session_and_touches_no_git() {
+fn a_fork_gets_its_own_tree_holding_the_parent_as_of_the_branch_point() {
     let home = TempDir::new("fork");
     let repo = repo(home.path()).canonicalize().unwrap();
     let parent = RunId::from("run_parent");
     let db = home.path().join("log.sqlite");
+    let (parent_wt, log) = parent_that_edited_twice(&db, &repo, &parent);
 
-    let started = driver::start(
-        EventLog::open(&db).unwrap(),
-        spec(&repo, &stub_agent(home.path(), FORK_PARENT), &parent),
-        "2026-09-13T09:00:00.000Z",
-        None,
-    )
-    .unwrap();
-    let parent_wt = started
-        .tree
-        .as_ref()
-        .expect("a run that starts from nothing gets a tree")
-        .worktree
-        .path()
-        .to_path_buf();
-    let (_, log) = started.session.wait().unwrap();
-    let parent_session = log
-        .run(&parent)
-        .unwrap()
-        .unwrap()
-        .provider_session_id
-        .unwrap();
-
-    // The branch point, resolved out of the log we already keep. `u1` arrived
-    // as one provider line carrying text *and* a tool call, so it fanned into
-    // two events keyed `u1#0` and `u1#1` -- the suffix is ours, and the CLI
-    // refuses it by name.
-    let events = log.events(&parent).unwrap();
-    let fanned = events
-        .iter()
-        .find(|e| e.idempotency_key.as_deref() == Some("u1#0"))
-        .expect("a provider line that fanned out");
-    let at = driver::ForkPoint::resolve(&log, &parent, fanned.seq).unwrap();
-    assert_eq!(at.address, "u1", "the address is the part before the '#'");
-    assert_eq!(at.seq, fanned.seq);
-
-    // And a block with no key has no address -- not a nearby one, not the
-    // run's first. `run.finished` is made at process exit and never had a
-    // provider uuid to key on.
-    let tail = events.last().unwrap();
-    assert_eq!(tail.type_name(), "run.finished");
-    assert!(tail.idempotency_key.is_none());
+    // The branch point: `u3`, the assistant message *between* the two edits.
+    // Addressable, because it reached stdout under a bare uuid.
+    let at = driver::ForkPoint::resolve(&log, &parent, seq_of(&log, &parent, "u3")).unwrap();
+    assert_eq!(at.address, "u3");
     assert!(
-        matches!(
-            driver::ForkPoint::resolve(&log, &parent, tail.seq),
-            Err(driver::Error::NotAddressable { .. })
-        ),
-        "an unaddressable block must refuse, never snap to a neighbour"
+        at.seq > first_completion_seq(&log, &parent),
+        "the branch point must be after the first edit or this proves nothing"
+    );
+    assert_eq!(
+        driver::ForkPoint::resolve(&log, &parent, seq_of(&log, &parent, "u1#0"))
+            .unwrap()
+            .address,
+        "u1",
+        "the address is the part before the '#'"
     );
 
-    // Everything git knows, before the fork.
-    let worktrees_before = git(&repo, &["worktree", "list", "--porcelain"]);
-    let refs_before = git(&repo, &["for-each-ref", "refs/agent-workspace/"]);
+    // The parent's tree, as it stands now. The child must not get this.
+    assert!(fs::read_to_string(parent_wt.join("src/auth.ts"))
+        .unwrap()
+        .contains("SECOND"));
+    assert!(parent_wt.join("src/late.ts").exists());
 
     let child = RunId::from("run_child");
     let dump = home.path().join("child-argv");
-    let child_bin = stub_agent(
-        home.path(),
-        &FORK_CHILD.replace("__DUMP__", &dump.display().to_string()),
-    );
     let child_session = driver::new_session_id();
     let mut launch = LaunchSpec::new(
         // Deliberately nonsense: `fork` owns the cwd and must overwrite this.
@@ -670,7 +731,10 @@ fn a_fork_branches_a_session_and_touches_no_git() {
         child_session.clone(),
         Permission::DenyPrompts,
     );
-    launch.binary = child_bin;
+    launch.binary = stub_agent(
+        home.path(),
+        &FORK_CHILD_EDITS.replace("__DUMP__", &dump.display().to_string()),
+    );
     launch.thinking = Thinking::Off;
 
     let forked = driver::fork(
@@ -678,6 +742,8 @@ fn a_fork_branches_a_session_and_touches_no_git() {
         driver::ForkSpec {
             run_id: child.clone(),
             at: at.clone(),
+            branch: "agent/run_child".to_owned(),
+            post_create_hook: None,
             prompt: "try it without the cache".to_owned(),
             launch,
             workspace_mcp: None,
@@ -686,40 +752,64 @@ fn a_fork_branches_a_session_and_touches_no_git() {
         None,
     )
     .unwrap();
+    let child_wt = forked.tree.worktree.path().to_path_buf();
+    let child_ref = forked.tree.shadow_ref.clone();
+
+    // **The pairing.** The child's checkout is the parent's tree at `seq`, and
+    // is neither of the two trees it could have been confused with.
+    let auth_at_fork = fs::read_to_string(child_wt.join("src/auth.ts")).unwrap();
     assert!(
-        forked.tree.is_none(),
-        "a fork has no worktree and no shadow ref, and says so"
+        auth_at_fork.contains("FIRST"),
+        "the child's tree must hold the parent's first edit: {auth_at_fork:?}"
     );
+    assert!(
+        !auth_at_fork.contains("SECOND"),
+        "the child got the parent's tree at its tip, not at the branch point: \
+         {auth_at_fork:?}"
+    );
+    assert!(
+        !child_wt.join("src/late.ts").exists(),
+        "a file the parent created after the branch point is in the child's tree"
+    );
+    assert_ne!(child_wt, parent_wt, "two runs must not share one tree");
+    assert_eq!(child_wt, repo.join(".worktrees").join(&child.0));
+    assert_eq!(child_ref, format!("refs/agent-workspace/runs/{}", child.0));
+    assert_eq!(
+        git(&child_wt, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "agent/run_child",
+        "a fork gets its own branch: git refuses two worktrees on one"
+    );
+
     let (outcome, log) = forked.session.wait().unwrap();
     assert_eq!(outcome.exit_code, Some(0));
     assert!(outcome.stored > 0, "nothing reached the log");
     assert_eq!(
-        outcome.snapshots, 0,
-        "a completed tool call in a treeless run has no shadow history to land in"
+        outcome.snapshots, 1,
+        "a fork has a shadow history of its own, so its edits are recorded"
     );
 
-    // The flags, as the child actually received them.
+    // The flags and the working directory, as the child actually received them.
     let dumped = fs::read_to_string(&dump).unwrap();
-    let mut lines = dumped.lines();
-    let cwd = Path::new(lines.next().unwrap()).canonicalize().unwrap();
-    let argv: Vec<&str> = lines.collect();
+    let mut dumped = dumped.lines();
+    let cwd = Path::new(dumped.next().unwrap()).canonicalize().unwrap();
+    let argv: Vec<&str> = dumped.collect();
     let pair = |flag: &str, value: &str| argv.windows(2).any(|w| w[0] == flag && w[1] == value);
 
     assert_eq!(
         cwd,
-        parent_wt.canonicalize().unwrap(),
-        "a treeless fork works in its nearest ancestor's worktree, never the \
-         user's own checkout (§13)"
+        child_wt.canonicalize().unwrap(),
+        "a fork works in its own tree (§13), never an ancestor's and never the \
+         user's own checkout"
     );
     assert!(argv.contains(&"--fork-session"), "{argv:?}");
-    assert!(pair("--resume", &parent_session.0), "{argv:?}");
-    assert!(pair("--resume-session-at", "u1"), "{argv:?}");
+    assert!(pair("--resume", "parent-session"), "{argv:?}");
+    assert!(pair("--resume-session-at", "u3"), "{argv:?}");
     assert!(
         pair("--session-id", &child_session.0),
         "the child is named by us, not read back off the stream (§14): {argv:?}"
     );
 
-    // The row: the whole graph edge, and neither half of the git state.
+    // The row: the whole graph edge, and git state of its own.
     let row = log.run(&child).unwrap().unwrap();
     assert_eq!(row.parent_run_id.as_ref(), Some(&parent));
     assert_eq!(
@@ -728,138 +818,255 @@ fn a_fork_branches_a_session_and_touches_no_git() {
         "the branch point is stored at the fork or it is lost: the provider \
          records no parentage"
     );
-    assert_eq!(row.worktree_path, None, "a fork does no git work");
     assert_eq!(
-        row.shadow_ref, None,
-        "and therefore has nothing for Review to blame against"
+        row.worktree_path.as_deref(),
+        Some(child_wt.to_str().unwrap())
     );
-    assert_eq!(row.branch, None);
+    assert_eq!(row.branch.as_deref(), Some("agent/run_child"));
+    assert_eq!(row.shadow_ref.as_deref(), Some(child_ref.as_str()));
     assert_eq!(row.provider_session_id.as_ref(), Some(&child_session));
     assert_eq!(row.workspace_path, repo.display().to_string());
 
-    // The repository is byte-for-byte where it was.
+    // §13.1 on the fork: its edit is attributable to the tool call that made it,
+    // by `seq`, back into the *child's* log.
+    let wt = Worktree::open(&child_wt).unwrap();
+    let shadow = ShadowHistory::open(&wt, &child).unwrap();
+    let attr = shadow.attribute("src/auth.ts").unwrap();
+    let line = attr
+        .iter()
+        .find(|a| a.text.contains("the child"))
+        .expect("the child's edited line");
+    assert_eq!(line.seq, first_completion_seq(&log, &child));
+    assert_eq!(line.tool_use_id.as_deref(), Some("toolu_09"));
     assert_eq!(
-        git(&repo, &["worktree", "list", "--porcelain"]),
-        worktrees_before,
-        "the fork created a worktree"
+        attr.iter()
+            .find(|a| a.text.contains("FIRST"))
+            .map(|a| a.seq),
+        Some(0),
+        "the line the child inherited is attributed to the child's own root — \
+         `seq` 0, the tree as this agent found it. The parent's `seq` for it is \
+         in the parent's history, which is where Review looks the parent up"
     );
+
+    // The parent is untouched by any of it: its tree and its history.
+    assert!(fs::read_to_string(parent_wt.join("src/auth.ts"))
+        .unwrap()
+        .contains("SECOND"));
     assert_eq!(
-        git(&repo, &["for-each-ref", "refs/agent-workspace/"]),
-        refs_before,
-        "the fork rooted a shadow history"
-    );
-    assert!(
-        !repo.join(".worktrees").join(&child.0).exists(),
-        "the fork created {}/.worktrees/{}",
-        repo.display(),
-        child.0
-    );
-    assert!(
         git(
-            &repo,
+            &parent_wt,
             &[
-                "for-each-ref",
-                "--format=%(refname)",
-                "refs/agent-workspace/runs/"
+                "rev-list",
+                "--count",
+                &format!("refs/agent-workspace/runs/{}", parent.0)
             ]
-        )
-        .lines()
-        .all(|r| !r.ends_with(&child.0)),
-        "the fork created refs/agent-workspace/runs/{}",
-        child.0
+        ),
+        "3",
+        "the child's snapshot landed in the parent's history"
     );
 }
 
-/// A fork of a fork works where its *grandparent* does, because nothing in
-/// between has a tree — and the walk stops at a worktree rather than falling
-/// back to `workspace_path`, which is the user's own checkout.
+/// A fork of a fork branches from the **fork's** own history, not from the
+/// nearest ancestor that happens to have a tree.
+///
+/// There is no ancestor walk any more, and this is what removed the need for
+/// one: every run has a worktree and a shadow ref, so every run is a parent a
+/// fork can be placed against.
 #[test]
-fn a_fork_of_a_treeless_fork_inherits_the_nearest_real_worktree() {
+fn a_fork_of_a_fork_branches_from_the_fork() {
     let home = TempDir::new("fork2");
     let repo = repo(home.path()).canonicalize().unwrap();
     let root = RunId::from("run_root");
     let db = home.path().join("log.sqlite");
+    let (root_wt, log) = parent_that_edited_twice(&db, &repo, &root);
 
-    let started = driver::start(
-        EventLog::open(&db).unwrap(),
-        spec(&repo, &stub_agent(home.path(), FORK_PARENT), &root),
-        "2026-09-13T09:00:00.000Z",
+    let child = RunId::from("run_child");
+    let child_wt = fork_once(
+        &db,
+        home.path(),
+        driver::ForkPoint::resolve(&log, &root, seq_of(&log, &root, "u3")).unwrap(),
+        &child,
+        "argv-child",
+    );
+
+    // The grandchild anchors in the child, after the child's own edit.
+    let log = log_of(&db);
+    let grandchild = RunId::from("run_grandchild");
+    let grandchild_wt = fork_once(
+        &db,
+        home.path(),
+        driver::ForkPoint::resolve(&log, &child, seq_of(&log, &child, "c3")).unwrap(),
+        &grandchild,
+        "argv-grandchild",
+    );
+
+    for (a, b) in [
+        (&root_wt, &child_wt),
+        (&child_wt, &grandchild_wt),
+        (&root_wt, &grandchild_wt),
+    ] {
+        assert_ne!(a, b, "every run owns its own tree");
+    }
+    assert!(
+        fs::read_to_string(grandchild_wt.join("src/auth.ts"))
+            .unwrap()
+            .contains("the child"),
+        "the grandchild's tree must come from its parent's history, not its \
+         grandparent's"
+    );
+
+    let row = log_of(&db).run(&grandchild).unwrap().unwrap();
+    assert_eq!(row.parent_run_id, Some(child.clone()));
+    assert_eq!(
+        row.worktree_path.as_deref(),
+        Some(grandchild_wt.to_str().unwrap())
+    );
+    assert!(row.shadow_ref.is_some());
+}
+
+/// Fork one run, run it to completion, and return the tree it worked in.
+fn fork_once(db: &Path, home: &Path, at: driver::ForkPoint, id: &RunId, dump: &str) -> PathBuf {
+    let dump = home.join(dump);
+    let mut launch = LaunchSpec::new(
+        "/definitely/not/a/checkout",
+        driver::new_session_id(),
+        Permission::DenyPrompts,
+    );
+    launch.binary = stub_agent(
+        home,
+        &FORK_CHILD_EDITS.replace("__DUMP__", &dump.display().to_string()),
+    );
+    launch.thinking = Thinking::Off;
+
+    let forked = driver::fork(
+        EventLog::open(db).unwrap(),
+        driver::ForkSpec {
+            run_id: id.clone(),
+            at,
+            branch: format!("agent/{}", id.0),
+            post_create_hook: None,
+            prompt: "again".to_owned(),
+            launch,
+            workspace_mcp: None,
+        },
+        "2026-09-13T09:05:00.000Z",
         None,
     )
     .unwrap();
-    let root_wt = started.tree.as_ref().unwrap().worktree.path().to_path_buf();
-    let (_, log) = started.session.wait().unwrap();
+    let wt = forked.tree.worktree.path().to_path_buf();
+    let (outcome, _) = forked.session.wait().unwrap();
+    assert_eq!(outcome.snapshots, 1, "{} edited a file", id.0);
 
-    let at = driver::ForkPoint::resolve(
-        &log,
-        &root,
-        log.events(&root)
-            .unwrap()
-            .iter()
-            .find(|e| e.idempotency_key.as_deref() == Some("u1#0"))
-            .unwrap()
-            .seq,
-    )
+    let cwd = Path::new(fs::read_to_string(&dump).unwrap().lines().next().unwrap())
+        .canonicalize()
+        .unwrap();
+    assert_eq!(
+        cwd,
+        wt.canonicalize().unwrap(),
+        "{} must work in its own tree",
+        id.0
+    );
+    wt
+}
+
+/// A parent with no shadow ref cannot be forked, and the refusal is loud.
+///
+/// The tempting fallbacks are both wrong: the repository's `HEAD` is a tree the
+/// conversation never saw, and the parent's worktree *now* is the tree the lazy
+/// design was rejected for handing over. Refusing costs a fork; substituting
+/// costs a fork that looks like it worked.
+///
+/// `runs.shadow_ref` stays nullable for §13.1's sake — a ref can be removed
+/// after the fact, and Review must then report attribution as unavailable rather
+/// than omit it — so this state is representable and something has to answer for
+/// it.
+#[test]
+fn a_fork_of_a_run_with_no_shadow_ref_is_refused_and_writes_nothing() {
+    let home = TempDir::new("fork-no-ref");
+    let repo = repo(home.path()).canonicalize().unwrap();
+    let db = home.path().join("log.sqlite");
+    let parent = RunId::from("run_refless");
+
+    let mut log = EventLog::open(&db).unwrap();
+    log.create_run(&Run {
+        id: parent.clone(),
+        agent: "claude-code".to_owned(),
+        agent_version: None,
+        provider_session_id: Some(agent_protocol::SessionId::from("parent-session")),
+        workspace_path: repo.display().to_string(),
+        // Still on disk. It is not an answer, and the point of this test is that
+        // it is not reached for.
+        worktree_path: Some(repo.join(".worktrees/run_refless").display().to_string()),
+        branch: Some("agent/run_refless".to_owned()),
+        shadow_ref: None,
+        prompt: None,
+        status: RunStatus::Finished,
+        started_at: "2026-09-13T09:00:00.000Z".to_owned(),
+        finished_at: Some("2026-09-13T09:01:00.000Z".to_owned()),
+        parent_run_id: None,
+        branch_point_seq: None,
+    })
     .unwrap();
 
-    let mut previous = root.clone();
-    let mut previous_at = at;
-    for (i, name) in ["run_child", "run_grandchild"].iter().enumerate() {
-        let id = RunId::from(*name);
-        let dump = home.path().join(format!("argv-{i}"));
-        let mut launch = LaunchSpec::new(
-            "/definitely/not/a/checkout",
-            driver::new_session_id(),
-            Permission::DenyPrompts,
-        );
-        launch.binary = stub_agent(
-            home.path(),
-            &FORK_CHILD.replace("__DUMP__", &dump.display().to_string()),
-        );
-        launch.thinking = Thinking::Off;
+    let worktrees_before = git(&repo, &["worktree", "list", "--porcelain"]);
+    let refs_before = git(&repo, &["for-each-ref", "refs/agent-workspace/"]);
 
-        let forked = driver::fork(
-            EventLog::open(&db).unwrap(),
-            driver::ForkSpec {
-                run_id: id.clone(),
-                at: previous_at,
-                prompt: "again".to_owned(),
-                launch,
-                workspace_mcp: None,
+    let child = RunId::from("run_orphan");
+    let mut launch = LaunchSpec::new(
+        "/definitely/not/a/checkout",
+        driver::new_session_id(),
+        Permission::DenyPrompts,
+    );
+    launch.binary = stub_agent(
+        home.path(),
+        &FORK_CHILD_EDITS.replace("__DUMP__", "/dev/null"),
+    );
+    launch.thinking = Thinking::Off;
+
+    let forked = driver::fork(
+        EventLog::open(&db).unwrap(),
+        driver::ForkSpec {
+            run_id: child.clone(),
+            // Constructed rather than resolved: this parent has no events, and
+            // the refusal under test is about its git state, not its log.
+            at: driver::ForkPoint {
+                parent: parent.clone(),
+                seq: 4,
+                address: "whatever".to_owned(),
             },
-            "2026-09-13T09:05:00.000Z",
-            None,
-        )
-        .unwrap();
-        let (_, log) = forked.session.wait().unwrap();
+            branch: "agent/run_orphan".to_owned(),
+            post_create_hook: None,
+            prompt: "fork me".to_owned(),
+            launch,
+            workspace_mcp: None,
+        },
+        "2026-09-13T09:05:00.000Z",
+        None,
+    );
+    let Err(err) = forked else {
+        panic!("a fork with no recorded tree to branch from was allowed to start")
+    };
 
-        let cwd = Path::new(fs::read_to_string(&dump).unwrap().lines().next().unwrap())
-            .canonicalize()
-            .unwrap();
-        assert_eq!(
-            cwd,
-            root_wt.canonicalize().unwrap(),
-            "{name} must work in the only worktree in its ancestry"
-        );
+    assert!(
+        matches!(err, driver::Error::CannotFork { .. }),
+        "a fork that cannot be placed at its branch point must refuse: {err}"
+    );
+    assert!(
+        err.to_string().contains("shadow ref"),
+        "the refusal must say what is missing: {err}"
+    );
 
-        // The next fork anchors in the run we just made, which has no tree.
-        previous_at = driver::ForkPoint::resolve(
-            &log,
-            &id,
-            log.events(&id)
-                .unwrap()
-                .iter()
-                .find(|e| e.idempotency_key.as_deref() == Some("c1"))
-                .unwrap()
-                .seq,
-        )
-        .unwrap();
-        previous = id;
-    }
-
-    let row = log_of(&db).run(&previous).unwrap().unwrap();
-    assert_eq!(row.parent_run_id, Some(RunId::from("run_child")));
-    assert_eq!(row.worktree_path, None);
+    // Nothing was written down on the way out: no row, no worktree, no ref.
+    assert!(log_of(&db).run(&child).unwrap().is_none());
+    assert_eq!(
+        git(&repo, &["worktree", "list", "--porcelain"]),
+        worktrees_before
+    );
+    assert_eq!(
+        git(&repo, &["for-each-ref", "refs/agent-workspace/"]),
+        refs_before
+    );
+    assert!(!repo.join(".worktrees").join(&child.0).exists());
 }
 
 fn log_of(db: &Path) -> EventLog {
