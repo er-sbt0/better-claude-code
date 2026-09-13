@@ -96,6 +96,33 @@ reason the table exists at all — a bubble wraps sooner, and estimating both th
 same way makes the scrollbar lurch past precisely the blocks a reader scrolls
 back to find.
 
+### The default read is the conversation, not the log
+
+The same gap produced a second and larger divergence, and it is worth naming
+separately because the first fix does not touch it. Drawing §7's six types
+faithfully — every block labelled, every tool call opened with its arguments,
+every `run.started` and `turn.finished` inline — yields a *log viewer with prose
+in it*. The column is supposed to be a conversation with tool calls in it. Those
+are the same data and a different product.
+
+Three defaults carry the difference, none of them a change to the projection:
+
+- **Lifecycle is not in the conversation.** `run.started`, both `turn.*`, the
+  hook lifecycle and rate-limit notices are `Raw` blocks, and a feed opens with
+  five of them before a word is said. Hidden, behind a count that is always on
+  screen. The count is load-bearing rather than polite: a `Raw` block can also
+  be a message the normalizer failed to classify, and a view that dropped those
+  silently would conceal a normalizer bug in the one place nobody would look.
+- **A tool call is one line until asked for** — `Read src/auth.ts`, which is
+  what `document_model::summary` already says. `Diff`, `Terminal` and `Code`
+  stay open: those are the work, not a record that work happened.
+- **No caption above agent prose.** The header names the agent and the model on
+  every column already.
+
+§7 is untouched by all of this. It says what a block *is*; this says which
+blocks a reader sees first, and §3 has always listed collapse as first-class
+rather than incidental.
+
 §10's shape is not lost — it is relocated. Map view renders each column as a card
 carrying exactly what §10 listed: name, status, `model · N msgs`, and a
 one-line summary. The shape became a zoom level instead of a collapse state, and

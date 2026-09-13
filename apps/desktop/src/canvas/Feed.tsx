@@ -52,18 +52,42 @@ function keyOf(block: Block, index: number, blocks: readonly Block[]): string {
 }
 
 /**
- * Lifecycle is collapsed until asked for.
+ * A tool call is one line until asked for.
  *
- * `run.started`, both `turn.*` and the hook lifecycle are `Raw` blocks — §7
- * ships six types and lifecycle earns none of them — and a run's feed opens
- * with five of them before the conversation starts. Collapsed, each is one line
- * that says what it is; expanded, the payload is right there. Nothing is
- * hidden, which is the distinction §7's invariant actually cares about.
+ * `Read src/auth.ts` is what a reader wants from a tool call nine times out of
+ * ten, and it is what the projection's own `summary` already says. Expanded, it
+ * is the arguments and the output. The default is collapsed because a coding
+ * conversation is mostly prose *about* tool calls, and a feed that opens every
+ * one of them in full is a log with prose in it rather than a conversation with
+ * tool calls in it.
+ *
+ * `Diff`, `Terminal` and `Code` stay open: those are the work itself, not a
+ * record that work happened.
  */
-const collapsedByDefault = (block: Block): boolean => block.type === 'raw'
+const collapsedByDefault = (block: Block): boolean =>
+  block.type === 'raw' || block.type === 'tool_call'
+
+/**
+ * What "conversation" leaves out, and why it is a view rather than a filter in
+ * the projection.
+ *
+ * `run.started`, both `turn.*`, the hook lifecycle and the rate-limit notices
+ * are `Raw` blocks — §7 ships six types and lifecycle earns none of them — and
+ * a run's feed opens with five of them before a word is said. They are plumbing
+ * that happens to be on the same stream as the conversation, and interleaving
+ * them is the single thing that stops a column reading as a chat.
+ *
+ * They are hidden here and nowhere else: `document-model` keeps every one of
+ * them, §7's invariant is about the *projection* preserving what it cannot
+ * classify, and the count is always on screen with one click to show them. That
+ * count is not decoration — a `Raw` block can also be a message the normalizer
+ * failed to classify, and a view that dropped those silently would be hiding a
+ * bug in the one place nobody would look for it.
+ */
+const isPlumbing = (block: Block): boolean => block.type === 'raw'
 
 export function Feed({
-  blocks,
+  blocks: allBlocks,
   branches,
   inheritedAt,
   loaded,
@@ -91,6 +115,17 @@ export function Feed({
   const [viewport, setViewport] = useState(0)
   const [hovered, setHovered] = useState<number | null>(null)
   const [open, setOpen] = useState<Record<string, boolean>>({})
+  const [showPlumbing, setShowPlumbing] = useState(false)
+
+  // Everything below this line works on `blocks`, which is the *view*. The
+  // filter is here rather than in the caller so that windowing, measurement and
+  // the offset table all see one list: a hidden block that still occupied a row
+  // in the prefix-sum table would leave a gap the reader could scroll into.
+  const blocks = useMemo(
+    () => (showPlumbing ? allBlocks : allBlocks.filter((b) => !isPlumbing(b))),
+    [allBlocks, showPlumbing],
+  )
+  const hidden = allBlocks.length - blocks.length
 
   const keys = useMemo(() => blocks.map((b, i) => keyOf(b, i, blocks)), [blocks])
   const isOpen = useCallback(
@@ -318,9 +353,40 @@ export function Feed({
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex shrink-0 items-center gap-2 border-b border-border-soft px-3 py-1">
-        <span className="font-mono text-micro text-faint">
-          {loaded ? `${blocks.length} blocks` : 'loading…'}
-        </span>
+        {/* The hidden count is never not shown: a `Raw` block can be a message
+            the normalizer could not classify, and "3 hidden" is the only place
+            that would ever surface. */}
+        {loaded && hidden > 0 ? (
+          <button
+            type="button"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation()
+              setShowPlumbing(true)
+            }}
+            className="shrink-0 font-mono text-micro text-faint hover:text-text"
+            title="run and turn lifecycle, and anything the normalizer could not classify"
+          >
+            {hidden} hidden
+          </button>
+        ) : (
+          <span className="shrink-0 font-mono text-micro text-faint">
+            {!loaded ? 'loading…' : showPlumbing ? 'all events' : ''}
+          </span>
+        )}
+        {showPlumbing && (
+          <button
+            type="button"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation()
+              setShowPlumbing(false)
+            }}
+            className="shrink-0 font-mono text-micro text-faint hover:text-text"
+          >
+            conversation
+          </button>
+        )}
         <span className="min-w-0 flex-1 truncate text-micro text-faint">
           ⌘⇧F forks at a message
         </span>

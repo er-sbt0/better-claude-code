@@ -67,10 +67,14 @@ export function BlockView({ block }: { block: Block }) {
           </div>
         )
       }
+      // No `agent` caption. The column header already says which agent and
+      // which model, on every column, all the time — repeating it above every
+      // paragraph is the noise that makes a feed read as a transcript rather
+      // than as the half of a conversation the reader is actually having. The
+      // user's turn is the one that needs marking, and the bubble marks it.
       return (
         <div className="px-3 py-1.5">
-          <Label className="text-muted">agent</Label>
-          <p className="mt-0.5 whitespace-pre-wrap text-ui text-text select-text">{text}</p>
+          <p className="whitespace-pre-wrap text-ui text-text select-text">{text}</p>
         </div>
       )
     }
