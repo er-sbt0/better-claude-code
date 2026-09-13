@@ -10,12 +10,12 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use agent_protocol::RawEvent;
 use event_log::EventLog;
 
 use crate::error::{Error, Result};
 use crate::launch::{user_message, LaunchSpec};
 use crate::pipeline::{Ingested, Pipeline};
+use crate::sink::{EventSink, StreamEnd};
 
 /// What the caller can do to a running agent.
 enum Control {
@@ -110,7 +110,7 @@ pub fn spawn(
     spec: &LaunchSpec,
     pipeline: Arc<Mutex<Pipeline>>,
     first_prompt: &str,
-    sink: Option<Sender<RawEvent>>,
+    stream: StreamEnd,
     mcp: Option<workspace_mcp::Listener>,
 ) -> Result<Session> {
     spec.validate()?;
@@ -143,7 +143,12 @@ pub fn spawn(
     let reader_killer = Arc::clone(&killer);
     let reader_pipeline = Arc::clone(&pipeline);
     let reader = thread::spawn(move || {
-        let outcome = read_loop(stdout, &reader_pipeline, sink.as_ref());
+        // `stream` is moved in and never leaves: the run's live channel closes
+        // where this thread returns, by whatever path it returns — the `?`
+        // below, or a panic. Nothing else holds a sender, so no other producer
+        // can keep a finished run looking live (`sink.rs`).
+        let sink = stream.sink();
+        let outcome = read_loop(stdout, &reader_pipeline, &sink);
         // Reap before joining the helpers: the writer is blocked on a channel
         // that stays open until the caller drops the Session, and stderr does
         // not close until the process does.
@@ -167,7 +172,7 @@ pub fn spawn(
             .expect("pipeline mutex poisoned")
             .finish(outcome.exit_code)?;
         outcome.stored += tail.stored as u64;
-        emit(sink.as_ref(), tail.events);
+        sink.emit(tail.events);
         drop(writer);
         Ok(outcome)
     });
@@ -181,11 +186,7 @@ pub fn spawn(
     })
 }
 
-fn read_loop(
-    stdout: ChildStdout,
-    pipeline: &Mutex<Pipeline>,
-    sink: Option<&Sender<RawEvent>>,
-) -> Result<Outcome> {
+fn read_loop(stdout: ChildStdout, pipeline: &Mutex<Pipeline>, sink: &EventSink) -> Result<Outcome> {
     let mut outcome = Outcome {
         exit_code: None,
         stored: 0,
@@ -219,22 +220,9 @@ fn read_loop(
         if snapshot.is_some() {
             outcome.snapshots += 1;
         }
-        emit(sink, events);
+        sink.emit(events);
     }
     Ok(outcome)
-}
-
-/// Offer events to the live view.
-///
-/// A closed receiver means nobody is watching any more, which is not an error:
-/// the log is the durable copy and this channel is only the view.
-fn emit(sink: Option<&Sender<RawEvent>>, events: Vec<RawEvent>) {
-    let Some(sink) = sink else { return };
-    for e in events {
-        if sink.send(e).is_err() {
-            return;
-        }
-    }
 }
 
 fn write_loop(mut stdin: ChildStdin, rx: Receiver<Control>) {

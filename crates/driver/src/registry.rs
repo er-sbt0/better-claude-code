@@ -134,8 +134,6 @@ impl Registry {
     where
         F: FnMut(RawEvent) + Send + 'static,
     {
-        refuse_unsupervisable(spec.workspace_mcp.is_some())?;
-
         let run_id = spec.run_id.clone();
         let branch = spec.branch.clone();
         let started_at = self.clock.now();
@@ -180,8 +178,6 @@ impl Registry {
     where
         F: FnMut(RawEvent) + Send + 'static,
     {
-        refuse_unsupervisable(spec.workspace_mcp.is_some())?;
-
         let run_id = spec.run_id.clone();
         let branch = spec.branch.clone();
         let started_at = self.clock.now();
@@ -278,8 +274,6 @@ impl Registry {
     where
         F: FnMut(RawEvent) + Send + 'static,
     {
-        refuse_unsupervisable(workspace_mcp.is_some())?;
-
         if run.provider_session_id.is_none() {
             return Err(Error::CannotFork {
                 run: run.id.0.clone(),
@@ -393,12 +387,22 @@ impl Registry {
 
     /// Drain the run's events into `on_event`, then reap it.
     ///
-    /// The channel closing is the signal, and it means exactly one thing: every
-    /// [`Sender`](std::sync::mpsc::Sender) has been dropped, which happens when
-    /// the driver's reader thread has emitted the tail events the process exit
-    /// produced and returned. There is no other end condition, which is why
-    /// [`Registry::start`] refuses a run that would keep a sender alive
-    /// elsewhere.
+    /// The channel closing is the signal, and it means exactly one thing: the
+    /// driver's reader thread has emitted the tail events the process exit
+    /// produced and returned. There is no other end condition, and there does
+    /// not need to be — `driver::sink` makes that the *only* thing it can
+    /// mean. The sender lives in a [`StreamEnd`](crate::StreamEnd) that only
+    /// the reader thread holds, and every other producer of the run's events —
+    /// the workspace MCP server's connection threads, which outlive the agent's
+    /// process by however long teardown takes — holds an
+    /// [`EventSink`](crate::EventSink), which cannot keep the channel open.
+    ///
+    /// That used to be false, and the difference is what unblocked §12: while
+    /// the listener's accept thread held a sender, a supervised run that hosted
+    /// the permission server would have waited here for a close that only
+    /// [`Session::wait`](crate::Session::wait) could cause, and this thread is
+    /// what has to reach that wait. Such a run was refused at the door rather
+    /// than left to hang; now it is an ordinary run.
     fn supervise<F>(self, run: RunId, events: Receiver<RawEvent>, mut on_event: F) -> JoinHandle<()>
     where
         F: FnMut(RawEvent) + Send + 'static,
@@ -472,27 +476,4 @@ impl std::fmt::Debug for Registry {
             .field("live", &self.live())
             .finish_non_exhaustive()
     }
-}
-
-/// Refuse a run that would keep the event sink alive after its process ended.
-///
-/// The accept thread of a workspace MCP server holds a clone of the event sink
-/// for as long as the listener is up, and the listener only comes down inside
-/// `Session::wait`. Supervising such a run would deadlock: the supervisor waits
-/// for the channel to close, the channel waits for the wait the supervisor has
-/// not reached. Permissions are a later piece (§12's V1 surface is a dialog and
-/// there is no `Decider` that is a person yet), so this is refused loudly
-/// rather than left as a hang for whoever builds it — and it is refused for a
-/// fork as well as for a start, because a fork is supervised by the same
-/// thread with the same end condition.
-fn refuse_unsupervisable(hosts_workspace_mcp: bool) -> Result<()> {
-    if hosts_workspace_mcp {
-        return Err(Error::NotSupervisable {
-            reason: "the workspace MCP server's accept thread holds a clone of the event \
-                     sink until the session is waited on, so the stream would never end \
-                     and the run would never be reaped"
-                .to_owned(),
-        });
-    }
-    Ok(())
 }

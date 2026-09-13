@@ -399,13 +399,16 @@ fn usage() {
              --model <id>       e.g. claude-sonnet-5\n\
              --allow <tool>     repeatable: --allow Read --allow Edit\n\
              --mode <mode>      --permission-mode, e.g. acceptEdits\n\
+             --ask <policy>     `allow` or `deny`: host the workspace MCP server\n\
+             --relay <path>     the relay binary (default: beside this example)\n\
              --max-turns <n>    default 6\n\
              --budget <usd>     default 1.00\n\
              --db <path>        event log (default <repo>/.agent-workspace/log.sqlite)\n\
              --keep             do not remove the worktree afterwards\n\
          \n\
-         Nothing may prompt: anything requiring permission is denied (§12).\n\
-         Grant tools explicitly with --allow."
+         Without --ask nothing may prompt: anything requiring permission is\n\
+         denied (§12), so grant tools explicitly with --allow. With it, the run\n\
+         hosts the workspace MCP server and every prompt is answered the one way."
     );
 }
 

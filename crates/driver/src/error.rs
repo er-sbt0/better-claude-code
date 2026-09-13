@@ -19,11 +19,6 @@ pub enum Error {
     #[error("run {run} is not live in this process")]
     NotLive { run: String },
 
-    /// A run whose event stream would never end, so nothing would ever reap it.
-    /// See [`crate::Registry::start`].
-    #[error("this run cannot be supervised: {reason}")]
-    NotSupervisable { reason: String },
-
     /// A launch that would have failed in a way the provider reports as
     /// something else. Caught before spawning, because the alternative is an
     /// agent that denies every tool call for no visible reason.

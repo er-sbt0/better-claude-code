@@ -14,10 +14,12 @@
 //! suite and `examples/run.rs` cover the parts of that gap they can.
 
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agent_protocol::{RawEvent, RunId};
@@ -160,6 +162,25 @@ fn wait_for_event(rx: &Receiver<RawEvent>, type_name: &str) -> RawEvent {
     panic!("the stream ended without a {type_name}");
 }
 
+/// Drain to the end of the run's stream, or fail loudly.
+///
+/// `for e in rx` is the natural spelling and it is unbounded, which is exactly
+/// the wrong shape for the failure this file has to be able to catch: a stream
+/// that never closes is a supervisor that never reaps, and an unbounded drain
+/// turns that into a CI job that times out rather than a red test.
+fn drain_to_end(rx: &Receiver<RawEvent>) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = Vec::new();
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(e) => seen.push(e.type_name().to_owned()),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return seen,
+        }
+    }
+    panic!("the run's stream never closed; it had delivered {seen:?}");
+}
+
 fn status(log: &EventLog, run: &RunId) -> RunStatus {
     log.run(run).unwrap().expect("the run row").status
 }
@@ -205,6 +226,21 @@ while read -r line; do
   fi
 done
 "#;
+
+/// A `Decider` that says yes and remembers what it was asked — which is the
+/// shape §12's dialog will have, minus the person.
+struct Answers {
+    asked: Arc<Mutex<Vec<String>>>,
+}
+
+impl driver::Decider for Answers {
+    fn decide(&self, request: &workspace_mcp::PermissionRequest) -> workspace_mcp::Decision {
+        self.asked.lock().unwrap().push(request.tool_name.clone());
+        workspace_mcp::Decision::Allow {
+            updated_input: None,
+        }
+    }
+}
 
 // -------------------------------------------------------------------- tests --
 
@@ -462,39 +498,131 @@ fn steering_a_run_that_is_not_live_is_an_error() {
     assert!(registry.reap(&gone).is_none());
 }
 
-/// The deadlock this would otherwise become: the MCP listener's accept thread
-/// holds a clone of the event sink until the session is waited on, and the
-/// supervisor waits on the session only once the sink is gone. Neither moves.
-/// Refused at the door until permissions are built, because a hang is the worst
-/// way to discover it.
+/// **The run the whole permission feature was waiting on**: supervised, hosting
+/// the workspace MCP server, answering a request through a `Decider` — and then
+/// reaped, which is the part that was impossible.
+///
+/// It used to be refused at the door. The listener's accept thread held a clone
+/// of the event sink and the listener only came down inside `Session::wait`, so
+/// a supervisor that drains the channel before waiting would have waited for a
+/// close that waited for the wait it had not reached. `driver::sink` moved the
+/// only sender into the reader thread and gave every other producer a handle
+/// that cannot keep the channel open, which is why this now reads like any
+/// other run.
+///
+/// The relay is played by this test rather than spawned: the socket is the
+/// contract, `workspace-mcp` already covers the relay end of it against a real
+/// child process, and what is under test here is the driver's ownership, not
+/// the byte pipe.
 #[test]
-fn a_run_hosting_the_workspace_mcp_server_is_refused() {
+fn a_supervised_run_hosts_the_permission_server_and_is_still_reaped() {
     let home = TempDir::new("mcp");
     let repo = repo(home.path());
-    let bin = stub_agent(home.path(), "one-turn", ONE_TURN);
+    let bin = stub_agent(home.path(), "waits", WAITS_FOR_STDIN);
     let run = RunId::from("run_mcp");
+    let db = home.path().join("log.sqlite");
+    let runtime_dir = home.path().join("rt");
 
+    let asked = Arc::new(Mutex::new(Vec::new()));
     let mut s = spec(&repo, &bin, &run);
     s.workspace_mcp = Some(driver::WorkspaceMcp {
+        // Never read: nothing here spawns the provider, so nothing spawns the
+        // relay. The path is in the injected `--mcp-config` and that is all.
         relay: home.path().join("workspace-mcp-relay"),
-        runtime_dir: home.path().join("run"),
-        decider: Arc::new(driver::DenyEverything),
+        // §15: outside the worktree, which is the one property of this path
+        // that is not a detail.
+        runtime_dir: runtime_dir.clone(),
+        decider: Arc::new(Answers {
+            asked: Arc::clone(&asked),
+        }),
     });
 
-    let registry = Registry::new();
-    let err = registry
-        .start(EventLog::open_in_memory().unwrap(), s, |_| {})
-        .unwrap_err();
+    let registry = registry();
+    let (on_event, rx) = events();
+    registry
+        .start(EventLog::open(&db).unwrap(), s, on_event)
+        .unwrap();
 
-    assert!(matches!(err, Error::NotSupervisable { .. }), "{err:?}");
-    // Refused before anything happened, which is why the check is in `start`
-    // and not in the supervisor: no registry entry, no worktree, no process.
-    // A run that cannot be supervised must not half-exist.
-    assert!(registry.live().is_empty());
-    assert!(
-        !repo.join(".git/worktrees").exists(),
-        "the refused run got a worktree anyway"
+    // The provider's permission layer, arriving on the runtime's own channel
+    // (§15) while the run is live.
+    let socket = runtime_dir.join(&run.0).join("mcp.sock");
+    let mut relay = UnixStream::connect(&socket)
+        .unwrap_or_else(|e| panic!("the run bound no socket at {}: {e}", socket.display()));
+    // Bounded, because the failure being tested for is a thread that never
+    // answers. A blocked read here would hang the test binary.
+    relay
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut replies = BufReader::new(relay.try_clone().unwrap());
+    writeln!(
+        relay,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"request_permission","arguments":{{"tool_name":"Edit","input":{{"file_path":"README.md"}},"tool_use_id":"toolu_1"}}}}}}"#
+    )
+    .unwrap();
+    relay.flush().unwrap();
+    let mut line = String::new();
+    replies
+        .read_line(&mut line)
+        .expect("the workspace answered the permission request within ten seconds");
+    let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+    let decision: serde_json::Value =
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(decision["behavior"], "allow", "{line}");
+    assert_eq!(
+        asked.lock().unwrap().as_slice(),
+        ["Edit"],
+        "the decider is what answered, not a default"
     );
+
+    // Both halves of the round trip reach the live view, on the same channel as
+    // everything else the run says (§8's trap).
+    assert_eq!(
+        wait_for_event(&rx, "permission.requested").type_name(),
+        "permission.requested"
+    );
+    assert_eq!(
+        wait_for_event(&rx, "permission.resolved").type_name(),
+        "permission.resolved"
+    );
+
+    // Now end it, with the MCP connection still open — which is the real
+    // condition, since a relay holds its connection for the life of its agent
+    // and dies asynchronously with it. The run must not be hostage to it.
+    registry.end(&run).unwrap();
+
+    let seen = drain_to_end(&rx);
+    assert_eq!(
+        seen.last().map(String::as_str),
+        Some("run.finished"),
+        "the tail event did not come last: {seen:?}"
+    );
+
+    eventually("the run to leave the registry", || !registry.is_live(&run));
+
+    let log = EventLog::open(&db).unwrap();
+    eventually("the run row to be closed", || {
+        status(&log, &run) != RunStatus::Running
+    });
+    assert_eq!(
+        log.run(&run).unwrap().unwrap().status,
+        RunStatus::Finished,
+        "reaping handed the log back, so `finish` could write the row"
+    );
+
+    // The audit record, which is the half §14 says is the account of what the
+    // agent was allowed to do.
+    let kinds: Vec<&str> = log
+        .events(&run)
+        .unwrap()
+        .iter()
+        .map(|e| e.type_name())
+        .filter(|t| t.starts_with("permission."))
+        .collect();
+    assert_eq!(kinds, ["permission.requested", "permission.resolved"]);
+
+    // Held until here on purpose: dropping it earlier would have let the
+    // connection close on its own and proved nothing.
+    drop(relay);
 }
 
 /// A run that failed in the stream is never filed as finished, however politely

@@ -1211,10 +1211,11 @@ fn a_permission_request_is_answered_and_recorded() {
         None,
     )));
     let (tx, rx) = std::sync::mpsc::channel();
+    let stream = driver::StreamEnd::open(Some(tx));
 
     let ws = driver::RunWorkspace::new(
         Arc::clone(&pipeline),
-        Some(tx),
+        stream.sink(),
         Arc::new(Answer(workspace_mcp::Decision::Deny {
             message: "not in this worktree".to_owned(),
             interrupt: false,
@@ -1260,6 +1261,29 @@ fn a_permission_request_is_answered_and_recorded() {
     // UI showing a run that is waiting on nothing.
     let seen: Vec<String> = rx.try_iter().map(|e| e.type_name().to_owned()).collect();
     assert_eq!(seen, ["permission.requested", "permission.resolved"]);
+
+    // And the half of the channel this workspace deliberately does *not* hold.
+    // The run's stream ends where the reader thread ends, and a workspace that
+    // is still alive — as one is, on every socket thread the listener has not
+    // torn down yet — cannot keep it open. This is the whole of what unblocked
+    // a supervised run hosting the permission server: the supervisor's drain
+    // used to wait on a sender in here, and the only thing that would have
+    // dropped it was the wait the supervisor had not reached.
+    drop(stream);
+    assert!(
+        matches!(rx.recv(), Err(std::sync::mpsc::RecvError)),
+        "the workspace kept the run's live channel open after the stream ended"
+    );
+    // Still usable, and now a no-op rather than an error: a request answered
+    // during teardown is recorded, and has nowhere live to be shown.
+    let late = ws.request_permission(workspace_mcp::PermissionRequest {
+        tool_name: "Read".to_owned(),
+        input: serde_json::json!({"file_path": "/etc/hosts"}),
+        tool_use_id: Some("toolu_2".to_owned()),
+    });
+    assert!(matches!(late, workspace_mcp::Decision::Deny { .. }));
+    let stored = pipeline.lock().unwrap().log().events(&run).unwrap();
+    assert_eq!(stored.len(), 4, "the log still took it: {stored:?}");
 }
 
 /// A run that cannot be asked must not claim it can.

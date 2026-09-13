@@ -16,13 +16,13 @@
 //! gets prompt-injected can write something that *looks* like a permission
 //! request into its own output; it cannot reach this channel.
 
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
-use agent_protocol::{Event, PermissionRequested, PermissionResolved, RawEvent, ToolUseId};
+use agent_protocol::{Event, PermissionRequested, PermissionResolved, ToolUseId};
 use workspace_mcp::{Decision, PermissionRequest, Workspace};
 
 use crate::pipeline::Pipeline;
+use crate::sink::EventSink;
 
 /// Who answers a permission request.
 ///
@@ -48,18 +48,21 @@ impl Decider for DenyEverything {
 }
 
 /// The run's end of the workspace MCP server.
+///
+/// It is held by threads this type knows nothing about — the listener's accept
+/// thread, and one per connection the relay opens — which is why the sink here
+/// is an [`EventSink`] and not a channel sender. A sender would make this
+/// object's lifetime decide when the run's live stream ends, and the threads
+/// holding it are torn down inside `Session::wait`, which a supervisor only
+/// reaches after that stream has already ended (`sink.rs`).
 pub struct RunWorkspace {
     pipeline: Arc<Mutex<Pipeline>>,
-    sink: Option<Sender<RawEvent>>,
+    sink: EventSink,
     decider: Arc<dyn Decider>,
 }
 
 impl RunWorkspace {
-    pub fn new(
-        pipeline: Arc<Mutex<Pipeline>>,
-        sink: Option<Sender<RawEvent>>,
-        decider: Arc<dyn Decider>,
-    ) -> Self {
+    pub fn new(pipeline: Arc<Mutex<Pipeline>>, sink: EventSink, decider: Arc<dyn Decider>) -> Self {
         RunWorkspace {
             pipeline,
             sink,
@@ -73,22 +76,20 @@ impl RunWorkspace {
     /// same trap behind it: an event that reaches the log but not the sink is
     /// invisible until the run is reloaded, which is how `run.finished` once
     /// left every run looking unfinished.
+    ///
+    /// The log half is the one that must not be skipped. The sink half is
+    /// best-effort by construction: a request answered after the run's stream
+    /// has closed — the provider's permission layer can still be mid-call while
+    /// the process is exiting — is recorded and has nowhere live to be shown,
+    /// which is the right way round. The alternative would be a `run.finished`
+    /// that is not the last thing the live view sees.
     fn record(&self, event: Event) -> Result<(), crate::Error> {
         let ingested = self
             .pipeline
             .lock()
             .expect("pipeline mutex poisoned")
             .ingest_external(event)?;
-
-        if let Some(sink) = &self.sink {
-            for event in ingested.events {
-                // A closed receiver is not an error: the log is the durable
-                // copy and this channel is only the view.
-                if sink.send(event).is_err() {
-                    break;
-                }
-            }
-        }
+        self.sink.emit(ingested.events);
         Ok(())
     }
 }
@@ -114,6 +115,10 @@ impl Workspace for RunWorkspace {
             };
         }
 
+        // Outside the pipeline lock, and that is the property §12's dialog
+        // rests on: this call blocks until somebody answers, and a person is
+        // slow. The run's stream keeps being read and written while they think
+        // — only the one tool call the provider is holding open waits.
         let decision = self.decider.decide(&request);
 
         let (allowed, reason) = match &decision {

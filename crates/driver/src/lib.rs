@@ -40,6 +40,7 @@ mod permission;
 mod pipeline;
 mod process;
 mod registry;
+mod sink;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -56,6 +57,7 @@ pub use permission::{Decider, DenyEverything, RunWorkspace};
 pub use pipeline::{Ingested, Pipeline};
 pub use process::{Outcome, Session};
 pub use registry::{Live, Registry};
+pub use sink::{EventSink, StreamEnd};
 
 /// `seq` 0 is the run's state before anything happened.
 ///
@@ -353,7 +355,7 @@ pub fn start(
             shadow: Some(tree.shadow),
             prompt: &spec.prompt,
             workspace_mcp: spec.workspace_mcp.as_ref(),
-            sink,
+            stream: StreamEnd::open(sink),
         },
     )?;
 
@@ -553,7 +555,7 @@ pub fn fork(
             shadow: Some(tree.shadow),
             prompt: &spec.prompt,
             workspace_mcp: spec.workspace_mcp.as_ref(),
-            sink,
+            stream: StreamEnd::open(sink),
         },
     )?;
 
@@ -605,7 +607,9 @@ struct SpawnSpec<'a> {
     shadow: Option<ShadowHistory>,
     prompt: &'a str,
     workspace_mcp: Option<&'a WorkspaceMcp>,
-    sink: Option<Sender<RawEvent>>,
+    /// The run's live channel, and the only thing that ends it: it is moved
+    /// into the reader thread and closes there (`sink.rs`).
+    stream: StreamEnd,
 }
 
 /// Record the run, wire the MCP server, and spawn. Touches no git.
@@ -620,21 +624,15 @@ fn spawn_run(mut log: EventLog, spec: SpawnSpec<'_>) -> Result<Session> {
         shadow,
         prompt,
         workspace_mcp,
-        sink,
+        stream,
     } = spec;
 
     let run_id = row.id.clone();
     log.create_run(&row)?;
 
     let pipeline = Arc::new(Mutex::new(Pipeline::new(run_id.clone(), log, shadow)));
-    let mcp = wire_workspace_mcp(
-        &mut launch,
-        &run_id,
-        workspace_mcp,
-        &pipeline,
-        sink.as_ref(),
-    )?;
-    process::spawn(&launch, pipeline, prompt, sink, mcp)
+    let mcp = wire_workspace_mcp(&mut launch, &run_id, workspace_mcp, &pipeline, &stream)?;
+    process::spawn(&launch, pipeline, prompt, stream, mcp)
 }
 
 /// Resume a run the provider still holds.
@@ -663,14 +661,9 @@ pub fn resume(
     // A resumed run gets its own socket and its own listener. The server is
     // per-process, not per-run-row: the old one died with the old process, and
     // the provider will spawn a fresh relay for this one.
-    let mcp = wire_workspace_mcp(
-        &mut launch,
-        &run.id,
-        workspace_mcp,
-        &pipeline,
-        sink.as_ref(),
-    )?;
-    process::spawn(&launch, pipeline, prompt, sink, mcp)
+    let stream = StreamEnd::open(sink);
+    let mcp = wire_workspace_mcp(&mut launch, &run.id, workspace_mcp, &pipeline, &stream)?;
+    process::spawn(&launch, pipeline, prompt, stream, mcp)
 }
 
 /// Bind the run's MCP server and rewrite the flags that depend on it.
@@ -695,13 +688,16 @@ fn wire_workspace_mcp(
     run_id: &RunId,
     cfg: Option<&WorkspaceMcp>,
     pipeline: &Arc<Mutex<Pipeline>>,
-    sink: Option<&Sender<RawEvent>>,
+    stream: &StreamEnd,
 ) -> Result<Option<workspace_mcp::Listener>> {
     let Some(cfg) = cfg else { return Ok(None) };
 
+    // A sink, never the stream itself. The listener's threads outlive the
+    // agent's process by however long teardown takes, and a sender in their
+    // hands would be the run's live channel refusing to close (`sink.rs`).
     let workspace = Arc::new(RunWorkspace::new(
         Arc::clone(pipeline),
-        sink.cloned(),
+        stream.sink(),
         Arc::clone(&cfg.decider),
     ));
     let listener = workspace_mcp::Listener::bind(&cfg.runtime_dir.join(&run_id.0), workspace)?;

@@ -8,7 +8,7 @@ of the design's ideas are real, which are next, and which must not be
 relitigated without new information.
 
 **Updated:** 2026-09-13 · **Branch:** `main`
-**Code:** six crates plus the desktop shell · CI green · 140 tests.
+**Code:** six crates plus the desktop shell · CI green · 164 tests.
 **The headless spine is complete, and the semantic channel now exists:** a real
 run has both asked us for permission and reported a finding to us.
 **The thesis is on screen:** ⌘⇧F in the window has branched a real conversation
@@ -76,6 +76,14 @@ It prints the event stream live, then the metrics, then each changed line beside
 the tool call that produced it. `--ask allow|deny` hosts the workspace MCP
 server and answers the provider's prompts through it; without it nothing may
 prompt and every tool has to be pre-granted with `--allow`.
+
+*That description was only two-thirds true with `--ask`, until 2026-09-13.* The
+example drains the event channel to completion before it waits on the session,
+and the MCP listener held a sender, so the run printed its whole stream and then
+hung: the metrics and the attribution under them never ran. The recorded run
+below is exactly what was seen, which is why it stops at `turn.finished`. The
+deadlock and its fix are in §2; both halves work now, and the shape it was an
+instance of is a trap in §8.
 
 **What a real run looks like.** With `--ask allow`, one `Read`, one `Edit` and
 one report against a two-file repo: 21 events, $0.08, one turn.
@@ -232,21 +240,53 @@ Also queued:
   implementations answer the same way every time. §12's V1 surface is a dialog,
   and it is now the only thing between the channel and the feature.
 
-  **It is blocked on one thing, and whoever picks it up should read this
-  first.** `Registry::start` refuses a run carrying a `workspace_mcp` config,
-  so today a supervised run — which is every run the window starts — cannot
-  host the permission server at all. The reason is ownership, not policy: the
-  listener's accept thread holds an `Arc<RunWorkspace>` carrying a clone of the
-  event sink, and the listener only comes down inside `Session::wait()`. A
-  supervisor that drains the channel to completion before waiting would
-  therefore wait for a close that waits for the wait it has not reached. The
-  refusal is loud on purpose rather than left as a hang. Wiring a dialog means
-  first giving the listener a way to release the sink — or the supervisor a
-  second end condition — and that is a change to the driver, not to the UI.
-  The same shape is latent in `driver/examples/run.rs`, whose `for ev in rx`
-  precedes its `wait()`: `--ask allow` there should hang after the last event,
-  which is worth confirming against the §1 run that is recorded as having
-  worked.
+  **The driver stopped being in the way on 2026-09-13, and what is left really
+  is the dialog.** Until then `Registry::start` refused a run carrying a
+  `workspace_mcp` config, so a supervised run — which is every run the window
+  starts — could not host the permission server at all. The reason was
+  ownership rather than policy, and this file's account of it was right in every
+  detail: the event channel was a bare `mpsc::Sender`, `RunWorkspace` carried a
+  clone of it, the listener's accept thread and each of its connection threads
+  held an `Arc<RunWorkspace>`, and the listener only came down inside
+  `Session::wait`. A supervisor that drains the channel before waiting would
+  have waited for a close that waited for the wait it had not reached. It was
+  reproduced against a stub agent before it was fixed, with a socket client
+  standing in for the relay, and it looks exactly as described: `run.finished`
+  is delivered, and then the channel never closes. **`examples/run.rs` did
+  hang**, for the same reason and with no refusal in front of it; §1 is
+  corrected.
+
+  Of the two fixes this bullet used to offer — release the sink, or give the
+  supervisor a second end condition — the answer turned out to be neither, and
+  the reason is worth keeping. Both of them treat "who is still holding a
+  sender" as something to work around, and that question is the actual defect:
+  the end of a run's live channel was a fact about reference counting rather
+  than about the run. `crates/driver/src/sink.rs` splits the two capabilities a
+  `Sender` conflates. `StreamEnd` holds the only sender, is not `Clone`, and is
+  moved into the reader thread, so the channel closes where that thread returns
+  — by every path out of it, including a panic. `EventSink` is what every other
+  producer gets: it can emit and it cannot keep the channel open. A second end
+  condition would have needed a polling loop or a sentinel event to express, and
+  would have left the sink's owner as ambiguous as it was. `refuse_unsupervisable`
+  is gone; a supervised run that hosts the server, answers through a `Decider`,
+  reaches `run.finished` and is *reaped* is now a test.
+
+  **What remains, and none of it is in the driver:**
+
+  - **The dialog** — a `Decider` implemented in the shell. The thing to know
+    before writing it: `decide` is called on an MCP connection thread and
+    *blocks the agent* until it returns, so a human decider is a thread parked
+    until the window answers, and it needs an answer for the window that never
+    does. The pipeline lock is deliberately not held across it
+    (`driver::permission`), so a person staring at a dialog does not stall the
+    run's stream — only the one tool call that is waiting.
+  - **`start_run` and `fork_run` passing a `WorkspaceMcp` instead of `None`**,
+    which means the shell has to know where `workspace-mcp-relay` is. It is not
+    bundled with the app today, and the socket directory it names must not be
+    the worktree (§15).
+  - **A fork still inherits no permission posture**, for the reason §3 gives
+    about the allow-list: the `runs` row stores what a run *is*, not what it was
+    launched with.
 
 ---
 
@@ -273,7 +313,7 @@ four that are screens.
 | **Review** — the diff surface with reasoning attached to hunks, a branch diffed against its fork point | §13.1 | not started — *the one screen that must be excellent* |
 | **Compare siblings** — two branches off one point, side by side | §19 | not started — last in, first cut if V1 runs long |
 | **Runs list** — a cross-workspace index and launcher, deliberately thin | §10 | not started — demoted from home screen |
-| **Permissions** — proxied via `--permission-prompt-tool` | §12 option A | **channel done**, no UI — a `Decider` answers, and the only ones are allow-all and deny-all |
+| **Permissions** — proxied via `--permission-prompt-tool` | §12 option A | **channel done, and now reachable from a supervised run**, no UI — a `Decider` answers and the only implementations are allow-all and deny-all. The driver used to refuse to supervise a run that hosted the server at all, and it was an ownership bug rather than a policy position (§2): the run's live channel ended when the last `mpsc::Sender` clone dropped, and the MCP listener's threads — which outlive the agent's process by design — held one. `driver::sink` gives the run's stream a single non-`Clone` owner in the reader thread and every other producer a handle that cannot hold it open, so the refusal is gone and a supervised run that hosts the server, answers a request through a `Decider`, finishes and is *reaped* is a test. Missing is exactly §12's dialog, plus the shell passing a `WorkspaceMcp` and shipping the relay binary beside the app |
 
 Block provenance is cheap now and painful later: every block carries
 `(runId, seqRange)` from the first render, not once something needs it. Under the
@@ -531,10 +571,12 @@ reach stdout": true of a `-p` run, false of ours.
 - **`permission.requested` can never have a fixture, and that is structural.**
   The provider's permission layer calls our tool directly, so the request is
   never a `tool_use` block and never reaches stdout. Replaying a stream can no
-  more produce it than produce `run.finished`. It is covered by a driver test
-  and by live runs, and a change to its contract will show up as runs failing,
-  not as a golden diff — which is why re-reading the binary is the only defense
-  and why that record exists separately.
+  more produce it than produce `run.finished`. It is covered by two driver
+  tests — the round trip without a process, and, since the ownership fix in §2,
+  a supervised run answering one over a real socket, which is the shape the
+  window will use — and by live runs. A change to its contract will show up as
+  runs failing, not as a golden diff, which is why re-reading the binary is the
+  only defense and why that record exists separately.
 - **Subagent traffic.** `parent_tool_use_id` is present but null in every
   fixture. It has a second consumer now: attribution granularity.
 - **§13.1 edge cases.** Submodules, symlink and mode changes, large binaries,
@@ -576,6 +618,8 @@ reach stdout": true of a `-p` run, false of ours.
 | The shell owns no logic | `apps/desktop` | anything there that starts deciding belongs in a crate, where a test can reach it without a window |
 | The map card states the *outcome* beside the three-word pill | `branching-surface.md`, §10 | new, and an addition rather than a reversal: the three words answer *does this want me now*, so `failed`, `finished` and `abandoned` all collapse to **idle** — which is right, and which leaves a successful branch and a failed one looking identical on the one surface built for comparing branches. Outcome is a second axis, it is still on the row, and `format.ts` still spells all four words. The record propagates three words to "border, pill, sliver and card"; it never said the card shows only them |
 | A fork runs no post-create hook | `apps/desktop/src-tauri/src/lib.rs`, §13 | new, and the first caller had to choose: a shadow commit respects `.gitignore`, so a child's checkout has none of the parent's `node_modules` or `target` even though the parent has them on disk. `None`, because a hook is arbitrary user code and this app has no configuration surface for one — every run the window starts already runs none, and a fork that ran a command its parent never ran would be the shell deciding what builds the user's repository. The consequence is real and is stated on the surface rather than hidden: a fork of a project with a build step starts from a clean tracked checkout. When `StartRunRequest` grows a hook, the fork inherits it |
+| **One handle ends a run's event stream; every other producer gets one that cannot** | `crates/driver/src/sink.rs` | new, and it is what unblocked §12. The end of a run's live channel was "the last `mpsc::Sender` clone was dropped", which makes it a fact about reference counting rather than about the run — and the workspace MCP server's threads, which by design outlive the agent's process, held a clone. `StreamEnd` is not `Clone`, holds the only sender, and is moved into the reader thread, so the stream ends where the thread that produces the run's last event returns; `EventSink` is the clonable half and holds no sender at all. The two fixes the roadmap had proposed — let the listener release the sink, or give the supervisor a second end condition — both keep "who is still holding one" as a question someone has to get right at each call site, and a second end condition needs a polling loop or a sentinel event besides. Making it unanswerable is cheaper than answering it |
+| **`Listener::shutdown` ends its open connections rather than waiting for them** | `crates/workspace-mcp/src/listener.rs` | new, and the same argument one layer down: `Session::wait` reclaims the run's event-log connection by unwrapping the `Arc` the workspace is behind, so a connection thread still running makes that a race — and a run that lost it would sit in the database saying `Running` forever. Waiting for the peer is not an option, since a relay holds its connection for the life of its agent; so each open socket is half-closed under its own thread, which turns a blocking read into an EOF and makes the join that follows bounded by one line of output |
 
 ### What building decided that the design had not
 
@@ -628,6 +672,46 @@ reach stdout": true of a `-p` run, false of ours.
   that survived; deletions come from `removed_at` (the pickaxe). A UI that only
   blames silently shows no attribution for removals, which looks like working
   software.
+- **A channel that ends when its last sender drops is a reference count, not
+  an end condition.** The driver's live event channel has two producers — the
+  thread reading stdout, and whatever socket thread the workspace MCP server is
+  serving a permission request on — and one consumer, `Registry::supervise`,
+  whose only signal is disconnection. Because the listener came down inside
+  `Session::wait`, and the supervisor reaches that wait only *after* its drain
+  returns, a supervised run hosting the permission server deadlocked: the drain
+  waited for a close that waited for the wait the drain was blocking. It was
+  refused at the door rather than left to hang, and the refusal outlived its
+  cause and blocked the feature. The general shape is the part to keep:
+  **whenever a stream's end is "everybody let go", the set of holders is the
+  contract, and it is invisible at every call site that clones one.**
+  `driver::sink` answers it by type — see §8's table — and the same trap is
+  available to any future producer of a run's events, or to any other channel
+  whose close is load-bearing.
+- **A channel that ends when the last sender drops ends when the last *holder*
+  drops, and holders are easy to acquire by accident.** This one cost §12 the
+  whole of V1 so far. A run's live stream was an `mpsc` channel, so "the run is
+  over" meant "every `Sender` clone has been dropped" — a fact about reference
+  counting rather than about the run. The workspace MCP server's listener
+  threads outlive the agent's process *by design*, they held a clone, and so a
+  supervised run that hosted the server could never be reaped. The driver
+  refused to start one rather than hang, which read for months like a policy
+  about permissions and was a deadlock wearing its coat.
+  `crates/driver/src/sink.rs` answers it by type — `StreamEnd` is not `Clone`,
+  owns the only sender and is moved into the reader thread; `EventSink` is what
+  everything else gets and holds no sender — because the alternative is
+  auditing every call site forever for who is still holding one. Reach for the
+  same shape whenever the end of a stream is a question about ownership rather
+  than about the work.
+- **A second descriptor on a socket keeps it open after the thread serving it
+  has gone.** The fix above gave `Listener` a cloned `UnixStream` per
+  connection so it could half-close one whose peer had gone quiet. The kernel
+  sends FIN when the *last* descriptor closes, so a serving thread that
+  finished normally left the peer reading a socket nobody would ever write to
+  again — and a relay waits on that socket for the life of its `claude`
+  process, so the process never exited and neither did anything waiting on it.
+  `serve` now half-closes on every exit including a panic. The symptom was one
+  test hanging forever, which is a CI timeout rather than a red test, which is
+  why the bounded-wait rule below is not pedantry.
 - **Events produced at process exit must reach the live view, not just the
   log.** `run.finished` is not a line of stdout. The first real run against
   Claude Code showed every run looking unfinished because of this; there is a
