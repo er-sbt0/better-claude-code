@@ -52,7 +52,13 @@ pub enum Thinking {
 #[derive(Debug, Clone)]
 pub struct LaunchSpec {
     pub binary: PathBuf,
-    /// Always the run's worktree, never the user's own checkout (§13).
+    /// A worktree, never the user's own checkout (§13).
+    ///
+    /// Usually the run's own. A fork that has not written has none yet, and
+    /// works in the nearest ancestor's until it does — see [`crate::fork`],
+    /// which is also where the argument for that lives. The half of this that
+    /// never bends is the second half: no run of ours has the user's checkout
+    /// as its working directory.
     pub cwd: PathBuf,
     /// We assign it rather than reading it back out of the stream, so the run
     /// row can be resumed before the process has said anything (§14).
@@ -74,6 +80,20 @@ pub struct LaunchSpec {
     pub partial_messages: bool,
     /// Resume an earlier session by its id (§14).
     pub resume: Option<SessionId>,
+    /// Branch [`resume`](LaunchSpec::resume) at a chain entry instead of
+    /// continuing it: `--fork-session --resume-session-at <uuid>` (§19).
+    ///
+    /// The value is a **bare** chain-entry uuid — what
+    /// [`normalizer::claude_code::fork_address`] returns, never a
+    /// `raw_events.idempotency_key` straight out of the log, because the
+    /// `{uuid}#{i}` fan-out suffix is ours and the CLI refuses it by name.
+    /// [`validate`](LaunchSpec::validate) enforces that here rather than
+    /// letting a live run discover it.
+    ///
+    /// There is no "fork at the tip" spelling on purpose. The branching surface
+    /// anchors every fork to a message, and the tip is a message with an
+    /// address like any other.
+    pub fork_at: Option<String>,
     /// Escape hatch for flags this struct has no opinion about.
     pub extra: Vec<String>,
 }
@@ -97,6 +117,7 @@ impl LaunchSpec {
             thinking: Thinking::Summarized,
             partial_messages: false,
             resume: None,
+            fork_at: None,
             extra: Vec::new(),
         }
     }
@@ -129,6 +150,33 @@ impl LaunchSpec {
                     reason: format!(
                         "--permission-prompt-tool needs a fully qualified \
                          mcp__<server>__<tool> name, got {tool}"
+                    ),
+                });
+            }
+        }
+        if let Some(at) = &self.fork_at {
+            // `--fork-session` is documented "use with --resume or --continue",
+            // and the fork spike only ever ran it that way: without a session
+            // to branch, there is nothing for the address to resolve against.
+            if self.resume.is_none() {
+                return Err(Error::LaunchSpec {
+                    reason: format!(
+                        "--resume-session-at {at} needs --resume: a fork branches a session, \
+                         and there is none to branch"
+                    ),
+                });
+            }
+            // Our fan-out suffix, not the provider's. Verified refused by name:
+            // `No message found with message.uuid of: <uuid>#0`. That failure
+            // arrives as a *completed* process with an error subtype rather
+            // than as a bad flag, so catching it here is the difference between
+            // a refused launch and a live run spent discovering it
+            // (`docs/verification/claude-code-fork-address.md`).
+            if at.contains('#') {
+                return Err(Error::LaunchSpec {
+                    reason: format!(
+                        "--resume-session-at takes a bare chain-entry uuid, got {at}: the \
+                         `#i` fan-out suffix is ours and the CLI refuses it by name"
                     ),
                 });
             }
@@ -233,6 +281,15 @@ impl LaunchSpec {
         if let Some(r) = &self.resume {
             push!("--resume");
             push!(r.0);
+        }
+        // `--session-id` is already above and unconditional, which is the half
+        // of forking §14 had built before §19 asked for it: the child is named
+        // by us, so its run row is resumable before the process has spoken.
+        // These two say which conversation it starts from.
+        if let Some(at) = &self.fork_at {
+            push!("--fork-session");
+            push!("--resume-session-at");
+            push!(at);
         }
         a.extend(self.extra.iter().cloned());
         push!("-p");

@@ -166,6 +166,22 @@ fn status(log: &EventLog, run: &RunId) -> RunStatus {
 
 // ------------------------------------------------------------------- agents --
 
+/// A refused fork, as the provider actually reports one: a `result` with
+/// `subtype: "error_during_execution"` and a fresh `session_id` of its own,
+/// from a process that starts and stops cleanly.
+///
+/// The exit status is 0 deliberately. That is the case the row status has to
+/// survive — `docs/verification/claude-code-fork-address.md` is explicit that
+/// an unresolvable `--resume-session-at` is loud in the stream and nowhere
+/// else, and that a refused fork still gets a session id, so neither "we got a
+/// result" nor "we got a session id" is evidence the fork worked.
+const REFUSED: &str = r#"#!/usr/bin/env bash
+cat > /dev/null &
+printf '%s\n' '{"type":"system","subtype":"init","uuid":"u0","session_id":"f9bdee13","cwd":"'"$PWD"'","tools":[],"mcp_servers":[],"model":"claude-sonnet-5","permissionMode":"default"}'
+printf '%s\n' '{"type":"result","uuid":"u1","subtype":"error_during_execution","result_index":0,"is_error":true,"num_turns":0,"duration_ms":10,"total_cost_usd":0,"modelUsage":{},"permission_denials":[],"errors":["No message found with message.uuid of: nope"]}'
+exit 0
+"#;
+
 /// One turn, then exit without being told to. A real agent does not do this —
 /// it is the control case for "the stream ended on its own".
 const ONE_TURN: &str = r#"#!/usr/bin/env bash
@@ -215,7 +231,10 @@ fn a_run_is_reaped_when_its_stream_ends() {
         .unwrap();
     assert_eq!(live.run_id, run);
     assert_eq!(live.branch, "agent/run_reap");
-    assert!(live.worktree_path.exists(), "the run has a worktree (§13)");
+    assert!(
+        live.worktree_path.is_some_and(|p| p.exists()),
+        "a run started from nothing has a worktree (§13); only a fork lacks one"
+    );
 
     // The tail events a process exit produces reach the callback, not only the
     // log. A live view that misses these shows every run as unfinished.
@@ -475,5 +494,55 @@ fn a_run_hosting_the_workspace_mcp_server_is_refused() {
     assert!(
         !repo.join(".git/worktrees").exists(),
         "the refused run got a worktree anyway"
+    );
+}
+
+/// A run that failed in the stream is never filed as finished, however politely
+/// its process exited.
+///
+/// This is the shape a refused fork arrives in: `--resume-session-at` on an
+/// address that resolves nowhere produces `error_during_execution` from a
+/// process that started, answered nothing and exited. Deriving the row's status
+/// from the exit code alone would call that `Finished`, and the run list would
+/// show a branch that does not exist as a branch that worked.
+#[test]
+fn a_run_that_failed_in_the_stream_is_not_filed_as_finished() {
+    let home = TempDir::new("refused");
+    let repo = repo(home.path());
+    let bin = stub_agent(home.path(), "refused", REFUSED);
+    let run = RunId::from("run_refused");
+    let db = home.path().join("log.sqlite");
+
+    let registry = registry();
+    let (on_event, _rx) = events();
+    registry
+        .start(
+            EventLog::open(&db).unwrap(),
+            spec(&repo, &bin, &run),
+            on_event,
+        )
+        .unwrap();
+    eventually("the refused run to be reaped", || !registry.is_live(&run));
+
+    let log = EventLog::open(&db).unwrap();
+    eventually("the run row to be closed", || {
+        status(&log, &run) != RunStatus::Running
+    });
+    assert_eq!(
+        status(&log, &run),
+        RunStatus::Failed,
+        "the process exited 0; acceptance is read off the result subtype"
+    );
+
+    let types: Vec<String> = log
+        .events(&run)
+        .unwrap()
+        .iter()
+        .map(|e| e.type_name().to_owned())
+        .collect();
+    assert!(types.contains(&"run.failed".to_owned()), "{types:?}");
+    assert!(
+        !types.contains(&"assistant.message".to_owned()),
+        "a refused fork answers nothing: {types:?}"
     );
 }

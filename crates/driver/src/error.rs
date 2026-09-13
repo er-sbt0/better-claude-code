@@ -30,6 +30,35 @@ pub enum Error {
     #[error("the launch spec is not coherent: {reason}")]
     LaunchSpec { reason: String },
 
+    /// A fork whose parent the log does not have.
+    #[error("run {0} is not in the log")]
+    NoSuchRun(agent_protocol::RunId),
+
+    /// A fork anchored at a `seq` the parent's log does not contain. Holes are
+    /// normal — a replayed event consumes a `seq` and then deduplicates away
+    /// (§8) — so this is a lookup failure, not a corruption.
+    #[error("run {run} has no event at seq {seq}")]
+    NoSuchEvent { run: String, seq: u64 },
+
+    /// A fork anchored at a block that has no provider address.
+    ///
+    /// Not every block has one: out-of-band events carry no key, and the user's
+    /// own prompt entries never reach stdout. Refused rather than rounded to a
+    /// neighbouring block that does have one — see [`crate::ForkPoint::resolve`].
+    #[error(
+        "the {event} at run {run} seq {seq} has no chain-entry uuid, so it cannot be \
+         a branch point"
+    )]
+    NotAddressable {
+        run: String,
+        seq: u64,
+        event: String,
+    },
+
+    /// A fork that cannot be placed at all.
+    #[error("run {run} cannot be forked: {reason}")]
+    CannotFork { run: String, reason: String },
+
     #[error(transparent)]
     WorkspaceMcp(#[from] workspace_mcp::Error),
 

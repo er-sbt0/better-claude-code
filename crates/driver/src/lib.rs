@@ -3,8 +3,14 @@
 //! It owns the four things only the component that launches the process can
 //! own, and each of them is a rule from the design rather than a convenience:
 //!
-//! - **The worktree comes first** (§13). A run is created *with* its worktree;
-//!   the user's own checkout is never an agent's working directory.
+//! - **A run that *writes* is created with its worktree** (§13). The user's own
+//!   checkout is never an agent's working directory, and nothing an agent
+//!   writes lands outside the tree its own run owns. The rule used to read "the
+//!   worktree comes first"; `docs/branching-surface.md` overturned that wording
+//!   and left the invariant standing, because the tree buys clean shadow
+//!   attribution (§13.1) and that is only owed once a run writes. [`start`]
+//!   still makes the tree up front. [`fork`] makes none at all, and
+//!   [`ensure_tree`] is the seam a treeless run acquires one through.
 //! - **The shadow history is rooted after the post-create hook and before the
 //!   first tool call** (§13.1). Any earlier and every file the hook wrote is
 //!   attributed to the run's first `Edit`.
@@ -83,6 +89,98 @@ pub struct RunSpec {
     pub workspace_mcp: Option<WorkspaceMcp>,
 }
 
+impl RunSpec {
+    /// The git half of this spec, for [`ensure_tree`].
+    pub fn tree_spec(&self) -> TreeSpec {
+        TreeSpec {
+            run_id: self.run_id.clone(),
+            repo: self.repo.clone(),
+            branch: self.branch.clone(),
+            base: self.base.clone(),
+            post_create_hook: self.post_create_hook.clone(),
+        }
+    }
+}
+
+/// Everything needed to fork a run, above the launch flags.
+#[derive(Debug, Clone)]
+pub struct ForkSpec {
+    /// The child's run id. Ours, like every run id (§14).
+    pub run_id: RunId,
+    /// Where the branch is anchored, resolved by [`ForkPoint::resolve`].
+    pub at: ForkPoint,
+    pub prompt: String,
+    /// Launch flags. `cwd`, `resume` and `fork_at` are overwritten by [`fork`]
+    /// — the first because §13 does not leave a working directory to the
+    /// caller, the other two because they *are* the fork. `session_id` is the
+    /// caller's: it names the child.
+    pub launch: LaunchSpec,
+    pub workspace_mcp: Option<WorkspaceMcp>,
+}
+
+/// A resolved branch point: a `seq` in the parent's log, and the provider
+/// address that block carries.
+///
+/// Two identifiers for one moment, and both are needed. The `seq` is ours and
+/// is what the graph edge is stored as; the address is the provider's and is
+/// the only thing `--resume-session-at` understands. Resolving one to the other
+/// is [`ForkPoint::resolve`], and it can fail — which is the point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkPoint {
+    pub parent: RunId,
+    /// A `seq` in the **parent's** log.
+    pub seq: u64,
+    /// The bare chain-entry uuid `--resume-session-at` accepts.
+    pub address: String,
+}
+
+impl ForkPoint {
+    /// Resolve the block at `seq` in `parent`'s log to a provider address.
+    ///
+    /// Fallible on purpose, and in two distinguishable ways: there may be no
+    /// event at that `seq`, or the event may have no address. The second is not
+    /// a corner case. Out-of-band events carry no `idempotency_key` at all —
+    /// permission decisions reach us over the MCP channel and `run.finished` is
+    /// made at process exit — and the user's own prompt entries never reach
+    /// stdout either, so they are unaddressable even though they are chain
+    /// entries (`docs/verification/claude-code-fork-address.md`). *Every keyed
+    /// block is forkable* is true; *every block is forkable* is false.
+    ///
+    /// It does **not** fall back to a nearby block that does have an address.
+    /// `branching-surface.md` rejected snapping, and the reason is on the
+    /// screen rather than in the schema: the child's inherited-context strip
+    /// states a message count out loud, and a fork that silently rewound past
+    /// the block the user clicked would make the one surface whose job is to
+    /// say where you came from lie about it.
+    pub fn resolve(log: &EventLog, parent: &RunId, seq: u64) -> Result<ForkPoint> {
+        // `seq` 0 belongs to no event ([`SEQ_BEFORE_RUN`]), and `events_after`
+        // is exclusive, so asking for the one event after `seq - 1` is how a
+        // single `seq` is read. A saturating subtraction keeps 0 out of range
+        // rather than wrapping into it.
+        let found = log
+            .events_after(parent, seq.saturating_sub(1), 1)?
+            .into_iter()
+            .find(|e| e.seq == seq)
+            .ok_or_else(|| Error::NoSuchEvent {
+                run: parent.0.clone(),
+                seq,
+            })?;
+
+        let address = normalizer::claude_code::fork_address(found.idempotency_key.as_deref())
+            .ok_or_else(|| Error::NotAddressable {
+                run: parent.0.clone(),
+                seq,
+                event: found.type_name().to_owned(),
+            })?;
+
+        Ok(ForkPoint {
+            parent: parent.clone(),
+            seq,
+            address: address.to_owned(),
+        })
+    }
+}
+
 /// How to host the workspace MCP server for one run.
 #[derive(Clone)]
 pub struct WorkspaceMcp {
@@ -126,74 +224,366 @@ pub fn default_runtime_dir() -> PathBuf {
         .join("agent-workspace")
 }
 
-/// A started run: its worktree, its shadow history, and the live process.
+/// A started run: the live process, and the git half of it if it has one yet.
 pub struct Started {
     pub session: Session,
+    /// `None` for a [`fork`] that has not written anything: it has no worktree
+    /// and no shadow ref, and acquires neither until [`ensure_tree`] is called
+    /// on its first mutating tool call.
+    ///
+    /// An `Option` rather than a placeholder path and an empty string, because
+    /// §13.1 requires Review to *say* attribution is unavailable for such a
+    /// run, and it can only say that if the absence survives being written
+    /// down. A fake path would be indistinguishable from a real one exactly
+    /// where it matters.
+    pub tree: Option<StartedTree>,
+}
+
+/// Where a started run's git state landed.
+pub struct StartedTree {
     pub worktree: Worktree,
+    /// `refs/agent-workspace/runs/<id>` — what Review attributes against
+    /// (§13.1).
     pub shadow_ref: String,
+}
+
+/// Everything [`ensure_tree`] needs: what a run is about git, and nothing about
+/// a process.
+///
+/// Separate from [`RunSpec`] because the two halves are no longer made at the
+/// same moment. A forked run is spawned now and given a tree later, and the
+/// later caller has a run row and a branch point rather than a `RunSpec`.
+#[derive(Debug, Clone)]
+pub struct TreeSpec {
+    pub run_id: RunId,
+    /// The user's repository. Never the agent's cwd.
+    pub repo: PathBuf,
+    pub branch: String,
+    /// Commit-ish the worktree branches from. For a root run, whatever the user
+    /// chose; for a fork acquiring its tree late, the parent's shadow commit at
+    /// the branch point (§19).
+    pub base: String,
+    pub post_create_hook: Option<Vec<String>>,
+}
+
+/// The git half of a run: the tree it works in, and its rooted shadow history.
+pub struct Tree {
+    pub worktree: Worktree,
+    pub shadow: ShadowHistory,
 }
 
 /// Create the worktree, root the shadow history, record the run, and spawn.
 ///
-/// The order is the contract. Each step depends on the one before it, and two
-/// of the dependencies are not obvious: the hook has to run before the shadow
-/// history is rooted, and the run row has to exist before the first event is
-/// appended, because the log refuses events for a run it does not know.
+/// The order is still the contract, and the split below preserves every
+/// dependency in it rather than reordering anything. [`ensure_tree`] does the
+/// git — worktree, then the post-create hook, then the shadow root, because a
+/// root taken before the hook attributes every file the hook wrote to the run's
+/// first `Edit` (§13.1). [`spawn_run`] then records the run *before* a single
+/// event is appended, because the log refuses events for a run it does not
+/// know.
+///
+/// What the split buys is that the second half can run without the first.
+/// [`fork`] calls only [`spawn_run`], so a fork costs no git at all, and a
+/// forked run calls [`ensure_tree`] later — on its first mutating tool call —
+/// with a `base` it could not have known here. See `docs/branching-surface.md`,
+/// "The worktree arrives late".
 pub fn start(
-    mut log: EventLog,
+    log: EventLog,
     mut spec: RunSpec,
     started_at: &str,
     sink: Option<Sender<RawEvent>>,
 ) -> Result<Started> {
-    let wt = Worktree::create(&spec.repo, &spec.run_id, &spec.branch, &spec.base)?;
+    let tree = ensure_tree(&spec.tree_spec())?;
+    let shadow_ref = tree.shadow.ref_name().to_owned();
 
-    if let Some(hook) = &spec.post_create_hook {
-        run_hook(wt.path(), hook)?;
-    }
+    // §13 does not leave this to the caller: the agent's cwd is the tree this
+    // run owns, and nothing else.
+    spec.launch.cwd = tree.worktree.path().to_path_buf();
 
-    let (shadow, _root) = ShadowHistory::begin(&wt, &spec.run_id, SEQ_BEFORE_RUN)?;
-    let shadow_ref = shadow.ref_name().to_owned();
-
-    log.create_run(&Run {
-        id: spec.run_id.clone(),
-        agent: normalizer::claude_code::AGENT_ID.to_owned(),
-        agent_version: None,
-        // §14: assigned, not captured. The run is resumable before the process
-        // has said anything.
-        provider_session_id: Some(spec.launch.session_id.clone()),
-        workspace_path: spec.repo.display().to_string(),
-        worktree_path: Some(wt.path().display().to_string()),
-        branch: Some(spec.branch.clone()),
-        shadow_ref: Some(shadow_ref.clone()),
-        prompt: Some(spec.prompt.clone()),
-        status: RunStatus::Running,
-        started_at: started_at.to_owned(),
-        finished_at: None,
-        // A root run: no parent, therefore no branch point. The fork path that
-        // fills both in is not built yet (§19).
-        parent_run_id: None,
-        branch_point_seq: None,
-    })?;
-
-    spec.launch.cwd = wt.path().to_path_buf();
-    let pipeline = Arc::new(Mutex::new(Pipeline::new(
-        spec.run_id.clone(),
+    let session = spawn_run(
         log,
-        Some(shadow),
-    )));
-    let mcp = wire_workspace_mcp(
-        &mut spec.launch,
-        &spec.run_id,
-        spec.workspace_mcp.as_ref(),
-        &pipeline,
-        sink.as_ref(),
+        SpawnSpec {
+            row: Run {
+                id: spec.run_id.clone(),
+                agent: normalizer::claude_code::AGENT_ID.to_owned(),
+                agent_version: None,
+                // §14: assigned, not captured. The run is resumable before the
+                // process has said anything.
+                provider_session_id: Some(spec.launch.session_id.clone()),
+                workspace_path: spec.repo.display().to_string(),
+                worktree_path: Some(tree.worktree.path().display().to_string()),
+                branch: Some(spec.branch.clone()),
+                shadow_ref: Some(shadow_ref.clone()),
+                prompt: Some(spec.prompt.clone()),
+                status: RunStatus::Running,
+                started_at: started_at.to_owned(),
+                finished_at: None,
+                // A root run: no parent, therefore no branch point. [`fork`]
+                // is what fills both in (§19).
+                parent_run_id: None,
+                branch_point_seq: None,
+            },
+            launch: spec.launch,
+            shadow: Some(tree.shadow),
+            prompt: &spec.prompt,
+            workspace_mcp: spec.workspace_mcp.as_ref(),
+            sink,
+        },
     )?;
-    let session = process::spawn(&spec.launch, pipeline, &spec.prompt, sink, mcp)?;
 
     Ok(Started {
         session,
-        worktree: wt,
-        shadow_ref,
+        tree: Some(StartedTree {
+            worktree: tree.worktree,
+            shadow_ref,
+        }),
+    })
+}
+
+/// The git half of starting a run: worktree, post-create hook, shadow root.
+///
+/// This is a seam, not a step. [`start`] calls it first and always; [`fork`]
+/// never calls it, and a forked run calls it the first time it is about to
+/// write — which is the whole of `branching-surface.md`'s "the worktree arrives
+/// late". Keeping the three operations in one function rather than three calls
+/// at each site is deliberate, because their order is load-bearing and only one
+/// of the two orderings is obvious:
+///
+/// - The **hook runs before the shadow root**. [`SEQ_BEFORE_RUN`] labels the
+///   root "the worktree as the agent found it", and the agent finds it after
+///   dependency install and codegen have run. Rooting first hands every file
+///   the hook wrote to whichever tool call snapshots next (§13.1).
+/// - The **worktree exists before the hook**, which is worth saying only
+///   because the hook is the one step here that runs arbitrary user code — and
+///   it runs in the new tree, never in the user's checkout.
+///
+/// Idempotent it is not: `Worktree::create` refuses a path that already exists,
+/// so a second call for the same run is an error rather than a no-op. That is
+/// the right failure for a caller that has lost track of whether a run has a
+/// tree, since the alternative is silently re-rooting a shadow history that
+/// already has commits in it.
+pub fn ensure_tree(spec: &TreeSpec) -> Result<Tree> {
+    let worktree = Worktree::create(&spec.repo, &spec.run_id, &spec.branch, &spec.base)?;
+
+    if let Some(hook) = &spec.post_create_hook {
+        run_hook(worktree.path(), hook)?;
+    }
+
+    let (shadow, _root) = ShadowHistory::begin(&worktree, &spec.run_id, SEQ_BEFORE_RUN)?;
+    Ok(Tree { worktree, shadow })
+}
+
+/// Fork a run: a new session branched at a message, and **no git work at all**.
+///
+/// `--fork-session`, a `--session-id` we assign like every other run's (§14),
+/// and a `--resume-session-at` resolved from the parent's own log
+/// ([`ForkPoint::resolve`]). The child's row carries both halves of the graph
+/// edge — `parent_run_id` and `branch_point_seq`, which the provider records
+/// nowhere and which cannot be reconstructed later — and carries **no**
+/// `worktree_path` and **no** `shadow_ref`, because it has neither yet.
+///
+/// # Where a treeless fork works
+///
+/// The child's cwd is the **nearest ancestor's worktree**: its parent's, or
+/// that run's parent's, up the chain to a root run, which always has one. Never
+/// the user's own checkout, and never an empty directory.
+///
+/// §13's invariant, as `branching-surface.md` restates it, is that *a run that
+/// writes never writes into the user's checkout*. A fork that has only read is
+/// not violating it even if the user's checkout is its cwd — but that makes the
+/// invariant conditional on a gate, and an invariant that holds only while
+/// something else works is one nobody can check. The ancestor's worktree keeps
+/// it unconditional: no run of ours ever has the user's checkout as its cwd,
+/// which is exactly what [`LaunchSpec::cwd`] has claimed since §13.
+///
+/// It is also the right content. A fork of a conversation is a fork of what
+/// that conversation was looking at, so the parent's tree is the one where the
+/// child's `Read`s and `Grep`s find what its inherited context refers to. One
+/// wart, recorded rather than hidden: that is the parent's tree *now*, not at
+/// the branch point, so a child forked at an early `seq` can read a file the
+/// parent has since changed. Reading ahead of the branch point is tolerable.
+/// Writing from there is not, which is the next paragraph.
+///
+/// # What stops a write from the wrong cwd
+///
+/// Not this function, deliberately — the stop belongs at the moment the answer
+/// changes rather than at the moment the question is asked. The tree has to
+/// exist *before* the first mutating tool call runs, not after, so the
+/// permission boundary is the hook: hold the child's first `Edit`/`Write`/
+/// `Bash`, call [`ensure_tree`] with the parent's shadow commit at
+/// [`ForkPoint::seq`] as its `base`, install the [`ShadowHistory`] on the
+/// pipeline, and only then let the call through.
+///
+/// Until that exists, a treeless fork is only honest under a posture that
+/// cannot approve a mutating tool without us: [`Permission::DenyPrompts`],
+/// which denies anything that would prompt, or [`Permission::AskVia`], which is
+/// that hook. A [`Permission::Mode`] fork has no gate at all and will write
+/// into its ancestor's worktree.
+///
+/// The second consequence is quieter and is the reason the first is a
+/// correctness requirement rather than tidiness: a treeless run's [`Pipeline`]
+/// has no [`ShadowHistory`], so nothing it writes is snapshotted. Its edits
+/// would not merely land in the wrong tree — they would land unattributed, and
+/// §13.1 has no way to notice afterwards.
+///
+/// # A refused fork is a finished process, not a failed spawn
+///
+/// An address the provider cannot resolve is refused loudly, but the refusal
+/// arrives as a `result` with `subtype: "error_during_execution"` from a
+/// process that started and exited normally — never as an `Err` from here. The
+/// refused run is even handed a fresh `session_id` of its own, so neither "we
+/// got a result" nor "we got a session id" means the fork worked
+/// (`docs/verification/claude-code-fork-address.md`).
+///
+/// Acceptance is therefore read off `subtype`, and it already is: the
+/// normalizer treats any non-`success` subtype as a failed turn and ends the
+/// run as `run.failed`. So a refused fork reaches the log as a failed run with
+/// no assistant output, and the one place that could have contradicted it —
+/// the run row's final status, which [`Registry`] used to derive from the exit
+/// code alone — reads the log instead.
+pub fn fork(
+    log: EventLog,
+    mut spec: ForkSpec,
+    started_at: &str,
+    sink: Option<Sender<RawEvent>>,
+) -> Result<Started> {
+    let parent = log
+        .run(&spec.at.parent)?
+        .ok_or_else(|| Error::NoSuchRun(spec.at.parent.clone()))?;
+    let Some(parent_session) = parent.provider_session_id.clone() else {
+        return Err(Error::CannotFork {
+            run: parent.id.0.clone(),
+            reason: "the parent has no provider session id, so there is nothing to \
+                     --fork-session from"
+                .to_owned(),
+        });
+    };
+
+    // See "Where a treeless fork works" above. Resolved before anything is
+    // written down, because a fork we cannot place is a fork we must refuse
+    // rather than place badly.
+    spec.launch.cwd = inherited_cwd(&log, &parent)?;
+    spec.launch.resume = Some(parent_session);
+    spec.launch.fork_at = Some(spec.at.address.clone());
+
+    let session = spawn_run(
+        log,
+        SpawnSpec {
+            row: Run {
+                id: spec.run_id.clone(),
+                agent: normalizer::claude_code::AGENT_ID.to_owned(),
+                agent_version: None,
+                provider_session_id: Some(spec.launch.session_id.clone()),
+                workspace_path: parent.workspace_path.clone(),
+                // Both absent, and both for the same reason: this run has done
+                // no git. `Run::check_fork_pairing` has nothing to say about
+                // these two — it guards the edge below — but Review does, and
+                // §13.1's answer for a missing ref is "attribution
+                // unavailable", not silence.
+                worktree_path: None,
+                branch: None,
+                shadow_ref: None,
+                prompt: Some(spec.prompt.clone()),
+                status: RunStatus::Running,
+                started_at: started_at.to_owned(),
+                finished_at: None,
+                // The graph edge, whole. `create_run` refuses half of one, and
+                // half is all anyone would ever be able to recover: the
+                // provider re-stamps a forked transcript with its own id and
+                // records no parentage (§19).
+                parent_run_id: Some(spec.at.parent.clone()),
+                branch_point_seq: Some(spec.at.seq),
+            },
+            launch: spec.launch,
+            // No tree, so no shadow history, so no snapshots. See above.
+            shadow: None,
+            prompt: &spec.prompt,
+            workspace_mcp: spec.workspace_mcp.as_ref(),
+            sink,
+        },
+    )?;
+
+    Ok(Started {
+        session,
+        tree: None,
+    })
+}
+
+/// The non-git half of starting a run.
+struct SpawnSpec<'a> {
+    row: Run,
+    launch: LaunchSpec,
+    shadow: Option<ShadowHistory>,
+    prompt: &'a str,
+    workspace_mcp: Option<&'a WorkspaceMcp>,
+    sink: Option<Sender<RawEvent>>,
+}
+
+/// Record the run, wire the MCP server, and spawn. Touches no git.
+///
+/// The run row is written first and that is not stylistic: the log refuses an
+/// event for a run it does not know, and the first event arrives as soon as the
+/// process speaks.
+fn spawn_run(mut log: EventLog, spec: SpawnSpec<'_>) -> Result<Session> {
+    let SpawnSpec {
+        row,
+        mut launch,
+        shadow,
+        prompt,
+        workspace_mcp,
+        sink,
+    } = spec;
+
+    let run_id = row.id.clone();
+    log.create_run(&row)?;
+
+    let pipeline = Arc::new(Mutex::new(Pipeline::new(run_id.clone(), log, shadow)));
+    let mcp = wire_workspace_mcp(
+        &mut launch,
+        &run_id,
+        workspace_mcp,
+        &pipeline,
+        sink.as_ref(),
+    )?;
+    process::spawn(&launch, pipeline, prompt, sink, mcp)
+}
+
+/// The directory a run with no worktree of its own works in.
+///
+/// Walks `parent_run_id` until it finds a run that has one. A root run always
+/// does, so this terminates on any chain this driver produced; the bound and
+/// the refusal below exist because the log is data, and data outlives the code
+/// that wrote it.
+///
+/// It never falls back to `workspace_path`. That column is the user's own
+/// checkout, and handing it to an agent is the one thing §13 exists to prevent
+/// — so an unplaceable fork is refused rather than placed there.
+fn inherited_cwd(log: &EventLog, parent: &Run) -> Result<PathBuf> {
+    /// Longer than any fork chain a human produces, short enough that a cycle
+    /// in `parent_run_id` ends as an error instead of a hang.
+    const MAX_DEPTH: usize = 64;
+
+    let mut run = parent.clone();
+    for _ in 0..MAX_DEPTH {
+        if let Some(path) = &run.worktree_path {
+            return Ok(PathBuf::from(path));
+        }
+        let Some(next) = run.parent_run_id.clone() else {
+            break;
+        };
+        let Some(ancestor) = log.run(&next)? else {
+            return Err(Error::CannotFork {
+                run: parent.id.0.clone(),
+                reason: format!("its ancestor {} is not in the log", next.0),
+            });
+        };
+        run = ancestor;
+    }
+    Err(Error::CannotFork {
+        run: parent.id.0.clone(),
+        reason: "no run in its ancestry has a worktree, so the fork has nowhere to work \
+                 that is not the user's own checkout"
+            .to_owned(),
     })
 }
 

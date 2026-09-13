@@ -165,6 +165,92 @@ fn argv_is_the_verified_launch_shape() {
     let mut s2 = s.clone();
     s2.append_system_prompt = Some("the workspace tools exist".to_owned());
     assert!(s2.argv().join(" ").contains("--system-prompt-snapshot off"));
+
+    // A run that starts fresh continues nothing and branches nothing. Worth an
+    // assertion rather than an eyeball: `--fork-session` on a plain start would
+    // silently hand the run a session id we did not assign (§14).
+    for absent in ["--resume", "--fork-session", "--resume-session-at"] {
+        assert!(
+            !joined.contains(absent),
+            "a normal start must not carry `{absent}`: {joined}"
+        );
+    }
+}
+
+/// §19's fork, as argv. Three flags plus the one that was always there.
+#[test]
+fn forking_argv_names_the_child_and_the_branch_point() {
+    let mut s = LaunchSpec::new(
+        "/wt",
+        agent_protocol::SessionId::from("child-session"),
+        Permission::DenyPrompts,
+    );
+    s.resume = Some(agent_protocol::SessionId::from("parent-session"));
+    s.fork_at = Some("93e6a054-0e51-4425-a90b-b46f7e28dc1c".to_owned());
+    s.validate().unwrap();
+    let joined = s.argv().join(" ");
+
+    for required in [
+        // The parent conversation. `--fork-session` is documented "use with
+        // --resume", and without it there is nothing to branch.
+        "--resume parent-session",
+        // A new session id instead of reusing the parent's...
+        "--fork-session",
+        // ...except that we assign it, so the child is addressable before the
+        // process speaks (§14). This is the flag that was already here.
+        "--session-id child-session",
+        // The branch point: a bare chain-entry uuid, off our own
+        // `raw_events.idempotency_key`.
+        "--resume-session-at 93e6a054-0e51-4425-a90b-b46f7e28dc1c",
+    ] {
+        assert!(
+            joined.contains(required),
+            "a forked argv is missing `{required}`: {joined}"
+        );
+    }
+
+    // Verified refused by name, so refuse it here rather than spend a live run
+    // on it: `No message found with message.uuid of: <uuid>#0`.
+    let mut suffixed = s.clone();
+    suffixed.fork_at = Some("93e6a054-0e51-4425-a90b-b46f7e28dc1c#0".to_owned());
+    assert!(
+        suffixed.validate().is_err(),
+        "the `#i` fan-out suffix is ours; the CLI refuses it"
+    );
+
+    // A branch point with nothing to branch.
+    let mut orphan = s.clone();
+    orphan.resume = None;
+    assert!(
+        orphan.validate().is_err(),
+        "--resume-session-at needs --resume"
+    );
+}
+
+/// The `{uuid}#{i}` fan-out is ours, and an unkeyed block has no address at all.
+///
+/// Both halves were bought live (`claude-code-fork-address.md`): the suffixed
+/// form is refused by name, and the user's own chain entries never reach stdout
+/// so nothing keys them. The second is why this is a fallible lookup and not an
+/// accessor.
+#[test]
+fn an_address_is_the_part_before_the_hash_and_may_not_exist() {
+    use normalizer::claude_code::fork_address;
+
+    let bare = "93e6a054-0e51-4425-a90b-b46f7e28dc1c";
+    assert_eq!(fork_address(Some(bare)), Some(bare));
+    assert_eq!(
+        fork_address(Some(&format!("{bare}#0"))),
+        Some(bare),
+        "one provider line fanned into several events is still one chain entry"
+    );
+    assert_eq!(fork_address(Some(&format!("{bare}#11"))), Some(bare));
+
+    // No key means no address, and nothing else. Not the run's first block, not
+    // the nearest keyed neighbour: `branching-surface.md` rejected snapping.
+    assert_eq!(fork_address(None), None);
+    assert_eq!(fork_address(Some("")), None);
+    assert_eq!(fork_address(Some("#0")), None);
 }
 
 /// The whole spine: worktree, shadow root, run row, spawn, stream, log,
@@ -184,7 +270,7 @@ fn a_run_produces_a_log_and_an_attributable_diff() {
         None,
     )
     .unwrap();
-    let wt_path = started.worktree.path().to_path_buf();
+    let wt_path = started.tree.as_ref().unwrap().worktree.path().to_path_buf();
     let (outcome, log) = started.session.wait().unwrap();
 
     assert_eq!(outcome.exit_code, Some(0));
@@ -297,7 +383,7 @@ fn post_create_hook_output_is_attributed_to_the_run_not_to_a_tool_call() {
         "echo 'installed by the hook' > vendor.lock".to_owned(),
     ]);
     let started = driver::start(log, s, "2026-09-13T09:00:00.000Z", None).unwrap();
-    let wt_path = started.worktree.path().to_path_buf();
+    let wt_path = started.tree.as_ref().unwrap().worktree.path().to_path_buf();
     let (_, _log) = started.session.wait().unwrap();
 
     let wt = Worktree::open(&wt_path).unwrap();
@@ -473,6 +559,312 @@ const EDIT_THEN_REPORT_LINES: &[&str] = &[
     r#"{"type":"user","uuid":"u2","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"ok"}]}}"#,
     r#"{"type":"assistant","uuid":"u3","message":{"id":"m2","content":[{"type":"text","text":"done"}]}}"#,
 ];
+
+// ------------------------------------------------------------------- forks --
+
+/// A parent worth forking: one provider line that fans out into two events, so
+/// its `idempotency_key` carries our `#i` suffix and the address has to be
+/// stripped out of it.
+const FORK_PARENT: &str = r#"#!/usr/bin/env bash
+cat > /dev/null &
+emit() { printf '%s\n' "$1"; }
+emit '{"type":"system","subtype":"init","uuid":"u0","session_id":"s","cwd":"'"$PWD"'","tools":["Read"],"mcp_servers":[],"model":"claude-sonnet-5","permissionMode":"default"}'
+emit '{"type":"assistant","uuid":"u1","message":{"id":"m1","content":[{"type":"text","text":"let me look"},{"type":"tool_use","id":"toolu_01","name":"Read","input":{"file_path":"src/auth.ts"}}]}}'
+emit '{"type":"user","uuid":"u2","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"export const a = 1;"}]}}'
+emit '{"type":"assistant","uuid":"u3","message":{"id":"m2","content":[{"type":"text","text":"it returns 1"}]}}'
+emit '{"type":"result","uuid":"u4","subtype":"success","result_index":0,"is_error":false,"num_turns":1,"duration_ms":10,"total_cost_usd":0.01,"modelUsage":{"claude-sonnet-5":{"inputTokens":10,"outputTokens":5,"costUSD":0.01}},"permission_denials":[]}'
+"#;
+
+/// A forked child. Writes its own argv and cwd out so the flags the driver
+/// chose are an assertion rather than an inspection, then runs a turn that
+/// completes a tool call without touching a file — which is a snapshot the
+/// driver would take if this run had a shadow history, and does not.
+const FORK_CHILD: &str = r#"#!/usr/bin/env bash
+{ printf '%s\n' "$PWD"; printf '%s\n' "$@"; } > __DUMP__
+cat > /dev/null &
+emit() { printf '%s\n' "$1"; }
+emit '{"type":"system","subtype":"init","uuid":"c0","session_id":"s","cwd":"'"$PWD"'","tools":["Read"],"mcp_servers":[],"model":"claude-sonnet-5","permissionMode":"default"}'
+emit '{"type":"assistant","uuid":"c1","message":{"id":"m1","content":[{"type":"tool_use","id":"toolu_02","name":"Read","input":{"file_path":"src/auth.ts"}}]}}'
+emit '{"type":"user","uuid":"c2","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_02","content":"export const a = 1;"}]}}'
+emit '{"type":"result","uuid":"c3","subtype":"success","result_index":0,"is_error":false,"num_turns":1,"duration_ms":10,"total_cost_usd":0.01,"modelUsage":{"claude-sonnet-5":{"inputTokens":10,"outputTokens":5,"costUSD":0.01}},"permission_denials":[]}'
+"#;
+
+/// §19's fork, end to end: the address comes out of the parent's log, the edge
+/// goes into the child's row, and **git is not touched**.
+///
+/// The last part is the one that would rot quietly, so it is asserted against
+/// the repository itself rather than against a mock: the full worktree list and
+/// the full set of `refs/agent-workspace/` refs are compared before and after.
+/// Re-eagerizing the tree would add a directory and a ref, and both sides of
+/// that comparison would move.
+#[test]
+fn a_fork_branches_a_session_and_touches_no_git() {
+    let home = TempDir::new("fork");
+    let repo = repo(home.path()).canonicalize().unwrap();
+    let parent = RunId::from("run_parent");
+    let db = home.path().join("log.sqlite");
+
+    let started = driver::start(
+        EventLog::open(&db).unwrap(),
+        spec(&repo, &stub_agent(home.path(), FORK_PARENT), &parent),
+        "2026-09-13T09:00:00.000Z",
+        None,
+    )
+    .unwrap();
+    let parent_wt = started
+        .tree
+        .as_ref()
+        .expect("a run that starts from nothing gets a tree")
+        .worktree
+        .path()
+        .to_path_buf();
+    let (_, log) = started.session.wait().unwrap();
+    let parent_session = log
+        .run(&parent)
+        .unwrap()
+        .unwrap()
+        .provider_session_id
+        .unwrap();
+
+    // The branch point, resolved out of the log we already keep. `u1` arrived
+    // as one provider line carrying text *and* a tool call, so it fanned into
+    // two events keyed `u1#0` and `u1#1` -- the suffix is ours, and the CLI
+    // refuses it by name.
+    let events = log.events(&parent).unwrap();
+    let fanned = events
+        .iter()
+        .find(|e| e.idempotency_key.as_deref() == Some("u1#0"))
+        .expect("a provider line that fanned out");
+    let at = driver::ForkPoint::resolve(&log, &parent, fanned.seq).unwrap();
+    assert_eq!(at.address, "u1", "the address is the part before the '#'");
+    assert_eq!(at.seq, fanned.seq);
+
+    // And a block with no key has no address -- not a nearby one, not the
+    // run's first. `run.finished` is made at process exit and never had a
+    // provider uuid to key on.
+    let tail = events.last().unwrap();
+    assert_eq!(tail.type_name(), "run.finished");
+    assert!(tail.idempotency_key.is_none());
+    assert!(
+        matches!(
+            driver::ForkPoint::resolve(&log, &parent, tail.seq),
+            Err(driver::Error::NotAddressable { .. })
+        ),
+        "an unaddressable block must refuse, never snap to a neighbour"
+    );
+
+    // Everything git knows, before the fork.
+    let worktrees_before = git(&repo, &["worktree", "list", "--porcelain"]);
+    let refs_before = git(&repo, &["for-each-ref", "refs/agent-workspace/"]);
+
+    let child = RunId::from("run_child");
+    let dump = home.path().join("child-argv");
+    let child_bin = stub_agent(
+        home.path(),
+        &FORK_CHILD.replace("__DUMP__", &dump.display().to_string()),
+    );
+    let child_session = driver::new_session_id();
+    let mut launch = LaunchSpec::new(
+        // Deliberately nonsense: `fork` owns the cwd and must overwrite this.
+        "/definitely/not/a/checkout",
+        child_session.clone(),
+        Permission::DenyPrompts,
+    );
+    launch.binary = child_bin;
+    launch.thinking = Thinking::Off;
+
+    let forked = driver::fork(
+        EventLog::open(&db).unwrap(),
+        driver::ForkSpec {
+            run_id: child.clone(),
+            at: at.clone(),
+            prompt: "try it without the cache".to_owned(),
+            launch,
+            workspace_mcp: None,
+        },
+        "2026-09-13T09:05:00.000Z",
+        None,
+    )
+    .unwrap();
+    assert!(
+        forked.tree.is_none(),
+        "a fork has no worktree and no shadow ref, and says so"
+    );
+    let (outcome, log) = forked.session.wait().unwrap();
+    assert_eq!(outcome.exit_code, Some(0));
+    assert!(outcome.stored > 0, "nothing reached the log");
+    assert_eq!(
+        outcome.snapshots, 0,
+        "a completed tool call in a treeless run has no shadow history to land in"
+    );
+
+    // The flags, as the child actually received them.
+    let dumped = fs::read_to_string(&dump).unwrap();
+    let mut lines = dumped.lines();
+    let cwd = Path::new(lines.next().unwrap()).canonicalize().unwrap();
+    let argv: Vec<&str> = lines.collect();
+    let pair = |flag: &str, value: &str| argv.windows(2).any(|w| w[0] == flag && w[1] == value);
+
+    assert_eq!(
+        cwd,
+        parent_wt.canonicalize().unwrap(),
+        "a treeless fork works in its nearest ancestor's worktree, never the \
+         user's own checkout (§13)"
+    );
+    assert!(argv.contains(&"--fork-session"), "{argv:?}");
+    assert!(pair("--resume", &parent_session.0), "{argv:?}");
+    assert!(pair("--resume-session-at", "u1"), "{argv:?}");
+    assert!(
+        pair("--session-id", &child_session.0),
+        "the child is named by us, not read back off the stream (§14): {argv:?}"
+    );
+
+    // The row: the whole graph edge, and neither half of the git state.
+    let row = log.run(&child).unwrap().unwrap();
+    assert_eq!(row.parent_run_id.as_ref(), Some(&parent));
+    assert_eq!(
+        row.branch_point_seq,
+        Some(at.seq),
+        "the branch point is stored at the fork or it is lost: the provider \
+         records no parentage"
+    );
+    assert_eq!(row.worktree_path, None, "a fork does no git work");
+    assert_eq!(
+        row.shadow_ref, None,
+        "and therefore has nothing for Review to blame against"
+    );
+    assert_eq!(row.branch, None);
+    assert_eq!(row.provider_session_id.as_ref(), Some(&child_session));
+    assert_eq!(row.workspace_path, repo.display().to_string());
+
+    // The repository is byte-for-byte where it was.
+    assert_eq!(
+        git(&repo, &["worktree", "list", "--porcelain"]),
+        worktrees_before,
+        "the fork created a worktree"
+    );
+    assert_eq!(
+        git(&repo, &["for-each-ref", "refs/agent-workspace/"]),
+        refs_before,
+        "the fork rooted a shadow history"
+    );
+    assert!(
+        !repo.join(".worktrees").join(&child.0).exists(),
+        "the fork created {}/.worktrees/{}",
+        repo.display(),
+        child.0
+    );
+    assert!(
+        git(
+            &repo,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/agent-workspace/runs/"
+            ]
+        )
+        .lines()
+        .all(|r| !r.ends_with(&child.0)),
+        "the fork created refs/agent-workspace/runs/{}",
+        child.0
+    );
+}
+
+/// A fork of a fork works where its *grandparent* does, because nothing in
+/// between has a tree — and the walk stops at a worktree rather than falling
+/// back to `workspace_path`, which is the user's own checkout.
+#[test]
+fn a_fork_of_a_treeless_fork_inherits_the_nearest_real_worktree() {
+    let home = TempDir::new("fork2");
+    let repo = repo(home.path()).canonicalize().unwrap();
+    let root = RunId::from("run_root");
+    let db = home.path().join("log.sqlite");
+
+    let started = driver::start(
+        EventLog::open(&db).unwrap(),
+        spec(&repo, &stub_agent(home.path(), FORK_PARENT), &root),
+        "2026-09-13T09:00:00.000Z",
+        None,
+    )
+    .unwrap();
+    let root_wt = started.tree.as_ref().unwrap().worktree.path().to_path_buf();
+    let (_, log) = started.session.wait().unwrap();
+
+    let at = driver::ForkPoint::resolve(
+        &log,
+        &root,
+        log.events(&root)
+            .unwrap()
+            .iter()
+            .find(|e| e.idempotency_key.as_deref() == Some("u1#0"))
+            .unwrap()
+            .seq,
+    )
+    .unwrap();
+
+    let mut previous = root.clone();
+    let mut previous_at = at;
+    for (i, name) in ["run_child", "run_grandchild"].iter().enumerate() {
+        let id = RunId::from(*name);
+        let dump = home.path().join(format!("argv-{i}"));
+        let mut launch = LaunchSpec::new(
+            "/definitely/not/a/checkout",
+            driver::new_session_id(),
+            Permission::DenyPrompts,
+        );
+        launch.binary = stub_agent(
+            home.path(),
+            &FORK_CHILD.replace("__DUMP__", &dump.display().to_string()),
+        );
+        launch.thinking = Thinking::Off;
+
+        let forked = driver::fork(
+            EventLog::open(&db).unwrap(),
+            driver::ForkSpec {
+                run_id: id.clone(),
+                at: previous_at,
+                prompt: "again".to_owned(),
+                launch,
+                workspace_mcp: None,
+            },
+            "2026-09-13T09:05:00.000Z",
+            None,
+        )
+        .unwrap();
+        let (_, log) = forked.session.wait().unwrap();
+
+        let cwd = Path::new(fs::read_to_string(&dump).unwrap().lines().next().unwrap())
+            .canonicalize()
+            .unwrap();
+        assert_eq!(
+            cwd,
+            root_wt.canonicalize().unwrap(),
+            "{name} must work in the only worktree in its ancestry"
+        );
+
+        // The next fork anchors in the run we just made, which has no tree.
+        previous_at = driver::ForkPoint::resolve(
+            &log,
+            &id,
+            log.events(&id)
+                .unwrap()
+                .iter()
+                .find(|e| e.idempotency_key.as_deref() == Some("c1"))
+                .unwrap()
+                .seq,
+        )
+        .unwrap();
+        previous = id;
+    }
+
+    let row = log_of(&db).run(&previous).unwrap().unwrap();
+    assert_eq!(row.parent_run_id, Some(RunId::from("run_child")));
+    assert_eq!(row.worktree_path, None);
+}
+
+fn log_of(db: &Path) -> EventLog {
+    EventLog::open(db).unwrap()
+}
 
 // ------------------------------------------------ the permission channel --
 

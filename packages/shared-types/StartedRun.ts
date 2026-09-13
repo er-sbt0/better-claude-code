@@ -8,8 +8,15 @@ import type { RunId } from "./RunId";
  * UI has just started the run and should not have to query for what it just
  * caused.
  */
-export type StartedRun = { run_id: RunId, branch: string, worktree_path: string, 
+export type StartedRun = { run_id: RunId, branch: string, 
+/**
+ * `null` for a run with no worktree of its own — a fork that has not
+ * written yet works in an ancestor's tree until it acquires one.
+ */
+worktree_path: string | null, 
 /**
  * `refs/agent-workspace/runs/<id>`: what Review attributes against (§13.1).
+ * `null` means there is nothing to attribute against yet, and §13.1
+ * requires Review to say so rather than omit it.
  */
-shadow_ref: string, started_at: string, };
+shadow_ref: string | null, started_at: string, };

@@ -45,6 +45,35 @@ fn is_transient(msg_type: &str, subtype: Option<&str>) -> bool {
     }
 }
 
+/// The provider address of a stored block: the chain-entry uuid
+/// `--resume-session-at` accepts, or `None` if the block has none.
+///
+/// The argument is a `raw_events.idempotency_key`, and this function is the
+/// only reader of the format [`ClaudeCodeNormalizer::ingest`] mints a few lines
+/// below — which is why it lives next to it rather than in the driver that
+/// calls it.
+///
+/// Two of its three behaviours were bought with live runs
+/// (`docs/verification/claude-code-fork-address.md`):
+///
+/// - **The address is the part before the `#`.** One provider line can fan out
+///   into several events, and those are keyed `{uuid}#{i}` — our suffix, not
+///   the provider's. `--resume-session-at "<uuid>#0"` is refused *by name*
+///   (`No message found with message.uuid of: <uuid>#0`), so passing the key
+///   through unstripped would burn a live run per fork.
+/// - **`None` means no address, and nothing else.** Out-of-band events carry no
+///   key — `wrap_external` says so — and neither do the user's own prompt
+///   entries, which never reach stdout at all. So *every keyed block is
+///   forkable* is true while *every block is forkable* is false, and a caller
+///   has to be able to hear "not this one". It must not round to a neighbour:
+///   the branching surface rejected snapping because the inherited-context
+///   strip states a message count out loud.
+pub fn fork_address(idempotency_key: Option<&str>) -> Option<&str> {
+    let key = idempotency_key?;
+    let uuid = key.split('#').next().unwrap_or("");
+    (!uuid.is_empty()).then_some(uuid)
+}
+
 pub struct ClaudeCodeNormalizer {
     run_id: RunId,
     clock: Box<dyn Clock>,

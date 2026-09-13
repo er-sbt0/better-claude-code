@@ -59,10 +59,15 @@ pub struct Live {
     pub run_id: RunId,
     pub branch: String,
     /// The agent's cwd, which is never the user's own checkout (§13).
-    pub worktree_path: PathBuf,
+    ///
+    /// `None` for a run that has no worktree of its own — a fork that has not
+    /// written. It works in an ancestor's tree until it acquires one, so this
+    /// is "the tree this run owns", not "where the process is".
+    pub worktree_path: Option<PathBuf>,
     /// `refs/agent-workspace/runs/<id>` — what Review attributes against
-    /// (§13.1).
-    pub shadow_ref: String,
+    /// (§13.1). `None` means there is nothing to attribute against yet and
+    /// Review must say so rather than omit it.
+    pub shadow_ref: Option<String>,
     /// The timestamp the run row carries, taken from this registry's clock.
     pub started_at: String,
 }
@@ -157,8 +162,11 @@ impl Registry {
         let live = Live {
             run_id: run_id.clone(),
             branch,
-            worktree_path: started.worktree.path().to_path_buf(),
-            shadow_ref: started.shadow_ref,
+            worktree_path: started
+                .tree
+                .as_ref()
+                .map(|t| t.worktree.path().to_path_buf()),
+            shadow_ref: started.tree.map(|t| t.shadow_ref),
             started_at,
         };
 
@@ -307,10 +315,22 @@ impl Registry {
     /// `Failed`. That is the honest reading of the four statuses we have:
     /// inventing `Interrupted` is a schema change, and calling a killed run
     /// `Finished` would be worse than blunt.
+    ///
+    /// **The exit code is not the only authority.** A run can fail in the
+    /// stream and still exit cleanly — the provider reports a bad turn as a
+    /// `result` with a non-`success` subtype, and a refused fork is exactly
+    /// that: `--resume-session-at` on an address that resolves nowhere produces
+    /// `error_during_execution` from a process that started and stopped
+    /// normally, and even hands the refused run a fresh `session_id`
+    /// (`docs/verification/claude-code-fork-address.md`). The normalizer
+    /// already reads acceptance off the subtype and ends such a run as
+    /// `run.failed`; this reads that back, so the row cannot say `Finished`
+    /// over a log that says the run failed.
     fn finish(&self, run: &RunId, session: Session) -> Result<Outcome> {
         let (outcome, mut log) = session.wait()?;
+        let failed_in_stream = !log.events_of_type(run, "run.failed")?.is_empty();
         let status = match outcome.exit_code {
-            Some(0) => RunStatus::Finished,
+            Some(0) if !failed_in_stream => RunStatus::Finished,
             _ => RunStatus::Failed,
         };
         log.finish_run(run, status, &self.clock.now())?;

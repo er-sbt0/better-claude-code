@@ -80,25 +80,61 @@ because the inherited-context strip states a message count out loud, and a fork
 that silently rewinds past the block you clicked makes that count a lie on the
 one surface whose job is to say where you came from.
 
-### The finding that costs us something
+### The finding that cost us something, and what replaced it
 
-**We have not verified that the stdout `uuid` is the identifier
-`--resume-session-at` accepts.** The spike
-(`docs/verification/session-fork-spike.sh:127`) read its uuid out of the
-transcript JSONL at `~/.claude/projects/<slug>/<session>.jsonl`, not off the
-stream. The two are near-certainly the same identifier — the transcript is
-written from the same messages — but "near-certainly" is what §16's rule about
-help text exists to refuse.
+**The spike was run before the fork path was built**, as this section demanded:
+`docs/verification/claude-code-fork-address.md`, eight live runs. The stream
+`uuid` **is** the identifier `--resume-session-at` accepts, and the claim above
+stops being inference.
 
-It is a cheap spike and it gates the entire feature: if the stream `uuid` and the
-transcript `uuid` are different namespaces, then mid-conversation forking
-requires reading the provider's transcript files at fork time, which is a
-dependency on a storage layout we do not own and the spike already found varies.
-The spike also only exercised a **user** entry; whether an assistant entry is
-accepted as a branch point is untested, and the prototype forks from assistant
-messages far more often than from user ones.
+As a set, every message uuid on stdout is a chain entry in the provider's
+transcript, and every transcript `assistant` entry came back on stdout under the
+same uuid. A uuid taken off the **stream** — the flag never saw the transcript —
+was accepted, branched, and produced a context holding the prefix and not the
+suffix. The control is the part that earns belief in the rest: two forks of one
+trunk differing only in which stream uuid they were anchored at came back
+knowing different things, which rules out both "the flag ignores the uuid" and
+"the flag always resumes the tip". And an **assistant** entry is accepted, which
+the older session-fork spike never showed and which this surface needs, since it
+forks from assistant messages far more often than from user ones.
 
-Run it before building the fork path, not after.
+What that buys is a dependency removed rather than a capability added: the fork
+path opens no file under `~/.claude/projects/`, so the storage layout we do not
+own is off the product path entirely. Two details it settled in passing, both
+now encoded in the driver:
+
+- **`{uuid}#{i}` is refused by name** — `No message found with message.uuid of:
+  <uuid>#0`. The fan-out suffix is ours alone, so an address is stripped at the
+  first `#` before it is passed.
+- **A refused fork still emits a `result` with a fresh `session_id`.** An
+  unresolvable address is loud rather than a silent resume from the tip, which
+  is the good news; the shape of the loudness is the trap. It arrives as a
+  *completed process with an error subtype*, not as a failed spawn, so
+  acceptance is read off `subtype` — `success` against `error_during_execution`
+  — and never off having received a result or a session id. The spike's own
+  first draft made that mistake.
+
+What it still costs us is smaller, and is about phrasing. The match is exact in
+one direction only: every stdout message uuid is a chain entry, but 31 of that
+trunk's 34 chain entries never reached stdout, and the ones that matter are the
+user's own prompt entries. So **every keyed block is forkable** stays true while
+*every chain entry is keyed* is false — the distinction the hover toolbar above
+is already drawn against. A surface that wanted to fork at "just before I asked
+that" would be addressing an entry we hold no key for, and would be back to
+reading provider files.
+
+Three things the spike did not prove, and none of them blocks the fork path:
+
+- **Tool-bearing conversations as anchors.** The trunk was text-only on purpose,
+  to keep the truncation signal clean. Nothing has forked at an assistant
+  message that requested a tool, with the `user` tool-result entry after it —
+  which is what a branch point looks like in real work.
+- **Stability of an address across a long conversation or a compaction.** Three
+  assistant entries, one sitting. Nothing checked that a uuid observed in turn
+  one is still resolvable twenty turns later, in a file the provider owns and
+  rewrites.
+- **Concurrency**, still, and for the fourth time. Every run in the spike was
+  sequential.
 
 ## The worktree arrives late
 
@@ -178,8 +214,14 @@ new information, so each is paired with the information.
 
 ## What this does not decide
 
-- **Whether the stream `uuid` is the fork address.** Above. Highest priority and
-  cheapest of anything here.
+- ~~**Whether the stream `uuid` is the fork address.**~~ Settled: it is, for
+  assistant entries included
+  (`docs/verification/claude-code-fork-address.md`). What survives it is
+  narrower. **Tool-bearing conversations as anchors** are untested, and they are
+  the common case; so is **whether an address outlives a long conversation or a
+  compaction**, since the provider owns the file the chain lives in. Neither
+  gates the fork path — both are things that would show up as a fork failing
+  loudly, which the same spike proved is how forks fail.
 - **Concurrent forks**, still. The roadmap has carried this as an open unknown
   since the fork spike ran its branches sequentially, and the prototype's central
   image — `by-package` mid-edit while `big-bang` waits on a permission decision —
@@ -212,4 +254,5 @@ single piece of work in V1's UI, which makes it the worst thing to build against
 a guess. Built second, it is built against `(runId, seqRange)` addresses that a
 working fork is already resolving against for real.
 
-The one thing that goes before either: the uuid spike.
+The one thing that went before either was the uuid spike, and it has
+(`docs/verification/claude-code-fork-address.md`).
