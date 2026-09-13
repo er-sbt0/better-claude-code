@@ -1,5 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { BootReport } from '@agent-workspace/shared-types/BootReport'
+import type { RawEvent } from '@agent-workspace/shared-types/RawEvent'
 import type { Run } from '@agent-workspace/shared-types/Run'
 import type { RunId } from '@agent-workspace/shared-types/RunId'
 import type { StartRunRequest } from '@agent-workspace/shared-types/StartRunRequest'
@@ -30,3 +32,21 @@ export const sendTurn = (runId: RunId, text: string) =>
 export const endRun = (runId: RunId) => invoke<void>('end_run', { runId })
 
 export const interruptRun = (runId: RunId) => invoke<void>('interrupt_run', { runId })
+
+// Every live run's events, on one channel for all of them, in stream order.
+//
+// The topic is spelled `RUN_EVENT` in `src-tauri/src/lib.rs` and that doc
+// comment carries the reasoning; a test there reads this file and fails if the
+// two drift, because a renamed channel is otherwise a live view that simply
+// never updates. The payload is a `RawEvent` verbatim, so the caller filters on
+// `run_id` — there is no per-run channel to subscribe to.
+//
+// Subscribe once, on mount, before anything can start a run. `listen` is itself
+// an IPC round trip: a subscription registered after `startRun()` resolves has
+// already lost the beginning of that run's stream, and nothing anywhere
+// reports the loss.
+export const RUN_EVENT = 'run:event'
+
+export const onRunEvent = (
+  handler: (event: RawEvent) => void,
+): Promise<UnlistenFn> => listen<RawEvent>(RUN_EVENT, (e) => handler(e.payload))

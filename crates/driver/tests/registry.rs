@@ -219,8 +219,25 @@ fn a_run_is_reaped_when_its_stream_ends() {
 
     // The tail events a process exit produces reach the callback, not only the
     // log. A live view that misses these shows every run as unfinished.
+    //
+    // `rx.iter()` runs to the end of the channel, which is the strong version
+    // of the claim: not merely that `run.finished` was delivered, but that it
+    // was the **last** thing delivered before the senders were dropped. That
+    // ordering is what the shell's emit path depends on — it forwards each
+    // event inline, so whatever arrives here last is what the webview sees
+    // last, and a queue anywhere in between would be a place for exactly this
+    // event to be stranded.
     let seen: Vec<String> = rx.iter().map(|e| e.type_name().to_owned()).collect();
     assert!(seen.contains(&"run.finished".to_owned()), "{seen:?}");
+    assert_eq!(
+        seen.last().map(String::as_str),
+        Some("run.finished"),
+        "the tail event did not come last: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|t| t == "turn.finished"),
+        "the stdout events came through too: {seen:?}"
+    );
 
     eventually("the run to leave the registry", || !registry.is_live(&run));
     assert!(registry.live().is_empty());

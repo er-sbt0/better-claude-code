@@ -30,8 +30,27 @@ use driver::{LaunchSpec, Permission, Registry, RunSpec};
 use event_log::{EventLog, Run};
 use normalizer::{Clock, SystemClock};
 use serde::{Deserialize, Serialize};
-use tauri::{Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use ts_rs::TS;
+
+/// The one channel every live run's events arrive on, for every run.
+///
+/// **One global channel, not `run:<id>:event`.** Two reasons, and the second is
+/// the one that decides it:
+///
+/// 1. A [`RawEvent`](agent_protocol::RawEvent) already carries `run_id`, so a
+///    per-run channel name would encode in the topic what the payload states —
+///    the same fact stored twice, which §8 rejects everywhere else.
+/// 2. The webview's `listen()` is **asynchronous**: it is itself an IPC call,
+///    and the subscription is not live until the host has processed it. A
+///    per-run topic cannot be known before [`start_run`] returns, by which time
+///    the supervisor thread is already emitting — so subscribing to it always
+///    races the first events of the run it is about. A channel that exists
+///    before any run does is subscribed once, on mount, and cannot lose them.
+///
+/// The cost is that the frontend filters by `run_id`, which is one comparison
+/// per event. The trade is recorded here rather than rediscovered.
+pub const RUN_EVENT: &str = "run:event";
 
 /// What starting up found and fixed.
 ///
@@ -134,7 +153,11 @@ fn live_runs(state: State<'_, AppState>) -> Vec<RunId> {
 /// mean the UI could not read while a run was writing — WAL and the two
 /// connections are what make a live feed possible at all.
 #[tauri::command]
-fn start_run(state: State<'_, AppState>, request: StartRunRequest) -> Result<StartedRun, String> {
+fn start_run(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: StartRunRequest,
+) -> Result<StartedRun, String> {
     let repo = PathBuf::from(&request.repo)
         .canonicalize()
         .map_err(|e| format!("{}: {e}", request.repo))?;
@@ -163,10 +186,32 @@ fn start_run(state: State<'_, AppState>, request: StartRunRequest) -> Result<Sta
 
     let live = state
         .runs
-        .start(log, spec, move |_event| {
-            // The live feed goes here, and only here: one `app.emit` of the
-            // event, on the run's supervisor thread. Everything else about the
-            // run's lifetime is already handled below this line.
+        .start(log, spec, move |event| {
+            // The live feed, and the whole of it: one `emit` per event, inline
+            // on the run's supervisor thread, in stream order.
+            //
+            // Inline is the load-bearing word. §8's standing trap is that
+            // *events produced at process exit must reach the live view, not
+            // just the log* — `run.finished` is not a line of stdout, it is
+            // synthesized once the process has been waited for. The supervisor
+            // delivers it here as the last call it makes before reaping, so any
+            // queue, channel or thread of our own between this closure and the
+            // webview would be a thing that can still hold the tail when the
+            // run is already gone. There is none.
+            //
+            // An emit can fail — the window can be closing while a run is still
+            // talking — and there is nothing useful to do about it: the run is
+            // already running and the log already has the event. Say so on
+            // stderr rather than swallow it, because a live view that silently
+            // stops updating is the symptom this would produce.
+            if let Err(e) = app.emit(RUN_EVENT, &event) {
+                eprintln!(
+                    "{}: {} seq {} never reached the webview: {e}",
+                    event.run_id.0,
+                    event.type_name(),
+                    event.seq
+                );
+            }
         })
         .map_err(|e| e.to_string())?;
 
@@ -245,4 +290,49 @@ pub fn run() {
                 app.state::<AppState>().runs.shutdown();
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_protocol::{Event, RawEvent, TurnStarted, SCHEMA_VERSION};
+
+    /// The three fields the live view is built on, at the top level of the
+    /// payload the webview receives.
+    ///
+    /// Nothing here wraps the event before emitting it, and this is the test
+    /// that says so: the frontend filters on `run_id`, keys on `seq` and
+    /// switches on `type`, and an envelope added between this crate and
+    /// `app.emit` would leave every one of those reading `undefined` — a live
+    /// view that renders nothing, with no error anywhere.
+    #[test]
+    fn the_emitted_payload_is_the_raw_event_itself() {
+        let event = RawEvent {
+            run_id: RunId::from("run_1842"),
+            seq: 7,
+            ts: "2026-09-13T14:22:08.412Z".to_owned(),
+            schema: SCHEMA_VERSION,
+            idempotency_key: None,
+            event: Event::TurnStarted(TurnStarted { index: 0 }),
+        };
+        let v = serde_json::to_value(&event).unwrap();
+        assert_eq!(v["run_id"], serde_json::json!("run_1842"));
+        assert_eq!(v["seq"], serde_json::json!(7));
+        assert_eq!(v["type"], serde_json::json!("turn.started"));
+    }
+
+    /// Both halves of the channel name, checked against each other.
+    ///
+    /// The topic is a string on each side of the webview boundary and nothing
+    /// generates it, so it is the one part of this bridge that can drift
+    /// silently: a renamed constant here and a live view that simply never
+    /// updates, with the run itself working perfectly.
+    #[test]
+    fn the_frontend_listens_on_the_channel_this_crate_emits() {
+        let ipc = include_str!("../../src/lib/ipc.ts");
+        assert!(
+            ipc.contains(&format!("'{RUN_EVENT}'")),
+            "apps/desktop/src/lib/ipc.ts does not listen on `{RUN_EVENT}`"
+        );
+    }
 }
