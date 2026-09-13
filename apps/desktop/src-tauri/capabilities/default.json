@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "What the webview is allowed to call. §15 treats agent output as untrusted input, so this list stays as short as the app can function with — every entry is a hole in that boundary.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

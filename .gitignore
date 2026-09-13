@@ -2,3 +2,8 @@ target/
 node_modules/
 *.db
 *.db-journal
+
+# Vite output, and the schemas/bindings the Tauri CLI generates from
+# tauri.conf.json and capabilities/.
+apps/desktop/dist/
+apps/desktop/src-tauri/gen/

@@ -14,6 +14,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The workspace now contains the Tauri shell, so the whole job needs the
+      # webview toolchain even to type-check it. §4: Linux is the primary
+      # target, and WebKitGTK is what it means.
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libdbus-1-dev libxdo-dev \
+            libayatana-appindicator3-dev librsvg2-dev patchelf
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -33,9 +43,35 @@ jobs:
         run: cargo test --all
 
       # packages/shared-types is generated from the Rust types and committed.
-      # `cargo test` regenerates it, so a diff here means someone changed a wire
-      # type without committing the regenerated TypeScript (§22).
+      # `cargo test` regenerates it, so a change here means someone edited a
+      # wire type without committing the regenerated TypeScript (§22). An
+      # *untracked* file counts: a brand-new type that nobody committed breaks
+      # the frontend build and `git diff` alone would not see it.
       - name: Generated TypeScript is current
         run: |
+          git add --intent-to-add packages/shared-types
           git diff --exit-code -- packages/shared-types \
             || { echo "::error::packages/shared-types is stale — run 'cargo test' and commit the result"; exit 1; }
+
+  web:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # The types the frontend consumes are generated in the rust job above;
+      # here they are just committed files, so this fails loudly if someone
+      # renamed a Rust field and did not look at the TypeScript.
+      - name: Typecheck
+        run: pnpm --filter @agent-workspace/desktop typecheck
+
+      - name: Build
+        run: pnpm --filter @agent-workspace/desktop build

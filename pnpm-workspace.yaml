@@ -1,0 +1,10 @@
+packages:
+  - apps/*
+  - packages/*
+
+# pnpm 10+ refuses to run a dependency's install scripts unless it is named
+# here. These two need theirs: esbuild and the Tauri CLI both fetch a
+# platform-specific binary.
+onlyBuiltDependencies:
+  - esbuild
+  - '@tauri-apps/cli'

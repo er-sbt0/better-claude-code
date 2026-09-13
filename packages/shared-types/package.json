@@ -1,0 +1,11 @@
+{
+  "name": "@agent-workspace/shared-types",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "GENERATED from the Rust crates by ts-rs. Never hand-edit (design §22).",
+  "//": "No barrel and no build step: every file here is `export type` only, so the imports erase at compile time. Deep-import the type you want: `@agent-workspace/shared-types/Run`.",
+  "exports": {
+    "./*": "./*.ts"
+  }
+}

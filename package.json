@@ -1,0 +1,10 @@
+{
+  "name": "agent-workspace",
+  "private": true,
+  "packageManager": "pnpm@11.21.0",
+  "scripts": {
+    "dev": "pnpm --filter @agent-workspace/desktop tauri dev",
+    "build": "pnpm --filter @agent-workspace/desktop tauri build",
+    "typecheck": "pnpm --filter @agent-workspace/desktop typecheck"
+  }
+}

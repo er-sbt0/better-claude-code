@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/agent-protocol", "crates/event-log", "crates/driver", "crates/normalizer", "crates/worktree"]
+members = [
+    "apps/desktop/src-tauri",
+    "crates/agent-protocol",
+    "crates/driver",
+    "crates/event-log",
+    "crates/normalizer",
+    "crates/worktree",
+]
 
 [workspace.package]
 edition = "2021"
@@ -11,6 +18,7 @@ publish = false
 [workspace.dependencies]
 agent-protocol = { path = "crates/agent-protocol" }
 normalizer = { path = "crates/normalizer" }
+driver = { path = "crates/driver" }
 event-log = { path = "crates/event-log" }
 worktree = { path = "crates/worktree" }
 serde = { version = "1", features = ["derive"] }

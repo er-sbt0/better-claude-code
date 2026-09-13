@@ -1,0 +1,29 @@
+[package]
+name = "desktop"
+description = "The Agent Workspace desktop shell: the Rust runtime behind the webview (design §4, §22)."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# Tauri builds the app as a library so the same code can back a mobile target
+# later; `main.rs` is a thin shim over it.
+name = "desktop_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+agent-protocol = { workspace = true }
+driver = { workspace = true }
+event-log = { workspace = true }
+normalizer = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tauri = { version = "2", features = [] }
+thiserror = { workspace = true }
+ts-rs = { workspace = true }
