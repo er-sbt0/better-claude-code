@@ -539,4 +539,13 @@ out as `seq` 0, the tree as the agent found it.
 - **The generated-types CI check cannot see a new file on its own.**
   `git diff --exit-code` says nothing about an untracked path, and a brand-new
   wire type is exactly that — it would break the frontend build with CI green.
-  `git add --intent-to-add` first.
+  `git add --intent-to-add` first — which `ci.yml` does.
+
+  **The local half of this bites harder, and it bit during the column step.**
+  `git status --porcelain` is the natural way to check before committing, and
+  it is not enough: this machine sets `status.showUntrackedFiles=no` globally,
+  so the two brand-new wire types that step generated were invisible to exactly
+  the command that was meant to catch them. CI would have failed on files that
+  never left the working tree. Check with `git status --porcelain -uall`, or
+  `git ls-files --others --exclude-standard packages/shared-types`, and stage
+  generated types by name.
