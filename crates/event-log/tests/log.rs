@@ -805,24 +805,54 @@ fn an_existing_v2_database_migrates_and_keeps_its_runs() {
 /// The three-word vocabulary, reached without a database.
 ///
 /// This is the decision `docs/branching-surface.md` fixes and the shell is not
-/// allowed to make: four run states, three words. `failed` and `abandoned`
-/// land on `idle` because the vocabulary answers "does this node want me now",
-/// and on that axis a run that is not running and not blocked is the same
-/// whatever became of it. Outcome is a second axis and `RunStatus` still
-/// carries it.
+/// allowed to make: five run states, three words. `failed`, `abandoned` and
+/// `interrupted` land on `idle` because the vocabulary answers "does this node
+/// want me now", and on that axis a run that is not running and not blocked is
+/// the same whatever became of it. Outcome is a second axis and `RunStatus`
+/// still carries it.
+///
+/// `interrupted` is the state that arrived last and it bought no fourth word.
+/// It had better not: it is the *ordinary* ending — nothing closes a run's
+/// stdin for it, so app exit interrupts every live run — and a vocabulary in
+/// which the common case demands attention says nothing at all.
 #[test]
-fn four_run_states_collapse_into_three_words() {
+fn five_run_states_collapse_into_three_words() {
     assert_eq!(Activity::of(RunStatus::Running, false), Activity::Running);
     assert_eq!(Activity::of(RunStatus::Running, true), Activity::NeedsYou);
     assert_eq!(Activity::of(RunStatus::Finished, false), Activity::Idle);
     assert_eq!(Activity::of(RunStatus::Failed, false), Activity::Idle);
     assert_eq!(Activity::of(RunStatus::Abandoned, false), Activity::Idle);
+    assert_eq!(Activity::of(RunStatus::Interrupted, false), Activity::Idle);
 
     // A dead process is not waiting for an answer. An unresolved request on a
     // run that has ended is a record of how it ended, not a demand on anyone.
     assert_eq!(Activity::of(RunStatus::Finished, true), Activity::Idle);
     assert_eq!(Activity::of(RunStatus::Failed, true), Activity::Idle);
     assert_eq!(Activity::of(RunStatus::Abandoned, true), Activity::Idle);
+    assert_eq!(Activity::of(RunStatus::Interrupted, true), Activity::Idle);
+}
+
+/// Every status survives the round trip through the `TEXT` column, and the
+/// spellings are the wire.
+///
+/// `RunStatus` is exported to TypeScript by `ts-rs` and stored by
+/// `RunStatus::as_str`, so these strings are two contracts at once: a row
+/// written by one build has to be readable by the next, and the shell's
+/// `STATUS` table is keyed by exactly these words. A variant added without a
+/// spelling is an `UnknownRunStatus` on somebody's existing database.
+#[test]
+fn every_run_status_round_trips_through_its_stored_spelling() {
+    for (status, spelled) in [
+        (RunStatus::Running, "running"),
+        (RunStatus::Finished, "finished"),
+        (RunStatus::Failed, "failed"),
+        (RunStatus::Abandoned, "abandoned"),
+        (RunStatus::Interrupted, "interrupted"),
+    ] {
+        assert_eq!(status.as_str(), spelled);
+        assert_eq!(RunStatus::parse(spelled), Some(status));
+    }
+    assert_eq!(RunStatus::parse("stopped"), None);
 }
 
 /// **needs you** is derived from the log, and answered permissions clear it.

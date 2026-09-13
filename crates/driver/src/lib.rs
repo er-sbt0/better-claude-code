@@ -723,6 +723,12 @@ fn wire_workspace_mcp(
 /// Every one of them is a lie after a restart: no process of ours survived it.
 /// Returns what was reconciled, because a user who left three runs going is
 /// entitled to be told they are gone rather than to find them quietly finished.
+///
+/// `Abandoned` rather than `Interrupted`, and the pair is worth keeping
+/// straight: this is what a row looks like when nobody watched the process go
+/// and the log may stop anywhere, so the status records our ignorance.
+/// `Registry::shutdown` — the orderly exit, which is what leaves a row
+/// `Interrupted` — is the reason there is usually nothing here at all.
 pub fn reconcile_after_restart(log: &mut EventLog, now: &str) -> Result<Vec<RunId>> {
     let orphans = log.running_runs()?;
     let mut out = Vec::new();

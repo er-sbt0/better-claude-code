@@ -96,6 +96,29 @@ pub enum RunStatus {
     /// driver reconciles at startup from [`crate::EventLog::running_runs`];
     /// §8 calls this crash recovery.
     Abandoned,
+    /// The process was killed rather than allowed to end: the user stopped the
+    /// run, or the app exited under it and `Registry::shutdown` interrupted
+    /// every live run.
+    ///
+    /// **An interrupt is not a failure and it is not a success**, and this
+    /// variant exists because the four statuses before it forced a run that
+    /// was killed to be one or the other. Nothing closes a run's stdin on its
+    /// behalf — a run is a conversation and the user decides when it is over —
+    /// so *every* live run is interrupted at app exit, and a status derived
+    /// from the exit code alone filed every one of them as `Failed`, over logs
+    /// that said `turn.finished`, `run.finished`, and no `run.failed`
+    /// anywhere. `Failed` is a claim about the agent's work; the canvas, the
+    /// runs list and the inspector all repeat it.
+    ///
+    /// Not [`RunStatus::Abandoned`], which is the neighbouring case and a
+    /// different fact. Abandoned means *we lost track of it*: the row still
+    /// said `Running` at boot, nobody watched the process go, and the log may
+    /// stop anywhere. Interrupted means *we ended it*, at a moment we know,
+    /// with the run's last events already written. One is reconciled from
+    /// ignorance at startup, the other is recorded by the thread holding the
+    /// session — and telling a user who pressed stop that their run was
+    /// "abandoned" describes neglect that did not happen.
+    Interrupted,
 }
 
 impl RunStatus {
@@ -105,6 +128,7 @@ impl RunStatus {
             RunStatus::Finished => "finished",
             RunStatus::Failed => "failed",
             RunStatus::Abandoned => "abandoned",
+            RunStatus::Interrupted => "interrupted",
         }
     }
 
@@ -114,6 +138,7 @@ impl RunStatus {
             "finished" => RunStatus::Finished,
             "failed" => RunStatus::Failed,
             "abandoned" => RunStatus::Abandoned,
+            "interrupted" => RunStatus::Interrupted,
             _ => return None,
         })
     }
@@ -215,17 +240,24 @@ impl Activity {
     /// Collapse a [`RunStatus`] and the log into the three words the surface
     /// has.
     ///
-    /// **Four states, three words, and `failed` and `abandoned` land on
-    /// `Idle`.** The vocabulary is not an outcome vocabulary — it answers "does
-    /// this node want me *now*", which is the only question a canvas of a dozen
-    /// columns can answer at a glance. On that axis a failed run and an
-    /// abandoned one are the same as a finished one: nothing is working and
-    /// nothing is blocked on a decision. Outcome is a second axis and it has
-    /// not moved — `RunStatus` is still on the row, and the inspector, the runs
-    /// list and the status bar still spell all four words. What this must not
+    /// **Five states, three words, and every ending lands on `Idle`.** The
+    /// vocabulary is not an outcome vocabulary — it answers "does this node
+    /// want me *now*", which is the only question a canvas of a dozen columns
+    /// can answer at a glance. On that axis a failed run, an abandoned one and
+    /// an interrupted one are the same as a finished one: nothing is working
+    /// and nothing is blocked on a decision. Outcome is a second axis and it
+    /// has not moved — `RunStatus` is still on the row, and the inspector, the
+    /// runs list and the status bar spell every word of it. What this must not
     /// do is smuggle outcome in by routing `Failed` to `NeedsYou`, which would
     /// make the pill mean two unrelated things and destroy the one state whose
     /// derivation the record actually specifies.
+    ///
+    /// [`RunStatus::Interrupted`] is the newest ending and it did not buy a
+    /// fourth word. A run the user stopped, or that app exit stopped, is
+    /// exactly as idle as one that ran out of things to say: the process is
+    /// gone either way and nobody is waiting on the reader. The reason it is a
+    /// separate *status* is the second axis, where "we ended it" and "it
+    /// failed" are not the same sentence.
     ///
     /// `NeedsYou` is that state: a `permission.requested` with no matching
     /// `permission.resolved`. It is scoped to a *running* run on purpose — a
@@ -235,7 +267,10 @@ impl Activity {
         match status {
             RunStatus::Running if awaiting_permission => Activity::NeedsYou,
             RunStatus::Running => Activity::Running,
-            RunStatus::Finished | RunStatus::Failed | RunStatus::Abandoned => Activity::Idle,
+            RunStatus::Finished
+            | RunStatus::Failed
+            | RunStatus::Abandoned
+            | RunStatus::Interrupted => Activity::Idle,
         }
     }
 

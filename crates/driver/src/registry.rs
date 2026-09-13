@@ -319,6 +319,11 @@ impl Registry {
     ///
     /// Everything the log received up to this point stays: writing per line
     /// rather than at the end is what makes an interrupt cheap (§8).
+    ///
+    /// The row this leaves behind is `Interrupted`, not `Failed`: the user
+    /// asked for the run to stop, and nothing the agent did went wrong. A
+    /// failure already in the log still outranks it — see
+    /// [`finish`](Self::finish).
     pub fn interrupt(&self, run: &RunId) -> Result<()> {
         self.with_session(run, Session::interrupt)
     }
@@ -359,6 +364,10 @@ impl Registry {
     /// connection. Interrupting rather than closing stdin is deliberate — the
     /// app is going away, and waiting for every agent to finish its turn first
     /// is a hang, not a courtesy.
+    ///
+    /// So **every run open at app exit is interrupted**, healthy ones included,
+    /// and that is the ordinary case rather than the exception — which is why
+    /// [`finish`](Self::finish) must not read a missing exit code as a failure.
     ///
     /// Returns what it ended, so a caller can say so.
     pub fn shutdown(&self) -> Vec<RunId> {
@@ -424,27 +433,50 @@ impl Registry {
     /// reconciled it (§8), which is the same lie crash recovery exists to
     /// prevent.
     ///
-    /// An interrupted run exits by signal, so it has no exit code and lands as
-    /// `Failed`. That is the honest reading of the four statuses we have:
-    /// inventing `Interrupted` is a schema change, and calling a killed run
-    /// `Finished` would be worse than blunt.
+    /// **The exit code is not the only authority, and on its own it lies about
+    /// every run this app ended.** Two readings are needed and neither is the
+    /// exit code by itself.
     ///
-    /// **The exit code is not the only authority.** A run can fail in the
-    /// stream and still exit cleanly — the provider reports a bad turn as a
-    /// `result` with a non-`success` subtype, and a refused fork is exactly
-    /// that: `--resume-session-at` on an address that resolves nowhere produces
-    /// `error_during_execution` from a process that started and stopped
-    /// normally, and even hands the refused run a fresh `session_id`
-    /// (`docs/verification/claude-code-fork-address.md`). The normalizer
-    /// already reads acceptance off the subtype and ends such a run as
-    /// `run.failed`; this reads that back, so the row cannot say `Finished`
+    /// A run can fail in the stream and still exit cleanly — the provider
+    /// reports a bad turn as a `result` with a non-`success` subtype, and a
+    /// refused fork is exactly that: `--resume-session-at` on an address that
+    /// resolves nowhere produces `error_during_execution` from a process that
+    /// started and stopped normally, and even hands the refused run a fresh
+    /// `session_id` (`docs/verification/claude-code-fork-address.md`). The
+    /// normalizer already reads acceptance off the subtype and ends such a run
+    /// as `run.failed`; this reads that back, so the row cannot say `Finished`
     /// over a log that says the run failed.
+    ///
+    /// And a run can succeed and have no exit code at all. Nothing closes
+    /// stdin on a run's behalf, so a healthy run sits waiting for its next turn
+    /// until something kills it — [`interrupt`](Self::interrupt), or
+    /// [`shutdown`](Self::shutdown) at app exit, which is *every* live run. A
+    /// process killed by a signal exits with no code, so the old rule filed all
+    /// of them as `Failed` over logs full of `turn.finished`, ending in
+    /// `run.finished`, with no `run.failed` anywhere. `RunStatus::Interrupted`
+    /// is the word for that, and no exit code is how it is detected: whether
+    /// the signal came from us or from the machine, nothing the *agent* did
+    /// ended this run.
+    ///
+    /// **A failure in the log outranks the interrupt**, which is the one
+    /// ordering here worth arguing. A run that failed a turn and then sat
+    /// waiting for another is killed at shutdown like any other, and filing it
+    /// `Interrupted` would erase the failure exactly the way the old rule
+    /// invented one. The cost is the reverse corner — a run killed before it
+    /// emitted an init message is `Failed`, because the log says it never
+    /// started — and that is the cheaper mistake: it is rare, it is one
+    /// millisecond wide, and it errs towards keeping a recorded failure rather
+    /// than towards hiding one.
     fn finish(&self, run: &RunId, session: Session) -> Result<Outcome> {
         let (outcome, mut log) = session.wait()?;
         let failed_in_stream = !log.events_of_type(run, "run.failed")?.is_empty();
         let status = match outcome.exit_code {
-            Some(0) if !failed_in_stream => RunStatus::Finished,
-            _ => RunStatus::Failed,
+            _ if failed_in_stream => RunStatus::Failed,
+            Some(0) => RunStatus::Finished,
+            // Killed by a signal: there is no exit code to read, and that is
+            // the signature of a run something outside it stopped.
+            None => RunStatus::Interrupted,
+            Some(_) => RunStatus::Failed,
         };
         log.finish_run(run, status, &self.clock.now())?;
         // `log` is dropped here: the run's second connection to the event log

@@ -155,9 +155,9 @@ point, and off-screen siblings are slivers on the frame.
 pass, two renderings: `focus` draws conversation columns, `map` draws §10's
 shape cards — name, status, `model · N msgs`, one-line summary — and ⌘[ / ⌘]
 walk between siblings. The map card states the run's *outcome* beside the
-three-word attention pill, because `failed`, `finished` and `abandoned` all
-collapse to **idle** on the attention axis and the map is the one surface whose
-job is comparing branches (§8).
+three-word attention pill, because `failed`, `finished`, `abandoned` and
+`interrupted` all collapse to **idle** on the attention axis and the map is the
+one surface whose job is comparing branches (§8).
 
 **What does not exist.** No permission surface. A request is answered by a
 `Decider` the caller supplies and the only implementations are "allow
@@ -620,6 +620,7 @@ reach stdout": true of a `-p` run, false of ours.
 | A fork runs no post-create hook | `apps/desktop/src-tauri/src/lib.rs`, §13 | new, and the first caller had to choose: a shadow commit respects `.gitignore`, so a child's checkout has none of the parent's `node_modules` or `target` even though the parent has them on disk. `None`, because a hook is arbitrary user code and this app has no configuration surface for one — every run the window starts already runs none, and a fork that ran a command its parent never ran would be the shell deciding what builds the user's repository. The consequence is real and is stated on the surface rather than hidden: a fork of a project with a build step starts from a clean tracked checkout. When `StartRunRequest` grows a hook, the fork inherits it |
 | **One handle ends a run's event stream; every other producer gets one that cannot** | `crates/driver/src/sink.rs` | new, and it is what unblocked §12. The end of a run's live channel was "the last `mpsc::Sender` clone was dropped", which makes it a fact about reference counting rather than about the run — and the workspace MCP server's threads, which by design outlive the agent's process, held a clone. `StreamEnd` is not `Clone`, holds the only sender, and is moved into the reader thread, so the stream ends where the thread that produces the run's last event returns; `EventSink` is the clonable half and holds no sender at all. The two fixes the roadmap had proposed — let the listener release the sink, or give the supervisor a second end condition — both keep "who is still holding one" as a question someone has to get right at each call site, and a second end condition needs a polling loop or a sentinel event besides. Making it unanswerable is cheaper than answering it |
 | **`Listener::shutdown` ends its open connections rather than waiting for them** | `crates/workspace-mcp/src/listener.rs` | new, and the same argument one layer down: `Session::wait` reclaims the run's event-log connection by unwrapping the `Arc` the workspace is behind, so a connection thread still running makes that a race — and a run that lost it would sit in the database saying `Running` forever. Waiting for the peer is not an option, since a relay holds its connection for the life of its agent; so each open socket is half-closed under its own thread, which turns a blocking read into an EOF and makes the join that follows bounded by one line of output |
+| **A run the app ended is `Interrupted`, a fifth status — and a failure already in the log outranks it** | `crates/event-log/src/run.rs`, `crates/driver/src/registry.rs` | new. Nothing closes a run's stdin on its behalf (a run is a conversation and the user decides when it is over), so `Registry::shutdown` interrupts *every* live run at app exit — and a process killed by a signal has no exit code, which the old `Some(0) => Finished, _ => Failed` read as failure. Ordinary use therefore filed healthy runs as `failed`, over logs ending in `run.finished` with no `run.failed` in them, and `failed` is a claim about the agent's work that the canvas, the runs list and the inspector all repeat. Not `Abandoned`, which is the neighbouring case and a different fact: abandoned is *we lost track of it* — the row still said `running` at boot, nobody watched the process go, the log may stop anywhere — while interrupted is *we ended it*, at a known moment, with the run's last events already written; telling a user who pressed stop that their run was abandoned describes neglect that did not happen. The ordering is the other half of the decision: a `run.failed` in the log wins over the missing exit code, because a run that failed a turn and then sat waiting is killed at shutdown like any other and filing it `Interrupted` would hide the failure exactly as the old rule invented one. The cost is one corner — a run killed before its init message reads `Failed`, since the log says it never started — and that is the cheaper mistake. Rows already written as `failed` are left alone: see the trap below |
 
 ### What building decided that the design had not
 
@@ -712,6 +713,31 @@ reach stdout": true of a `-p` run, false of ours.
   `serve` now half-closes on every exit including a panic. The symptom was one
   test hanging forever, which is a CI timeout rather than a red test, which is
   why the bounded-wait rule below is not pedantry.
+- **A status derived from an exit code alone lies about every run the app
+  ended.** `Registry::finish` read `Some(0) => Finished, _ => Failed`, and a
+  run killed by a signal has no exit code at all — so the rule was not an edge
+  case waiting to happen, it was wrong about the *common* path. Nothing closes
+  a run's stdin for it, so every run still open at app exit is interrupted by
+  `Registry::shutdown`, and each one landed in the database as `failed` with a
+  `finished_at` at the moment the window closed. It was caught on a real fork
+  that had run a full turn, two `Bash` calls and a `run.finished`, with no
+  `run.failed` anywhere in its log — the log had the truth the whole time and
+  the row contradicted it. The general shape: **when a row's status is derived
+  from how a process left rather than from what it did, check what the derivation
+  says about the way runs normally end**, not only about the way they fail.
+  `RunStatus::Interrupted` is the answer here and `finish` now reads the log
+  first.
+
+  **Rows already written as `failed` are not rewritten.** `runs` is a mutable
+  table so the prohibition is §8's on *events*, not on this — it is a judgement
+  call, and the call is no. A repair pass would need a second rule ("`failed`
+  with no `run.failed` event was really an interrupt"), and that rule is least
+  reliable on exactly the rows it would touch most confidently: a run whose
+  tail events never reached the log looks identical to one that was killed
+  while healthy. Re-labelling history under a rule that was not in force when
+  it was written buys a tidier canvas and costs the one property that makes the
+  log worth having. The rows stay; the log beside them already disagrees, and
+  anyone who looks can see which is right.
 - **Events produced at process exit must reach the live view, not just the
   log.** `run.finished` is not a line of stdout. The first real run against
   Claude Code showed every run looking unfinished because of this; there is a

@@ -7,7 +7,7 @@ import type { RunStatus } from '@agent-workspace/shared-types/RunStatus'
 // `event-log` crate computes, and the job of this file is to say either one in
 // a few characters and one colour.
 
-/** What the *row* says a run is, in four words. Not the graph's vocabulary. */
+/** What the *row* says a run is, in five words. Not the graph's vocabulary. */
 export const STATUS: Record<RunStatus, { label: string; dot: string; text: string }> = {
   running: { label: 'running', dot: 'bg-accent', text: 'text-accent' },
   finished: { label: 'finished', dot: 'bg-ok', text: 'text-ok' },
@@ -15,13 +15,18 @@ export const STATUS: Record<RunStatus, { label: string; dot: string; text: strin
   // §8: a run whose process died with the last session. Not an error — nobody
   // did anything wrong — so it is stated in grey rather than red.
   abandoned: { label: 'abandoned', dot: 'bg-faint', text: 'text-muted' },
+  // §8: the user stopped it, or the app exited under it — and since nothing
+  // closes a run's stdin for it, that is how most runs end. Grey for the same
+  // reason as `abandoned`, and emphatically not red: this used to be spelled
+  // `failed`, which accused the agent of something the user had done.
+  interrupted: { label: 'interrupted', dot: 'bg-faint', text: 'text-muted' },
 }
 
 /**
  * The graph's vocabulary: three words, and the only place one maps to a colour.
  *
  * The keys come from `Activity`, which is **generated** — the collapse from
- * four run states to three words happens in `event-log`, not here, because
+ * five run states to three words happens in `event-log`, not here, because
  * deriving **needs you** (a `permission.requested` with no matching
  * `permission.resolved`) is deciding, and the shell owns no logic. What is left
  * on this side is the part that genuinely is presentation: which colour.
@@ -30,7 +35,7 @@ export const STATUS: Record<RunStatus, { label: string; dot: string; text: strin
  * different questions — *does this run want me now* against *what became of
  * it* — and the second is why `failed` can collapse into `idle` here without
  * the information going anywhere: the inspector, the runs list and the status
- * bar still spell all four words.
+ * bar still spell every one of them.
  */
 export const ACTIVITY: Record<
   Activity,

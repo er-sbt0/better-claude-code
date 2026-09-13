@@ -203,6 +203,18 @@ printf '%s\n' '{"type":"result","uuid":"u1","subtype":"error_during_execution","
 exit 0
 "#;
 
+/// A turn that fails, and then a process that keeps waiting for another one.
+///
+/// The combination is what makes it interesting: the failure is in the log and
+/// the process is still alive, so the only way this run can end is a kill — and
+/// a kill must not be allowed to overwrite the failure with "we stopped it".
+const FAILS_THEN_WAITS: &str = r#"#!/usr/bin/env bash
+read -r _prompt
+printf '%s\n' '{"type":"system","subtype":"init","uuid":"u0","session_id":"s","cwd":"'"$PWD"'","tools":[],"mcp_servers":[],"model":"claude-sonnet-5","permissionMode":"default"}'
+printf '%s\n' '{"type":"result","uuid":"u1","subtype":"error_during_execution","result_index":0,"is_error":true,"num_turns":0,"duration_ms":10,"total_cost_usd":0,"modelUsage":{},"permission_denials":[],"errors":["it went wrong"]}'
+while read -r _line; do :; done
+"#;
+
 /// One turn, then exit without being told to. A real agent does not do this —
 /// it is the control case for "the stream ended on its own".
 const ONE_TURN: &str = r#"#!/usr/bin/env bash
@@ -390,6 +402,14 @@ fn a_follow_up_turn_reaches_the_agent() {
 
 /// An interrupt is the other way a run ends, and the log keeps everything it
 /// received (§8: per line, not at the end).
+///
+/// **What it records is `Interrupted`, and this test used to say `Failed`.**
+/// The old assertion carried its own defence — "we have no better word for it
+/// than Failed" — which is an admission that it was pinning the current thing
+/// rather than the right thing. It is the right thing now: the user asked for
+/// the run to stop, the agent did nothing wrong, and `failed` is a claim about
+/// the agent's work that the canvas, the runs list and the inspector all
+/// repeat.
 #[test]
 fn interrupting_a_run_reaps_it_and_records_that_it_did_not_finish() {
     let home = TempDir::new("kill");
@@ -418,9 +438,8 @@ fn interrupting_a_run_reaps_it_and_records_that_it_did_not_finish() {
     });
     assert_eq!(
         status(&log, &run),
-        RunStatus::Failed,
-        "no exit code: a killed run is not a finished one, and we have no \
-         better word for it than Failed"
+        RunStatus::Interrupted,
+        "no exit code: a killed run is neither a finished one nor a failed one"
     );
     let types: Vec<String> = log
         .events(&run)
@@ -479,6 +498,104 @@ fn shutdown_ends_every_live_run() {
             run.0
         );
     }
+}
+
+/// **The bug this status vocabulary was widened for**: a run that did its work
+/// and was still open when the app exited was recorded as `failed`.
+///
+/// It is not an edge case, it is the common path. Nothing closes a run's stdin
+/// on its behalf, so a healthy run waits for its next turn until `shutdown`
+/// kills it — and a process killed by a signal has no exit code, which the old
+/// rule read as "not `Some(0)`, therefore `Failed`". Everything the log knew
+/// said otherwise, and this test says it in the log's own words: a
+/// `turn.finished`, a `run.finished`, and no `run.failed` anywhere.
+#[test]
+fn a_run_that_did_its_work_and_was_still_open_at_app_exit_is_not_filed_as_failed() {
+    let home = TempDir::new("exit-ok");
+    let repo = repo(home.path());
+    let bin = stub_agent(home.path(), "waits", WAITS_FOR_STDIN);
+    let run = RunId::from("run_exit_ok");
+    let db = home.path().join("log.sqlite");
+
+    let registry = registry();
+    let (on_event, rx) = events();
+    registry
+        .start(
+            EventLog::open(&db).unwrap(),
+            spec(&repo, &bin, &run),
+            on_event,
+        )
+        .unwrap();
+    wait_for_event(&rx, "turn.finished");
+
+    // The window closes on a run that is perfectly well.
+    assert_eq!(registry.shutdown(), vec![run.clone()]);
+
+    let log = EventLog::open(&db).unwrap();
+    let row = log.run(&run).unwrap().expect("the run row");
+    assert_ne!(
+        row.status,
+        RunStatus::Failed,
+        "the app ended this run; nothing about it failed"
+    );
+    assert_eq!(row.status, RunStatus::Interrupted);
+    assert_eq!(row.finished_at.as_deref(), Some(FINISHED_AT));
+
+    let types: Vec<String> = log
+        .events(&run)
+        .unwrap()
+        .iter()
+        .map(|e| e.type_name().to_owned())
+        .collect();
+    assert!(types.contains(&"turn.finished".to_owned()), "{types:?}");
+    assert!(
+        !types.contains(&"run.failed".to_owned()),
+        "the log never said this run failed, so neither may the row: {types:?}"
+    );
+    assert_eq!(log.metrics(&run).unwrap().turns, 1, "the turn still counts");
+}
+
+/// A failure already in the log outranks the interrupt that stopped the
+/// process.
+///
+/// The ordering only shows up in this shape: a turn that failed, and then a
+/// process still sitting on stdin, so that the only available ending is a kill.
+/// Reading "no exit code" as `Interrupted` unconditionally would erase the
+/// failure — the same class of lie as the old rule inventing one, pointed the
+/// other way, and the more expensive of the two because a hidden failure is a
+/// branch the runs list says nothing is wrong with.
+#[test]
+fn a_failure_in_the_log_survives_the_interrupt_that_ended_the_process() {
+    let home = TempDir::new("kill-failed");
+    let repo = repo(home.path());
+    let bin = stub_agent(home.path(), "fails-then-waits", FAILS_THEN_WAITS);
+    let run = RunId::from("run_kill_failed");
+    let db = home.path().join("log.sqlite");
+
+    let registry = registry();
+    let (on_event, rx) = events();
+    registry
+        .start(
+            EventLog::open(&db).unwrap(),
+            spec(&repo, &bin, &run),
+            on_event,
+        )
+        .unwrap();
+    wait_for_event(&rx, "turn.finished");
+
+    registry.interrupt(&run).unwrap();
+    eventually("the killed run to be reaped", || !registry.is_live(&run));
+
+    let log = EventLog::open(&db).unwrap();
+    eventually("the run row to be closed", || {
+        status(&log, &run) != RunStatus::Running
+    });
+    assert_eq!(
+        status(&log, &run),
+        RunStatus::Failed,
+        "the turn failed before anyone killed it, and killing it is not an \
+         excuse to forget"
+    );
 }
 
 /// A run that ended, and a run that was never ours, are the same answer: this
