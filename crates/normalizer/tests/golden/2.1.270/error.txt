@@ -1,0 +1,18 @@
+  1  raw.unclassified       reason=NotModeled source=system/hook_started
+  2  raw.unclassified       reason=NotModeled source=system/hook_response
+  3  run.started            agent=claude-code model=claude-sonnet-5
+  4  turn.started           index=0
+  5  run.rate_limited
+  6  tool.started           name=Read args={file_path}
+  7  tool.completed         name=Read is_error=true result=text non_execution=-
+  8  turn.finished          index=0 subtype=error_max_turns ok=false denials=0 models=2 cost_reconciles=true
+  9  run.failed             turns=1 reason=turn ended with subtype `error_max_turns`
+
+lines=7 classified=5 unclassified=2 transient_dropped=0
+  assistant 1
+  rate_limit_event 1
+  result/error_max_turns 1
+  system/hook_response 1
+  system/hook_started 1
+  system/init 1
+  user 1

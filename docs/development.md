@@ -19,7 +19,7 @@ not the other, that gap is the first thing to suspect.
 | Node | 22.23.1 | CI pins 22 |
 | pnpm | 11.21.0 | `packageManager` in the root `package.json` |
 | git | 2.48.1 | the §13.1 attribution mechanism was verified against this |
-| Claude Code | 2.1.270 | fixtures are 2.1.269 — see `roadmap.md` §7 |
+| Claude Code | 2.1.270 | fixtures recorded against both 2.1.269 and 2.1.270 |
 
 ## System libraries (Linux)
 

@@ -1,0 +1,18 @@
+  1  raw.unclassified       reason=NotModeled source=system/hook_started
+  2  raw.unclassified       reason=NotModeled source=system/hook_response
+  3  run.started            agent=claude-code model=claude-sonnet-5
+  4  turn.started           index=0
+  5  run.rate_limited
+  6  assistant.message      block=0 len=1
+  7  turn.finished          index=0 subtype=success ok=true denials=0 models=2 cost_reconciles=true
+  8  run.finished           turns=1
+
+lines=13 classified=4 unclassified=2 transient_dropped=7
+  assistant 1
+  rate_limit_event 1
+  result/success 1
+  stream_event 6
+  system/hook_response 1
+  system/hook_started 1
+  system/init 1
+  system/status 1
