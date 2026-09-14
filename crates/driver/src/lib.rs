@@ -667,8 +667,17 @@ fn spawn_run(mut log: EventLog, spec: SpawnSpec<'_>) -> Result<Session> {
 ///
 /// The normalizer is seeded from the log; §14 explains why nothing in the
 /// stream can tell us this is a resume.
+///
+/// The row goes back to `Running` here, in the same breath and for the same
+/// reason that [`spawn_run`] creates a fresh row `Running` before there is a
+/// process: from this point on something is going to be talking under that id,
+/// and a row that says otherwise is the lie crash recovery exists to prevent —
+/// only inverted, a live run reading as over. It carries the same exposure as
+/// the fresh path, too: a launch that fails from here leaves a `Running` row
+/// with no process, which is exactly what [`reconcile_after_restart`] files as
+/// `Abandoned` at the next boot.
 pub fn resume(
-    log: EventLog,
+    mut log: EventLog,
     run: &Run,
     mut launch: LaunchSpec,
     prompt: &str,
@@ -679,6 +688,7 @@ pub fn resume(
         run.worktree_path.as_deref().unwrap_or(&run.workspace_path),
     ))?;
     let shadow = ShadowHistory::open(&wt, &run.id)?;
+    log.reopen_run(&run.id)?;
     launch.cwd = wt.path().to_path_buf();
     launch.resume = run.provider_session_id.clone();
     // The same run, so the same launch: a resumed conversation that pre-granted

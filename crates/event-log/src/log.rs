@@ -204,6 +204,35 @@ impl EventLog {
         Ok(())
     }
 
+    /// Put a run back to `Running`, because it is running again.
+    ///
+    /// The exact inverse of [`finish_run`](Self::finish_run), and it exists
+    /// because a run ending is not a conversation ending. Nothing closes an
+    /// agent's stdin on its behalf, so the only way to stop paying for an idle
+    /// conversation is to end it — and `send_turn` then wakes it with
+    /// `driver::resume`, same row, same tree, same session, seq carrying on
+    /// from where it stopped. Without this the row kept the status and the
+    /// `finished_at` of the moment it was put down, so a run that was talking
+    /// again read as over everywhere the status is shown, and
+    /// [`running_runs`](Self::running_runs) could not see it to reconcile if
+    /// the app died under it.
+    ///
+    /// `finished_at` is cleared rather than left alone: a row that says
+    /// `running` next to the timestamp it finished at describes two different
+    /// runs. The run's *first* ending is not lost by this — every event of it
+    /// is still in the log, which is where a history belongs; the row only ever
+    /// claimed to describe the latest one.
+    pub fn reopen_run(&mut self, id: &RunId) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ?1",
+            params![id.0],
+        )?;
+        if n == 0 {
+            return Err(Error::NoSuchRun(id.clone()));
+        }
+        Ok(())
+    }
+
     /// Record the provider's session id once we have it.
     ///
     /// §14 prefers *assigning* it at launch, in which case this is never

@@ -203,6 +203,48 @@ fn raw_events_reject_update_and_delete() {
 
 // ------------------------------------------------------------------- resume --
 
+/// A run can end and start again, and the row has to survive the round trip.
+///
+/// Not a hypothetical: nothing closes an agent's stdin on its behalf, so the
+/// only way to stop paying for an idle conversation is to end it, and typing
+/// into it again resumes the same session under the same row
+/// (`docs/verification/idle-run-cost.md`). `finished_at` is the field that
+/// makes this more than a status flip — a row that says `running` next to the
+/// moment it finished is describing two runs at once, and `running_runs`, which
+/// is where crash recovery starts, selects on the status alone.
+#[test]
+fn a_run_that_is_resumed_is_running_again_with_no_finish_time() {
+    let run = RunId::from("woken");
+    let mut log = open_with_run("woken");
+    log.finish_run(&run, RunStatus::Finished, "2026-09-14T09:00:00.000Z")
+        .unwrap();
+    assert!(log.running_runs().unwrap().is_empty());
+
+    log.reopen_run(&run).unwrap();
+    let row = log.run(&run).unwrap().unwrap();
+    assert_eq!(row.status, RunStatus::Running);
+    assert_eq!(row.finished_at, None);
+    assert_eq!(
+        log.running_runs().unwrap().len(),
+        1,
+        "a woken run is reconcilable like any other running run"
+    );
+
+    // Twice, because a run is woken as often as the user comes back to it.
+    log.finish_run(&run, RunStatus::Finished, "2026-09-14T10:00:00.000Z")
+        .unwrap();
+    log.reopen_run(&run).unwrap();
+    assert_eq!(log.run(&run).unwrap().unwrap().status, RunStatus::Running);
+
+    let err = log
+        .reopen_run(&RunId::from("never-existed"))
+        .expect_err("there is no row to reopen");
+    assert!(
+        err.to_string().contains("never-existed"),
+        "reopening a run that is not here says which one: {err}"
+    );
+}
+
 /// §14: a resumed stream replays events we already hold. They must deduplicate
 /// rather than double.
 #[test]

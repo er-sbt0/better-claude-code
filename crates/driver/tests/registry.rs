@@ -1135,6 +1135,112 @@ fn a_run_this_process_is_not_holding_can_be_resumed_and_take_another_turn() {
     eventually("the resumed run to be reaped", || !registry.is_live(&run));
 }
 
+/// **A woken run is running, and its row has to say so.**
+///
+/// This is the half of the round trip that was missing, and it matters more
+/// than it looks. An idle live run holds ~130 MB of private memory
+/// (`docs/verification/idle-run-cost.md`), and the answer recorded there is
+/// that nothing evicts one on a timer — the user does it, by ending an idle
+/// conversation and typing into it again, which `send_turn` turns into a
+/// resume. That round trip is worthless if the run comes back wearing
+/// `Finished`: the canvas, the runs list and the inspector all read the row,
+/// and a live conversation that renders as over is the crash-recovery lie
+/// inverted. `finished_at` has to go with it — `running` beside the moment it
+/// finished describes two different runs — and until it does,
+/// `running_runs` cannot see the woken run either, so a crash under it would
+/// leave the row saying `finished` when it was in fact abandoned mid-turn.
+#[test]
+fn a_woken_run_is_running_again_rather_than_still_finished() {
+    let home = TempDir::new("woken");
+    let repo = repo(home.path());
+    let bin = stub_agent(home.path(), "waits", WAITS_FOR_STDIN);
+    let run = RunId::from("run_woken");
+    let db = home.path().join("log.sqlite");
+
+    let registry = registry();
+    let (on_event, rx) = events();
+    let spec = spec(&repo, &bin, &run);
+    let session_id = spec.launch.session_id.clone();
+    let binary = spec.launch.binary.clone();
+    registry
+        .start(EventLog::open(&db).unwrap(), spec, on_event)
+        .unwrap();
+    wait_for_event(&rx, "turn.finished");
+
+    // The user puts an idle conversation down. Nothing is wrong with it; this
+    // is what reclaiming the process looks like.
+    registry.end(&run).unwrap();
+    eventually("the run to be reaped", || !registry.is_live(&run));
+
+    let log = EventLog::open(&db).unwrap();
+    assert_eq!(
+        status(&log, &run),
+        RunStatus::Finished,
+        "a run whose stdin was closed exits cleanly and is filed as finished"
+    );
+    let put_down = log.run(&run).unwrap().expect("the run row");
+    assert!(
+        put_down.finished_at.is_some(),
+        "and it is stamped with when that happened"
+    );
+    assert!(
+        log.running_runs().unwrap().is_empty(),
+        "nothing is running: the process is gone"
+    );
+
+    // And picks it up again.
+    let mut launch = LaunchSpec::new(
+        put_down
+            .worktree_path
+            .as_deref()
+            .unwrap_or(&put_down.workspace_path),
+        session_id,
+        Permission::DenyPrompts,
+    );
+    launch.binary = binary;
+    launch.thinking = Thinking::Off;
+    let (on_event2, rx2) = events();
+    registry
+        .resume(
+            EventLog::open(&db).unwrap(),
+            &put_down,
+            launch,
+            "still there?",
+            None,
+            on_event2,
+        )
+        .unwrap();
+
+    let woken = log.run(&run).unwrap().expect("the run row");
+    assert_eq!(
+        woken.status,
+        RunStatus::Running,
+        "the row says running from the moment the resume is launched, exactly \
+         as a fresh run's row does before its process has said anything"
+    );
+    assert_eq!(
+        woken.finished_at, None,
+        "and it no longer claims to have finished at a time it was talking"
+    );
+    assert_eq!(
+        log.running_runs()
+            .unwrap()
+            .iter()
+            .map(|r| r.id.clone())
+            .collect::<Vec<_>>(),
+        vec![run.clone()],
+        "so a crash under a woken run is reconcilable like any other"
+    );
+
+    // And it closes normally the second time, rather than being stuck running.
+    wait_for_event(&rx2, "turn.finished");
+    registry.end(&run).unwrap();
+    eventually("the woken run to be reaped", || !registry.is_live(&run));
+    eventually("its row to be closed again", || {
+        status(&log, &run) == RunStatus::Finished
+    });
+}
+
 /// A run that never reached a provider session has nothing to resume, and
 /// saying so is better than starting a fresh session under its row — which
 /// would detach the row from the conversation it names.

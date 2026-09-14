@@ -27,6 +27,22 @@
 //! [`Registry::interrupt`] is called** — or until [`Registry::shutdown`] runs
 //! at app exit, which is why that is not optional.
 //!
+//! Of those three, only the process is expensive, and it is now a number rather
+//! than a worry: **an idle post-turn `claude` is ~233 MB RSS, of which ~130 MB
+//! is private to it**, plus 23 fds and 18 threads, and the fifth one costs the
+//! same as the first (`docs/verification/idle-run-cost.md`). The second log
+//! connection is 97 kB and two descriptors — a rounding error beside the
+//! process, measured by `event-log/examples/connection_cost.rs` — and the
+//! worktree is on disk and outlives the run either way, so ending a run does
+//! not reclaim it. Nothing here evicts an idle run on a timer, deliberately:
+//! waking one costs about 1.3s of extra latency before the first token and
+//! re-runs the user's session hooks, and the decision and its numbers are
+//! recorded in `docs/roadmap.md` §8. What a user *can* do is end an idle
+//! conversation and keep talking to it: [`Registry::end`] then
+//! [`Registry::resume`] is a lossless round trip, which is the property
+//! `a_woken_run_is_running_again_rather_than_still_finished` and its
+//! neighbours in `tests/registry.rs` exist to hold.
+//!
 //! **The reaper is what closes the second connection.** [`Session::wait`]
 //! consumes the session and hands back the [`EventLog`] the run was writing to
 //! (§14's single-writer rule is per connection: the driver's log is never the
@@ -317,6 +333,14 @@ impl Registry {
     /// stdin on a `turn.finished`. The session is *not* reaped from this call:
     /// the agent has a turn to finish, and the supervisor reaps it when the
     /// stream actually stops.
+    ///
+    /// "Ends" is about the process, not the conversation. The row keeps the
+    /// provider's session id, so [`resume`](Self::resume) picks the same
+    /// conversation up in the same tree with the log continuing at the next
+    /// `seq` — which makes this the one lever a user has over the ~130 MB an
+    /// idle run holds (`docs/verification/idle-run-cost.md`). The price of
+    /// pulling it is paid on the next turn, not now: about 1.3s more before the
+    /// first token, and the user's session hooks run again.
     pub fn end(&self, run: &RunId) -> Result<()> {
         self.with_session(run, Session::close_input)
     }
