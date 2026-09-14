@@ -1715,8 +1715,8 @@ fn a_run_records_the_flags_it_was_launched_with() {
 
     let mut spec = spec(&repo, &bin, &run);
     spec.launch.model = Some("claude-opus-4-6".to_owned());
-    spec.launch.allowed_tools = vec!["Read".to_owned(), "Edit".to_owned()];
-    spec.launch.disallowed_tools = vec!["Bash".to_owned()];
+    spec.launch.allowed_tools = Some(vec!["Read".to_owned(), "Edit".to_owned()]);
+    spec.launch.disallowed_tools = Some(vec!["Bash".to_owned()]);
     spec.launch.permission_mode = Some("acceptEdits".to_owned());
     spec.launch.max_turns = Some(7);
     spec.launch.max_budget_usd = Some(2.5);
@@ -1765,7 +1765,7 @@ fn a_resumed_run_is_launched_with_what_the_run_was_launched_with() {
 
     let mut spec = spec(&repo, &bin, &run);
     spec.launch.model = Some("claude-opus-4-6".to_owned());
-    spec.launch.allowed_tools = vec!["Read".to_owned(), "Edit".to_owned()];
+    spec.launch.allowed_tools = Some(vec!["Read".to_owned(), "Edit".to_owned()]);
     spec.launch.max_turns = Some(7);
     let started = driver::start(
         EventLog::open(&db).unwrap(),
@@ -1889,35 +1889,21 @@ fn a_run_whose_row_stores_no_flags_still_starts() {
 /// guessed because `LaunchSpec::new`'s default *is* "unset" for each of them.
 #[test]
 fn a_caller_that_names_a_flag_keeps_it_over_the_row() {
-    let mut row = Run {
-        id: RunId::from("run_row"),
-        agent: "claude-code".to_owned(),
-        agent_version: None,
-        provider_session_id: None,
-        workspace_path: "/tmp".to_owned(),
-        worktree_path: None,
-        branch: None,
-        shadow_ref: None,
-        prompt: None,
-        model: Some("claude-opus-4-6".to_owned()),
-        launch_flags: LaunchFlags {
+    let mut row = launched_row(
+        Some("claude-opus-4-6"),
+        LaunchFlags {
             allowed_tools: vec!["Read".to_owned()],
             max_turns: Some(12),
             ..LaunchFlags::default()
         },
-        status: RunStatus::Finished,
-        started_at: "2026-09-14T09:00:00.000Z".to_owned(),
-        finished_at: None,
-        parent_run_id: None,
-        branch_point_seq: None,
-    };
+    );
 
     let mut named = LaunchSpec::new("/wt", driver::new_session_id(), Permission::DenyPrompts);
     named.model = Some("claude-sonnet-5".to_owned());
-    named.allowed_tools = vec!["Bash".to_owned()];
+    named.allowed_tools = Some(vec!["Bash".to_owned()]);
     named.inherit_from(&row);
     assert_eq!(named.model.as_deref(), Some("claude-sonnet-5"));
-    assert_eq!(named.allowed_tools, vec!["Bash".to_owned()]);
+    assert_eq!(named.allowed_tools, Some(vec!["Bash".to_owned()]));
     assert_eq!(
         named.max_turns,
         Some(12),
@@ -1927,7 +1913,7 @@ fn a_caller_that_names_a_flag_keeps_it_over_the_row() {
     let mut silent = LaunchSpec::new("/wt", driver::new_session_id(), Permission::DenyPrompts);
     silent.inherit_from(&row);
     assert_eq!(silent.model.as_deref(), Some("claude-opus-4-6"));
-    assert_eq!(silent.allowed_tools, vec!["Read".to_owned()]);
+    assert_eq!(silent.allowed_tools, Some(vec!["Read".to_owned()]));
     assert_eq!(silent.max_turns, Some(12));
 
     // And a row that stored nothing leaves the spec exactly as it was built.
@@ -1935,8 +1921,189 @@ fn a_caller_that_names_a_flag_keeps_it_over_the_row() {
     row.launch_flags = LaunchFlags::default();
     let mut over_nothing =
         LaunchSpec::new("/wt", driver::new_session_id(), Permission::DenyPrompts);
-    over_nothing.allowed_tools = vec!["Edit".to_owned()];
+    over_nothing.allowed_tools = Some(vec!["Edit".to_owned()]);
     over_nothing.inherit_from(&row);
-    assert_eq!(over_nothing.allowed_tools, vec!["Edit".to_owned()]);
+    assert_eq!(over_nothing.allowed_tools, Some(vec!["Edit".to_owned()]));
     assert_eq!(over_nothing.model, None);
+}
+
+/// A finished run's row, launched with `model` and `flags`.
+///
+/// The tests around it ask what a *later* spec reads off a row — a fork's or a
+/// resume's — so the run's own git state, session and history are deliberately
+/// absent: none of them reach `LaunchSpec::inherit_from`.
+fn launched_row(model: Option<&str>, flags: LaunchFlags) -> Run {
+    Run {
+        id: RunId::from("run_row"),
+        agent: "claude-code".to_owned(),
+        agent_version: None,
+        provider_session_id: None,
+        workspace_path: "/tmp".to_owned(),
+        worktree_path: None,
+        branch: None,
+        shadow_ref: None,
+        prompt: None,
+        model: model.map(str::to_owned),
+        launch_flags: flags,
+        status: RunStatus::Finished,
+        started_at: "2026-09-14T09:00:00.000Z".to_owned(),
+        finished_at: None,
+        parent_run_id: None,
+        branch_point_seq: None,
+    }
+}
+
+/// **"Pre-grant nothing" is not "I did not say", and under `DenyPrompts` the
+/// difference is the whole of what the run may do.**
+///
+/// The two were one value until these three fields became `Option`s: an empty
+/// `Vec` was what `LaunchSpec::new` left behind *and* what a caller asking for
+/// no tools had to write, and `inherit_from` tested `is_empty()`, so the second
+/// was answered as the first — a fork or a resume that deliberately handed the
+/// child nothing was handed its parent's entire allow-list instead. Every other
+/// field on that spec errs toward a child that can do less than its parent,
+/// which is visible and arguable; this one erred toward a child that can do
+/// more than its caller asked for, silently, on the field §12 makes the whole
+/// of a run's capability.
+#[test]
+fn an_explicitly_empty_list_is_not_the_caller_saying_nothing() {
+    let row = launched_row(
+        Some("claude-opus-4-6"),
+        LaunchFlags {
+            allowed_tools: vec!["Read".to_owned()],
+            disallowed_tools: vec!["Bash".to_owned()],
+            max_turns: Some(12),
+            extra: vec!["--some-flag".to_owned()],
+            ..LaunchFlags::default()
+        },
+    );
+
+    let mut empty = LaunchSpec::new("/wt", driver::new_session_id(), Permission::DenyPrompts);
+    empty.allowed_tools = Some(Vec::new());
+    empty.disallowed_tools = Some(Vec::new());
+    empty.extra = Some(Vec::new());
+    empty.inherit_from(&row);
+    assert_eq!(
+        empty.allowed_tools,
+        Some(Vec::new()),
+        "a caller that asked for no tools keeps none: the parent's list is not \
+         an answer to a question it already answered"
+    );
+    assert_eq!(empty.disallowed_tools, Some(Vec::new()));
+    assert_eq!(empty.extra, Some(Vec::new()));
+    assert_eq!(
+        (empty.model.as_deref(), empty.max_turns),
+        (Some("claude-opus-4-6"), Some(12)),
+        "and the fields it did say nothing about are still inherited"
+    );
+
+    // What that spec launches: the flag is absent rather than present and
+    // empty, which is the same argv `None` produces and the right one for both
+    // — the CLI has no spelling for an empty list, and a run without the flag
+    // pre-grants exactly nothing.
+    let argv = empty.argv();
+    assert!(
+        !argv.iter().any(|a| a == "--allowed-tools"),
+        "an empty allow-list is no flag at all: {argv:?}"
+    );
+    assert!(
+        !argv
+            .iter()
+            .any(|a| a == "Read" || a == "Bash" || a == "--some-flag"),
+        "and nothing of the parent's reaches the process: {argv:?}"
+    );
+
+    // The neighbouring spelling, unchanged: silence still inherits.
+    let mut silent = LaunchSpec::new("/wt", driver::new_session_id(), Permission::DenyPrompts);
+    silent.inherit_from(&row);
+    assert_eq!(silent.allowed_tools, Some(vec!["Read".to_owned()]));
+    assert_eq!(silent.extra, Some(vec!["--some-flag".to_owned()]));
+    assert!(
+        silent
+            .argv()
+            .windows(2)
+            .any(|w| w[0] == "--allowed-tools" && w[1] == "Read"),
+        "{:?}",
+        silent.argv()
+    );
+}
+
+/// **A resume that pre-grants nothing wakes the run with nothing.**
+///
+/// The end-to-end half of the test above, and the shape the failure actually
+/// took: `Registry::resume` is the ordinary path for any run from an earlier
+/// session, and the composer hands it a spec built from the row. A caller
+/// narrowing that second life to no pre-granted tools — the cautious thing to
+/// do with a conversation you are picking up — got the first life's allow-list
+/// back, from a decision nothing on the screen records.
+///
+/// The row is not rewritten either way: it stores what the run was *launched*
+/// with, and a resume is that launch again rather than a new fact about it.
+#[test]
+fn a_resume_that_pre_grants_nothing_is_launched_with_nothing() {
+    let home = TempDir::new("flags-resume-empty");
+    let repo = repo(home.path());
+    let bin = stub_agent(home.path(), EDIT_THEN_REPORT);
+    let run = RunId::from("run_narrowed");
+    let db = home.path().join("log.sqlite");
+
+    let mut spec = spec(&repo, &bin, &run);
+    spec.launch.allowed_tools = Some(vec!["Read".to_owned(), "Edit".to_owned()]);
+    spec.launch.max_turns = Some(7);
+    let started = driver::start(
+        EventLog::open(&db).unwrap(),
+        spec,
+        "2026-09-14T09:00:00.000Z",
+        None,
+    )
+    .unwrap();
+    let (_outcome, log) = started.session.wait().unwrap();
+    let row = log.run(&run).unwrap().unwrap();
+    drop(log);
+
+    let dump = home.path().join("narrowed-argv");
+    let mut launch = LaunchSpec::new(
+        "/definitely/not/a/checkout",
+        row.provider_session_id.clone().unwrap(),
+        Permission::DenyPrompts,
+    );
+    launch.binary = dumping_agent(home.path(), "narrowed-claude", &dump, "n");
+    launch.thinking = Thinking::Off;
+    // The whole of the test: said, rather than left unsaid.
+    launch.allowed_tools = Some(Vec::new());
+
+    let session = driver::resume(
+        EventLog::open(&db).unwrap(),
+        &row,
+        launch,
+        "and now the second turn",
+        None,
+        None,
+    )
+    .unwrap();
+    let (outcome, log) = session.wait().unwrap();
+    assert_eq!(outcome.exit_code, Some(0));
+
+    let dumped = fs::read_to_string(&dump).unwrap();
+    let argv: Vec<&str> = dumped.lines().collect();
+    assert!(
+        !argv.contains(&"--allowed-tools"),
+        "the caller asked for no pre-granted tools and got none: {argv:?}"
+    );
+    assert!(
+        !argv.contains(&"Read") && !argv.contains(&"Edit"),
+        "the first life's allow-list is not handed back: {argv:?}"
+    );
+    assert!(
+        argv.windows(2)
+            .any(|w| w[0] == "--max-turns" && w[1] == "7"),
+        "while the bound it said nothing about is still inherited: {argv:?}"
+    );
+
+    assert_eq!(
+        log.run(&run).unwrap().unwrap().launch_flags.allowed_tools,
+        vec!["Read".to_owned(), "Edit".to_owned()],
+        "and the row still records what the run was launched with, which is \
+         what the next fork of it inherits"
+    );
 }

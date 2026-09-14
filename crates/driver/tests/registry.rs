@@ -952,12 +952,10 @@ fn forking_through_the_registry_supervises_the_child_like_any_other_run() {
 
     let registry = registry();
     let (on_event, _rx) = events();
+    let mut parent_spec = spec(&repo, &bin, &parent);
+    parent_spec.launch.allowed_tools = Some(vec!["Read".to_owned(), "Edit".to_owned()]);
     registry
-        .start(
-            EventLog::open(&db).unwrap(),
-            spec(&repo, &bin, &parent),
-            on_event,
-        )
+        .start(EventLog::open(&db).unwrap(), parent_spec, on_event)
         .unwrap();
     eventually("the parent to be reaped", || !registry.is_live(&parent));
 
@@ -1049,6 +1047,100 @@ fn forking_through_the_registry_supervises_the_child_like_any_other_run() {
         row.model,
         log.run(&parent).unwrap().unwrap().model,
         "a fork inherits its parent's model, by copy onto its own row"
+    );
+    assert_eq!(
+        row.launch_flags.allowed_tools,
+        vec!["Read".to_owned(), "Edit".to_owned()],
+        "and its policy with it: this fork named nothing, and a continuation \
+         that quietly holds a different allow-list is not a continuation"
+    );
+}
+
+/// **A fork that pre-grants nothing gets nothing.**
+///
+/// The other half of the rule the test above checks, through the same command
+/// the ⌘⇧F button calls. Inheriting is what a fork does when the caller says
+/// nothing; a caller that *does* say something is making exactly the change the
+/// branch exists to make, and "this branch may pre-grant no tools" is a change
+/// a user is entitled to make to a conversation they are branching.
+///
+/// It could not be said at all until `LaunchSpec`'s list fields became
+/// `Option`s: an empty `Vec` was both how a bare spec arrives and how a caller
+/// spelled "nothing", so `inherit_from` answered the second with the parent's
+/// whole allow-list. Under §12's `DenyPrompts` posture that is the one
+/// direction this must never fail in — more capability than was asked for, with
+/// nothing on the screen saying so.
+#[test]
+fn a_fork_that_asks_for_no_tools_does_not_inherit_the_parents_allow_list() {
+    let home = TempDir::new("fork-empty-allow");
+    let repo = repo(home.path());
+    let bin = stub_agent(home.path(), "one-turn", ONE_TURN);
+    let parent = RunId::from("run_granting_parent");
+    let db = home.path().join("log.sqlite");
+
+    let registry = registry();
+    let (on_event, _rx) = events();
+    let mut parent_spec = spec(&repo, &bin, &parent);
+    parent_spec.launch.allowed_tools = Some(vec!["Read".to_owned(), "Edit".to_owned()]);
+    parent_spec.launch.max_turns = Some(7);
+    registry
+        .start(EventLog::open(&db).unwrap(), parent_spec, on_event)
+        .unwrap();
+    eventually("the parent to be reaped", || !registry.is_live(&parent));
+
+    let log = EventLog::open(&db).unwrap();
+    eventually("the parent's assistant message", || {
+        log.events(&parent)
+            .unwrap()
+            .iter()
+            .any(|e| e.type_name() == "assistant.message")
+    });
+    let at_seq = log
+        .events(&parent)
+        .unwrap()
+        .iter()
+        .find(|e| e.type_name() == "assistant.message")
+        .expect("the parent said something")
+        .seq;
+    let at = driver::ForkPoint::resolve(&log, &parent, at_seq).unwrap();
+
+    let child = RunId::from("run_ungranted_child");
+    let mut launch = LaunchSpec::new(&repo, driver::new_session_id(), Permission::DenyPrompts);
+    launch.binary = bin.clone();
+    launch.thinking = Thinking::Off;
+    // Said out loud: this branch pre-grants nothing.
+    launch.allowed_tools = Some(Vec::new());
+    registry
+        .fork(
+            EventLog::open(&db).unwrap(),
+            driver::ForkSpec {
+                run_id: child.clone(),
+                at,
+                branch: format!("agent/{}", child.0),
+                post_create_hook: None,
+                prompt: "start from here with nothing".to_owned(),
+                launch,
+                workspace_mcp: None,
+            },
+            |_| {},
+        )
+        .unwrap();
+    eventually("the child to be reaped", || !registry.is_live(&child));
+    eventually("the child's row to be closed", || {
+        status(&log, &child) != RunStatus::Running
+    });
+
+    let row = log.run(&child).unwrap().expect("the child's row");
+    assert!(
+        row.launch_flags.allowed_tools.is_empty(),
+        "the caller pre-granted nothing, so the child pre-grants nothing — and \
+         its own row says so, which is what a fork of *it* will inherit: {:?}",
+        row.launch_flags.allowed_tools
+    );
+    assert_eq!(
+        row.launch_flags.max_turns,
+        Some(7),
+        "while the bound the caller said nothing about is still the parent's"
     );
 }
 

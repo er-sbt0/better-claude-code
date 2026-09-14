@@ -72,8 +72,31 @@ pub struct LaunchSpec {
     pub session_id: SessionId,
     pub permission: Permission,
     pub model: Option<String>,
-    pub allowed_tools: Vec<String>,
-    pub disallowed_tools: Vec<String>,
+    /// Pre-granted tools, or `None` when the caller named no allow-list at all.
+    ///
+    /// **`Some(vec![])` is not `None`, and that distinction is the reason this
+    /// is an `Option`.** Under §12's `DenyPrompts` posture this field is the
+    /// whole of what a run may do, so "pre-grant nothing" is a posture a caller
+    /// is entitled to ask for — and on a fork or a resume it is the *opposite*
+    /// of saying nothing, which inherits the parent's list
+    /// ([`inherit_from`](LaunchSpec::inherit_from)). A bare `Vec` cannot tell
+    /// those two apart, and the reading it collapsed them to hands the child
+    /// *more* capability than the caller asked for — on the one field where
+    /// "fails open" means what it sounds like.
+    ///
+    /// [`argv`](LaunchSpec::argv) emits the same argv for both spellings, and
+    /// says why. The difference lives between building a spec and merging it
+    /// with a row, which is the only place it is a question anyone can answer.
+    pub allowed_tools: Option<Vec<String>>,
+    /// Tools denied outright, or `None` when the caller named no deny-list.
+    ///
+    /// The same `Option` as [`allowed_tools`](LaunchSpec::allowed_tools) and for
+    /// the mirrored reason: `Some(vec![])` is a fork that deliberately *drops*
+    /// the parent's deny-list, which a caller may well want and which an empty
+    /// `Vec` could only spell as "say nothing" — inheriting the very list it was
+    /// trying to clear. The failure is quieter in this direction and it is the
+    /// same failure.
+    pub disallowed_tools: Option<Vec<String>>,
     pub permission_mode: Option<String>,
     pub max_turns: Option<u32>,
     pub max_budget_usd: Option<f64>,
@@ -103,8 +126,15 @@ pub struct LaunchSpec {
     /// anchors every fork to a message, and the tip is a message with an
     /// address like any other.
     pub fork_at: Option<String>,
-    /// Escape hatch for flags this struct has no opinion about.
-    pub extra: Vec<String>,
+    /// Escape hatch for flags this struct has no opinion about, or `None` when
+    /// the caller named none.
+    ///
+    /// `Option` for the same reason as the two tool lists, with one twist: we
+    /// have no opinion about what is in here, so we equally have none about
+    /// whether inheriting it is safe. `Some(vec![])` is how a caller says "start
+    /// this branch without whatever argv the parent carried" — which, for a flag
+    /// this struct cannot classify, is a thing only the caller can decide.
+    pub extra: Option<Vec<String>>,
 }
 
 impl LaunchSpec {
@@ -124,15 +154,30 @@ impl LaunchSpec {
     /// argued field by field on [`LaunchFlags`]. The short version is that each
     /// of them is a property of this machine, this process or this moment
     /// rather than of the run, and several are already columns of their own.
+    ///
+    /// **The three list fields flatten here, and that is not the distinction
+    /// [`allowed_tools`](LaunchSpec::allowed_tools) exists to keep.** `None` and
+    /// `Some(vec![])` both store `[]`, because the row records a *launch* and
+    /// the two spellings launch identically: [`argv`](LaunchSpec::argv) emits no
+    /// `--allowed-tools` for either, so a parent that pre-granted nothing on
+    /// purpose and one that never mentioned tools ran the same process under the
+    /// same policy, and a child inheriting `[]` from either inherits that policy
+    /// exactly. What the `Option` carries is a fact about a *caller* — did this
+    /// call say anything — and it is answerable only while the spec is still the
+    /// caller's, before [`inherit_from`](LaunchSpec::inherit_from) merges it with
+    /// a row. Storing it would file a question about one call as a property of
+    /// the run, and it would move a serialized shape that has rows on disk;
+    /// [`LaunchFlags`] argues at length for not doing that, and nothing here
+    /// needs it to.
     pub fn flags(&self) -> LaunchFlags {
         LaunchFlags {
-            allowed_tools: self.allowed_tools.clone(),
-            disallowed_tools: self.disallowed_tools.clone(),
+            allowed_tools: self.allowed_tools.clone().unwrap_or_default(),
+            disallowed_tools: self.disallowed_tools.clone().unwrap_or_default(),
             permission_mode: self.permission_mode.clone(),
             max_turns: self.max_turns,
             max_budget_usd: self.max_budget_usd,
             append_system_prompt: self.append_system_prompt.clone(),
-            extra: self.extra.clone(),
+            extra: self.extra.clone().unwrap_or_default(),
         }
     }
 
@@ -155,6 +200,30 @@ impl LaunchSpec {
     /// every field here, so "the caller said nothing" is decidable rather than
     /// guessed.
     ///
+    /// **That sentence was false for three fields, and making it true is why
+    /// they are `Option<Vec<String>>`.** `allowed_tools`, `disallowed_tools` and
+    /// `extra` were bare `Vec`s tested with `is_empty()`, which spells "the
+    /// caller said nothing" and "the caller asked for nothing" with the same
+    /// value — so a fork or a resume that deliberately pre-granted *no* tools
+    /// inherited its parent's entire allow-list instead, silently, and under
+    /// §12's `DenyPrompts` posture that list is the whole of what a run may do.
+    /// The same collapse on the other two lists errs the other way: a caller
+    /// clearing the deny-list or the `extra` argv got the parent's back, and a
+    /// child that can do less than its caller asked at least fails as a refusal
+    /// someone can read. On the allow-list it erred toward a child that could do
+    /// *more*, under a posture whose whole premise is that nothing may prompt —
+    /// so the extra capability arrives unannounced and the record of the launch
+    /// agrees with it.
+    ///
+    /// Two shapes were considered and rejected. A second field beside each list
+    /// — a `bool` saying whether it was set — is two values that can disagree,
+    /// and nothing stops a caller from setting the list and forgetting the flag.
+    /// A named enum (`Unset` / `Set(Vec<String>)`) is `Option` with a vocabulary
+    /// nobody else on this struct uses, next to eight fields that already spell
+    /// "unset" as `None`. The cost of `Option` is one `unwrap_or_default` in
+    /// [`flags`](LaunchSpec::flags) and one `is_none` here, in exchange for the
+    /// two states being different values rather than the same one.
+    ///
     /// A run whose row stores nothing — one recorded before the column existed
     /// — leaves the spec exactly as the caller built it, which is the behaviour
     /// every such run already had.
@@ -163,11 +232,11 @@ impl LaunchSpec {
             self.model = run.model.clone();
         }
         let flags = &run.launch_flags;
-        if self.allowed_tools.is_empty() {
-            self.allowed_tools = flags.allowed_tools.clone();
+        if self.allowed_tools.is_none() {
+            self.allowed_tools = Some(flags.allowed_tools.clone());
         }
-        if self.disallowed_tools.is_empty() {
-            self.disallowed_tools = flags.disallowed_tools.clone();
+        if self.disallowed_tools.is_none() {
+            self.disallowed_tools = Some(flags.disallowed_tools.clone());
         }
         if self.permission_mode.is_none() {
             self.permission_mode = flags.permission_mode.clone();
@@ -181,8 +250,8 @@ impl LaunchSpec {
         if self.append_system_prompt.is_none() {
             self.append_system_prompt = flags.append_system_prompt.clone();
         }
-        if self.extra.is_empty() {
-            self.extra = flags.extra.clone();
+        if self.extra.is_none() {
+            self.extra = Some(flags.extra.clone());
         }
     }
 
@@ -194,8 +263,11 @@ impl LaunchSpec {
             session_id,
             permission,
             model: None,
-            allowed_tools: Vec::new(),
-            disallowed_tools: Vec::new(),
+            // `None`, never an empty `Vec`: [`inherit_from`] reads these to
+            // decide whether the caller said anything, and a spec fresh out of
+            // here has said nothing about any of them.
+            allowed_tools: None,
+            disallowed_tools: None,
             permission_mode: None,
             max_turns: None,
             max_budget_usd: None,
@@ -205,7 +277,7 @@ impl LaunchSpec {
             partial_messages: false,
             resume: None,
             fork_at: None,
-            extra: Vec::new(),
+            extra: None,
         }
     }
 
@@ -326,6 +398,18 @@ impl LaunchSpec {
     /// `--bare` are the knobs that *would* shut the rest out, deliberately not
     /// passed — `--bare` alone would cost the user's OAuth credentials.
     ///
+    /// `--allowed-tools` and `--disallowed-tools` are emitted only for a
+    /// **non-empty** list, so `None` and `Some(vec![])` produce the same argv —
+    /// deliberately, and it is the right argv for both. The CLI has no spelling
+    /// for an empty list — both flags take `<tools...>`, a required variadic
+    /// value (`docs/verification/claude-code-cli-2.1.270.md`) — and it needs
+    /// none, because a run launched with no `--allowed-tools` pre-grants
+    /// exactly nothing, which is what a caller asking for an empty list is
+    /// asking for. The two spellings
+    /// differ in what the *caller said*, and the only reader of that is
+    /// [`inherit_from`](LaunchSpec::inherit_from) — by the time argv is built,
+    /// the question has already been answered.
+    ///
     /// `-p` comes last and carries **no value**: with
     /// `--input-format stream-json` the prompt arrives over stdin as a `user`
     /// message, which is what turns a one-shot into a live session.
@@ -404,15 +488,16 @@ impl LaunchSpec {
             push!("--permission-mode");
             push!(m);
         }
-        if !self.allowed_tools.is_empty() {
+        // Empty and unset are one argv; the doc comment above says why.
+        if let Some(tools) = self.allowed_tools.as_deref().filter(|t| !t.is_empty()) {
             push!("--allowed-tools");
-            for t in &self.allowed_tools {
+            for t in tools {
                 a.push(t.clone());
             }
         }
-        if !self.disallowed_tools.is_empty() {
+        if let Some(tools) = self.disallowed_tools.as_deref().filter(|t| !t.is_empty()) {
             push!("--disallowed-tools");
-            for t in &self.disallowed_tools {
+            for t in tools {
                 a.push(t.clone());
             }
         }
@@ -444,7 +529,7 @@ impl LaunchSpec {
             push!("--resume-session-at");
             push!(at);
         }
-        a.extend(self.extra.iter().cloned());
+        a.extend(self.extra.iter().flatten().cloned());
         push!("-p");
         a
     }

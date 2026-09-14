@@ -195,7 +195,9 @@ fn main() {
     let run_id = RunId::from(format!("run_{}", uuid_like()));
     let mut launch = LaunchSpec::new(&repo, driver::new_session_id(), Permission::DenyPrompts);
     launch.model = model;
-    launch.allowed_tools = allow;
+    // `--allow` is repeatable and there is no spelling for "an empty list", so
+    // saying nothing on the command line is `None`: the caller named none.
+    launch.allowed_tools = (!allow.is_empty()).then_some(allow);
     launch.permission_mode = mode;
     launch.max_turns = Some(max_turns);
     launch.max_budget_usd = Some(budget);

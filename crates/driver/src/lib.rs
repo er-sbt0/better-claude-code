@@ -146,7 +146,11 @@ pub struct ForkSpec {
     /// Everything else a caller leaves unset is **inherited from the parent's
     /// row** ([`LaunchSpec::inherit_from`]), so the ordinary way to fork is to
     /// pass a bare [`LaunchSpec::new`] and say nothing. Naming a field here is
-    /// how a branch comes to differ from the run it came out of.
+    /// how a branch comes to differ from the run it came out of — including
+    /// naming an *empty* allow-list, which is how a branch comes to pre-grant
+    /// nothing at all. That is a different instruction from leaving the field
+    /// alone, and [`LaunchSpec::allowed_tools`] is the `Option` that keeps them
+    /// different.
     pub launch: LaunchSpec,
     pub workspace_mcp: Option<WorkspaceMcp>,
 }
@@ -734,6 +738,29 @@ pub fn resume(
 /// - `--append-system-prompt`, because a tool the agent is never told about is
 ///   a tool it never calls (§6). Appended to whatever the caller set rather
 ///   than replacing it.
+///
+/// # An explicitly empty allow-list still gets `report_finding`
+///
+/// [`LaunchSpec::allowed_tools`] can now say "pre-grant nothing" as distinct
+/// from saying nothing at all, and this adds the tool in both cases. That is a
+/// decision, not an oversight, and it rests on what the caller's empty list is
+/// a statement *about*: the tools the **agent** may reach for. `report_finding`
+/// is none of the agent's capability — it is the wire this process just bound
+/// so the run can hand findings back to the app that launched it, on a server
+/// this same function injected a moment ago and that the caller could not have
+/// been talking about, since it did not exist when the caller built the spec.
+/// Honouring the empty list here would not make the run safer; it would make it
+/// mute, and loudly so — verified the hard way, the finding raises a permission
+/// request of its own, so under a deny-by-default policy the run's own
+/// reporting channel is the first thing denied.
+///
+/// The empty list survives everywhere it is a statement about the run.
+/// [`LaunchSpec::flags`] is read at the launch seam *before* this runs, so the
+/// row stores the caller's empty list and every fork and resume off it inherits
+/// an empty list; this rewrite reaches the argv of one process and nothing
+/// else. That ordering is load-bearing and is the same one that keeps
+/// `append_system_prompt` from accumulating a copy of §6's paragraph per
+/// resume.
 fn wire_workspace_mcp(
     launch: &mut LaunchSpec,
     run_id: &RunId,
@@ -758,8 +785,12 @@ fn wire_workspace_mcp(
         tool: workspace_mcp::qualified(workspace_mcp::REQUEST_PERMISSION),
     };
     let report = workspace_mcp::qualified(workspace_mcp::REPORT_FINDING);
-    if !launch.allowed_tools.contains(&report) {
-        launch.allowed_tools.push(report);
+    // On an unset list and on a deliberately empty one alike — the heading
+    // above argues why, and why doing so costs the caller's empty list nothing
+    // that is stored or inherited.
+    let allowed = launch.allowed_tools.get_or_insert_with(Vec::new);
+    if !allowed.contains(&report) {
+        allowed.push(report);
     }
     launch.append_system_prompt = Some(match launch.append_system_prompt.take() {
         Some(existing) => format!("{existing}\n\n{}", workspace_mcp::SYSTEM_PROMPT),

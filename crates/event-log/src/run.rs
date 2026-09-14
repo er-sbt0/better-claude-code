@@ -123,6 +123,19 @@ impl Run {
 /// defaulted field is the same migration that a version bump would have had to
 /// spell out anyway.
 ///
+/// **Why the lists here are `Vec` where the spec's are `Option<Vec>`.**
+/// `driver::LaunchSpec` distinguishes "the caller named an empty allow-list"
+/// from "the caller named none", because on a fork or a resume those are
+/// opposite instructions — the first pre-grants nothing, the second inherits
+/// whatever this row holds. That distinction dies at `LaunchSpec::flags`, on
+/// purpose: it is a fact about a *call*, and both spellings produce the same
+/// process. A launch with an empty allow-list and one with no allow-list pass
+/// the same argv, so a row storing `[]` for either describes what ran, exactly,
+/// and a child inheriting `[]` from it runs under the same policy the parent
+/// did. Widening this field to `Option<Vec<String>>` to carry the difference
+/// would buy nothing a reader of a row can use, and would spend the one thing
+/// this struct is careful about: rows already on disk decode into it.
+///
 /// **What is not here, and why.** The excluded half of `driver::LaunchSpec` is
 /// not an oversight; each field is excluded for a reason of its own:
 ///

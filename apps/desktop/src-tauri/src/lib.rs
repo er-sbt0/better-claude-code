@@ -357,7 +357,12 @@ fn start_run(
     let run_id = driver::new_run_id();
     let mut launch = LaunchSpec::new(&repo, driver::new_session_id(), Permission::DenyPrompts);
     launch.model = request.model;
-    launch.allowed_tools = request.allowed_tools;
+    // `Some`, even when the list is empty: this window always names an
+    // allow-list, and an empty one from the dialog means "pre-grant nothing"
+    // rather than "I did not say". Nothing is inherited on a root run either
+    // way — `driver::fork` and `driver::resume` are where the difference is
+    // read — but the spec should say what the caller said.
+    launch.allowed_tools = Some(request.allowed_tools);
     launch.max_turns = request.max_turns;
     launch.max_budget_usd = request.max_budget_usd;
 
