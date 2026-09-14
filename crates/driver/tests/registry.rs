@@ -1431,3 +1431,64 @@ fn stderr_is_bounded_in_both_directions_the_agent_controls() {
         "the 200 KB line is clipped, and says so"
     );
 }
+
+/// §13's cleanup refuses a run this process is holding open, and no `force`
+/// lifts it.
+///
+/// The agent's cwd is that directory and cannot be changed after spawn, so
+/// removing the tree does not stop the run — it detaches the run's writes from
+/// git, which is worse than either leaving it or ending it. Asserted with
+/// `force: true` on purpose: that flag is §13's answer to *uncommitted
+/// changes*, and it must not be reachable past this check.
+///
+/// The check lives on the registry rather than beside the git in
+/// `driver::clean_up` because this is the only place that knows which runs have
+/// a process behind them, and routing every caller through here is what makes
+/// it unskippable — `apps/desktop` has `state.runs.is_live` in reach and would
+/// otherwise be deciding this in a window.
+#[test]
+fn cleaning_up_a_run_this_process_is_holding_open_is_refused() {
+    let home = TempDir::new("cleanup-live");
+    let repo = repo(home.path());
+    let bin = stub_agent(home.path(), "waits", WAITS_FOR_STDIN);
+    let run = RunId::from("run_live_tree");
+    let db = home.path().join("log.sqlite");
+
+    let registry = registry();
+    let (on_event, rx) = events();
+    let live = registry
+        .start(
+            EventLog::open(&db).unwrap(),
+            spec(&repo, &bin, &run),
+            on_event,
+        )
+        .unwrap();
+    wait_for_event(&rx, "turn.finished");
+    assert!(registry.is_live(&run));
+
+    let mut log = EventLog::open(&db).unwrap();
+    let refused = registry.clean_up(&mut log, &run, true);
+    assert!(
+        matches!(refused, Err(Error::RunIsLive { .. })),
+        "a live run's worktree was pulled out from under it: {refused:?}"
+    );
+    assert!(
+        live.worktree_path.exists(),
+        "and the refusal left the tree where the agent is working"
+    );
+    assert!(
+        log.run(&run).unwrap().unwrap().worktree_path.is_some(),
+        "a refused cleanup writes nothing"
+    );
+
+    // Once nothing is holding it, the same call goes through. `shutdown`
+    // interrupts and joins, so there is no process left by the time it returns.
+    registry.shutdown();
+    drain_to_end(&rx);
+    assert!(matches!(
+        registry.clean_up(&mut log, &run, true).unwrap(),
+        driver::Cleanup::Removed { .. }
+    ));
+    assert!(!live.worktree_path.exists());
+    assert_eq!(log.run(&run).unwrap().unwrap().worktree_path, None);
+}

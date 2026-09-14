@@ -1260,6 +1260,249 @@ fn log_of(db: &Path) -> EventLog {
     EventLog::open(db).unwrap()
 }
 
+// ----------------------------------------------------------------- cleanup --
+
+/// The whole of §13's cleanup, and the one thing it must not touch.
+///
+/// Everything the app creates per run is created inside the user's own
+/// repository — a worktree, a branch, a shadow ref and a shadow index — and
+/// until this existed nothing removed any of it. So the assertions come in
+/// pairs: what is gone, and what is emphatically still there.
+///
+/// The last pair is the one that earns the test. A cleanup that also deleted
+/// `refs/agent-workspace/runs/<id>` would look completely correct — the tree is
+/// gone, the branch is gone, the row is tidy — and would silently turn every
+/// cleaned-up run into one that cannot be forked and has no attribution for
+/// Review. So the run is forked *after* being cleaned up, and the child's tree
+/// is checked against the parent's content at the branch point, which is the
+/// only assertion that can tell a kept ref from a deleted one.
+#[test]
+fn cleaning_up_removes_the_tree_and_branch_and_leaves_the_run_forkable() {
+    let home = TempDir::new("cleanup");
+    let repo = repo(home.path()).canonicalize().unwrap();
+    let parent = RunId::from("run_cleaned");
+    let db = home.path().join("log.sqlite");
+    let (parent_wt, log) = parent_that_edited_twice(&db, &repo, &parent);
+
+    // Resolved before the cleanup, because the branch point is a fact about the
+    // log and must not become one about the disk.
+    let at = driver::ForkPoint::resolve(&log, &parent, seq_of(&log, &parent, "u3")).unwrap();
+    drop(log);
+
+    assert!(parent_wt.exists());
+    assert!(git(&repo, &["branch", "--list", "agent/run_cleaned"]).contains("agent/run_cleaned"));
+
+    let mut log = log_of(&db);
+    // The parent's tree is dirty — `parent_that_edited_twice` writes files the
+    // shadow history snapshots but never commits, which is the state every real
+    // run's tree is in. So this is the confirmed path, and the refusal it is
+    // confirming has its own test below.
+    let cleaned = driver::Registry::new()
+        .clean_up(&mut log, &parent, true)
+        .unwrap();
+    assert_eq!(
+        cleaned,
+        driver::Cleanup::Removed {
+            worktree_path: parent_wt.clone(),
+            branch: "agent/run_cleaned".to_owned(),
+        }
+    );
+
+    // Gone: the checkout, and the branch that nothing else would ever have
+    // removed.
+    assert!(!parent_wt.exists(), "the worktree is still on disk");
+    assert_eq!(
+        git(&repo, &["branch", "--list", "agent/run_cleaned"]),
+        "",
+        "the run's branch outlived its worktree"
+    );
+    assert!(
+        !git(&repo, &["worktree", "list", "--porcelain"]).contains("run_cleaned"),
+        "git still lists the worktree, so it was deleted rather than removed"
+    );
+    assert!(
+        !repo.join(".git/worktrees").join(&parent.0).exists(),
+        "the worktree's own git dir is still there, and with it the shadow \
+         index `agent-workspace/{}.index` that `ShadowHistory::begin` put \
+         inside it — the fourth thing a run leaves behind, and the one nobody \
+         would ever go looking for",
+        parent.0
+    );
+
+    // Still there: the row, minus the one column that named something which no
+    // longer exists.
+    let row = log.run(&parent).unwrap().unwrap();
+    assert_eq!(
+        row.worktree_path, None,
+        "`runs.worktree_path` is nullable for exactly this, and `driver::resume` \
+         dereferences it — a stale path here is a resume that fails inside git \
+         some weeks later"
+    );
+    assert_eq!(
+        row.shadow_ref.as_deref(),
+        Some(format!("refs/agent-workspace/runs/{}", parent.0).as_str()),
+        "the shadow ref is not what was cleaned up"
+    );
+    assert_eq!(
+        row.status,
+        RunStatus::Finished,
+        "cleanup is about the disk; it does not rewrite what became of the run"
+    );
+    assert_eq!(
+        git(
+            &repo,
+            &["rev-list", "--count", row.shadow_ref.as_ref().unwrap()]
+        ),
+        "3",
+        "the shadow history is intact: root plus the parent's two snapshots"
+    );
+
+    // **And the run is still forkable**, which is the assertion the kept ref is
+    // actually for. `branch_point_commit` reads the ref through the repository
+    // rather than through the checkout precisely so this works.
+    let child = RunId::from("run_after_cleanup");
+    let mut launch = LaunchSpec::new(
+        "/definitely/not/a/checkout",
+        driver::new_session_id(),
+        Permission::DenyPrompts,
+    );
+    launch.binary = stub_agent(
+        home.path(),
+        &FORK_CHILD_EDITS.replace("__DUMP__", "/dev/null"),
+    );
+    launch.thinking = Thinking::Off;
+
+    let forked = driver::fork(
+        EventLog::open(&db).unwrap(),
+        driver::ForkSpec {
+            run_id: child.clone(),
+            at,
+            branch: format!("agent/{}", child.0),
+            post_create_hook: None,
+            prompt: "carry on".to_owned(),
+            launch,
+            workspace_mcp: None,
+        },
+        "2026-09-13T09:30:00.000Z",
+        None,
+    )
+    .unwrap();
+    let child_wt = forked.tree.worktree.path().to_path_buf();
+    let auth = fs::read_to_string(child_wt.join("src/auth.ts")).unwrap();
+    assert!(
+        auth.contains("FIRST") && !auth.contains("SECOND"),
+        "a fork of a cleaned-up run must still be placed at its branch point, \
+         from the shadow ref rather than from a tree that is gone: {auth:?}"
+    );
+    let (outcome, _) = forked.session.wait().unwrap();
+    assert_eq!(outcome.exit_code, Some(0));
+}
+
+/// §13: a tree with uncommitted changes is refused, and `force` is the user's
+/// confirmation arriving.
+///
+/// The refusal is a **value**, not an error, and that is the half worth
+/// pinning: "ask the user" is an outcome the surface renders, and a caller that
+/// received it as an `Err` would have to tell a dirty tree apart from a git
+/// failure by reading a string.
+#[test]
+fn a_dirty_tree_is_refused_until_the_caller_forces_it() {
+    let home = TempDir::new("cleanup-dirty");
+    let repo = repo(home.path()).canonicalize().unwrap();
+    let run = RunId::from("run_dirty");
+    let db = home.path().join("log.sqlite");
+    let (wt, log) = parent_that_edited_twice(&db, &repo, &run);
+    drop(log);
+
+    let mut log = log_of(&db);
+    let registry = driver::Registry::new();
+
+    assert_eq!(
+        registry.clean_up(&mut log, &run, false).unwrap(),
+        driver::Cleanup::Dirty {
+            worktree_path: wt.clone()
+        },
+        "the agent's uncommitted work was removed without anyone confirming it"
+    );
+    assert!(
+        wt.exists(),
+        "the refusal has to leave the work where it was"
+    );
+    assert_eq!(
+        log.run(&run).unwrap().unwrap().worktree_path.as_deref(),
+        Some(wt.to_str().unwrap()),
+        "a refused cleanup must not half-apply: the row still names the tree \
+         that is still there"
+    );
+
+    // The same call, with the confirmation.
+    assert!(matches!(
+        registry.clean_up(&mut log, &run, true).unwrap(),
+        driver::Cleanup::Removed { .. }
+    ));
+    assert!(!wt.exists());
+}
+
+/// Cleanup is safe to repeat, and safe on a tree someone removed by hand.
+///
+/// Both are ordinary: a user clicks twice, or deletes `.worktrees/` themselves.
+/// Reaching `Worktree::open` on a path that is not there would raise
+/// `NotARepo` about the user's own repository — a true sentence about a
+/// question nobody asked — and the second click would look like a bug.
+#[test]
+fn cleaning_up_a_run_whose_tree_is_already_gone_is_a_no_op() {
+    let home = TempDir::new("cleanup-gone");
+    let repo = repo(home.path()).canonicalize().unwrap();
+    let run = RunId::from("run_twice");
+    let db = home.path().join("log.sqlite");
+    let (wt, log) = parent_that_edited_twice(&db, &repo, &run);
+    drop(log);
+
+    let mut log = log_of(&db);
+    let registry = driver::Registry::new();
+    assert!(matches!(
+        registry.clean_up(&mut log, &run, true).unwrap(),
+        driver::Cleanup::Removed { .. }
+    ));
+
+    // The second click: the row no longer names a tree.
+    assert_eq!(
+        registry.clean_up(&mut log, &run, false).unwrap(),
+        driver::Cleanup::AlreadyGone
+    );
+
+    // And the other way in: a row that still names a tree nobody removed
+    // through us. The row is squared with the disk on the way past, so the
+    // *next* call is the cheap one rather than another stat of a missing path.
+    let stale = RunId::from("run_stale");
+    let (stale_wt, stale_log) = parent_that_edited_twice(&db, &repo, &stale);
+    drop(stale_log);
+    fs::remove_dir_all(&stale_wt).unwrap();
+    assert_eq!(
+        registry.clean_up(&mut log, &stale, false).unwrap(),
+        driver::Cleanup::AlreadyGone
+    );
+    assert_eq!(log.run(&stale).unwrap().unwrap().worktree_path, None);
+    assert_ne!(wt, stale_wt);
+}
+
+/// A run the log has never heard of is an error rather than a cheerful no-op.
+///
+/// `AlreadyGone` means "there is nothing to remove for this run"; it must not
+/// also mean "there is no such run", or a caller with a typo gets told its
+/// cleanup worked.
+#[test]
+fn cleaning_up_a_run_that_is_not_in_the_log_is_an_error() {
+    let home = TempDir::new("cleanup-unknown");
+    let db = home.path().join("log.sqlite");
+    let mut log = log_of(&db);
+    let missing = RunId::from("run_nowhere");
+    assert!(matches!(
+        driver::Registry::new().clean_up(&mut log, &missing, false),
+        Err(driver::Error::NoSuchRun(id)) if id == missing
+    ));
+}
+
 // ------------------------------------------------ the permission channel --
 
 fn in_memory_run(run: &RunId) -> EventLog {

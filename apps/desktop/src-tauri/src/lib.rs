@@ -146,6 +146,55 @@ pub struct StartedRun {
     pub started_at: String,
 }
 
+/// What [`clean_up_run`] did, or why it did nothing.
+///
+/// A three-way answer rather than `Result<(), String>`, because one of the
+/// three is a question for the user and not a failure. `driver::Cleanup` is
+/// what decides which; this is that enum translated for the webview, and it is
+/// translated rather than re-exported because `driver` has no business
+/// carrying `serde` and `ts-rs` for the sake of one window (§4).
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum CleanUpReport {
+    /// The tree and the `agent/<run_id>` branch are gone, and the run row no
+    /// longer names a tree.
+    ///
+    /// `refs/agent-workspace/runs/<run_id>` is untouched and is not reported
+    /// here for the same reason it is not removed: nothing happened to it. The
+    /// run is still forkable and Review still has its attribution (§13.1).
+    Removed { worktree_path: String },
+    /// There was nothing to remove. A second click, or a tree someone deleted
+    /// by hand.
+    AlreadyGone,
+    /// Refused: the tree has uncommitted changes.
+    ///
+    /// §13 — "never delete a worktree with uncommitted changes without
+    /// confirmation" — and this is where the confirmation is asked for. The
+    /// caller shows the path, asks, and calls again with `force` if the user
+    /// says yes. Deciding *that* a confirmation is owed is the driver's; asking
+    /// is the window's, because a window is the only thing here with a user in
+    /// front of it.
+    Dirty { worktree_path: String },
+}
+
+impl From<driver::Cleanup> for CleanUpReport {
+    fn from(c: driver::Cleanup) -> Self {
+        match c {
+            driver::Cleanup::Removed {
+                worktree_path,
+                branch: _,
+            } => CleanUpReport::Removed {
+                worktree_path: worktree_path.display().to_string(),
+            },
+            driver::Cleanup::AlreadyGone => CleanUpReport::AlreadyGone,
+            driver::Cleanup::Dirty { worktree_path } => CleanUpReport::Dirty {
+                worktree_path: worktree_path.display().to_string(),
+            },
+        }
+    }
+}
+
 pub struct AppState {
     /// One connection, serialized. The log is single-writer by design (§14);
     /// when a live run needs its own handle, the driver takes one — this is
@@ -532,6 +581,46 @@ fn interrupt_run(state: State<'_, AppState>, run_id: RunId) -> Result<(), String
     state.runs.interrupt(&run_id).map_err(|e| e.to_string())
 }
 
+/// Take a finished run's worktree and its `agent/<run_id>` branch away again
+/// (§13).
+///
+/// Three lines of translation, as the rule at the top of this file requires,
+/// and every one of the decisions is behind them in [`driver::Registry::clean_up`]:
+/// a run this process is still supervising is refused outright, a tree with
+/// uncommitted changes comes back as [`CleanUpReport::Dirty`] until `force`
+/// says the user confirmed, and `refs/agent-workspace/runs/<run_id>` is kept so
+/// the run stays forkable and reviewable with its tree gone. None of that is
+/// checked here, and the liveness check in particular is not re-implemented
+/// here: `state.runs.is_live` is right there, and a second copy of the rule in
+/// this file is a second rule to keep in step with the first.
+///
+/// This is the **only** thing in the app that removes anything, and nothing
+/// calls it but a person. Until it is pressed, every run's tree and branch stay
+/// in the user's own repository — which is a cost stated out loud rather than
+/// traded away by a sweep that would have to delete uncommitted work without
+/// asking.
+///
+/// The UI's connection, not a second one: unlike [`start_run`] there is no
+/// process to lend a log to, and holding the lock across a `git worktree
+/// remove` is the honest thing to do anyway — it is one command on a directory
+/// nothing live is reading.
+#[tauri::command]
+fn clean_up_run(
+    state: State<'_, AppState>,
+    run_id: RunId,
+    force: bool,
+) -> Result<CleanUpReport, String> {
+    let mut log = state
+        .log
+        .lock()
+        .map_err(|_| "event log lock poisoned".to_owned())?;
+    state
+        .runs
+        .clean_up(&mut log, &run_id, force)
+        .map(CleanUpReport::from)
+        .map_err(|e| e.to_string())
+}
+
 /// The live feed, and the whole of it: one `emit` per event, inline on the
 /// run's supervisor thread, in stream order.
 ///
@@ -602,7 +691,8 @@ pub fn run() {
             fork_run,
             send_turn,
             end_run,
-            interrupt_run
+            interrupt_run,
+            clean_up_run
         ])
         .build(tauri::generate_context!())
         .expect("failed to start the Agent Workspace window")

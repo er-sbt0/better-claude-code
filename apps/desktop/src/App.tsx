@@ -11,6 +11,7 @@ import type { StartRunRequest } from '@agent-workspace/shared-types/StartRunRequ
 import type { UnlistenFn } from '@tauri-apps/api/event'
 import {
   bootReport,
+  cleanUpRun,
   endRun,
   forkPoints,
   forkRun,
@@ -25,6 +26,7 @@ import {
   startRun,
 } from './lib/ipc'
 import { Canvas, type CanvasHandle } from './canvas/Canvas'
+import { ConfirmCleanUpDialog } from './panels/ConfirmCleanUpDialog'
 import { InspectorPanel } from './panels/InspectorPanel'
 import { NewRunDialog } from './panels/NewRunDialog'
 import { RunsPanel } from './panels/RunsPanel'
@@ -114,6 +116,18 @@ export default function App() {
   const [rightWidth, setRightWidth] = useState(300)
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [dialogOpen, setDialogOpen] = useState(false)
+  /**
+   * A cleanup the driver refused because the tree is dirty, waiting on a person.
+   *
+   * The run id is held rather than re-read off `selected` when the answer comes
+   * back: this dialog can be opened from the palette with the inspector shut,
+   * and the selection is free to move while it is open.
+   */
+  const [pendingCleanup, setPendingCleanup] = useState<{
+    runId: RunId
+    worktreePath: string
+  } | null>(null)
+  const [forcing, setForcing] = useState(false)
 
   const canvas = useRef<CanvasHandle | null>(null)
 
@@ -353,6 +367,79 @@ export default function App() {
       .catch(fail(what === 'end' ? 'Could not end the run' : 'Could not interrupt the run'))
   }
 
+  /**
+   * Take the selected run's worktree and `agent/<id>` branch away (§13).
+   *
+   * The only gesture in this app that destroys something, and the only thing
+   * that ever removes a worktree: nothing here evicts one on a timer or at
+   * exit, so every run keeps its tree until somebody presses this.
+   *
+   * **Two calls, and the second one is the confirmation.** The first asks
+   * without `force`; a tree with uncommitted changes comes back as `dirty`
+   * rather than as a rejection, because §13's answer to uncommitted work is to
+   * ask rather than to fail. The shell does not decide *that* the question is
+   * owed — the driver does, by looking at `git status` — it only asks it, which
+   * is the one thing a window can do that a crate cannot.
+   *
+   * So the `dirty` answer becomes a piece of state rather than a second call:
+   * `pendingCleanup` is what `ConfirmCleanUpDialog` renders, and the forced
+   * call happens in `forceCleanUp` below and nowhere else. Cancelling clears
+   * the state and does nothing further, which is safe by construction — the
+   * refused call wrote nothing, so there is no half-applied state to undo. It
+   * carries the *run id* rather than reading `selected` again when the dialog
+   * answers: the palette can open this with the inspector closed, and the
+   * selection can move under a dialog that is already asking about a tree.
+   *
+   * `already_gone` is said out loud rather than swallowed: a button that
+   * returns silently having done nothing is indistinguishable from one that is
+   * broken, which is the whole reason `fail` exists below it.
+   */
+  const cleanUp = useCallback(() => {
+    if (selected === null) return
+    const id = selected
+    cleanUpRun(id, false)
+      .then((report) => {
+        if (report.outcome === 'dirty') {
+          setPendingCleanup({ runId: id, worktreePath: report.worktree_path })
+          return
+        }
+        if (report.outcome === 'already_gone') {
+          say(
+            toast(
+              'notice',
+              'Nothing to clean up',
+              `${id} has no worktree on disk. Its shadow history is untouched either way, so it is still forkable.`,
+            ),
+          )
+        }
+        refreshRuns()
+      })
+      .catch(fail('Could not clean up the run'))
+  }, [selected, refreshRuns, fail, say])
+
+  /**
+   * The answer to the dialog, and the only place `force` is ever passed.
+   *
+   * Reached only from an explicit press on the dialog's one destructive
+   * button. Everything else about the run — its log, its row, its shadow ref —
+   * is untouched, which is why this refreshes the list rather than dropping the
+   * selection: the run is still there, it just has no tree any more.
+   */
+  const forceCleanUp = useCallback(() => {
+    if (pendingCleanup === null) return
+    const { runId } = pendingCleanup
+    setForcing(true)
+    cleanUpRun(runId, true)
+      .then(() => {
+        setPendingCleanup(null)
+        refreshRuns()
+      })
+      // The dialog stays open on a failure so the toast is read beside the
+      // thing it is about; cancelling is still how it goes away.
+      .catch(fail('Could not clean up the run'))
+      .finally(() => setForcing(false))
+  }, [pendingCleanup, refreshRuns, fail])
+
   // A turn, through the process that is already running (§5). The rejection is
   // re-thrown after the toast so the composer can keep what was typed.
   const send = useCallback(
@@ -448,6 +535,16 @@ export default function App() {
       run: () => steer('interrupt'),
     },
     {
+      id: 'run.cleanup',
+      group: 'Run',
+      title: 'Clean up the selected run — remove its worktree and branch',
+      // The mirror of the two above: those need a live run, this needs one that
+      // is not. The command refuses a live run itself; this is the palette
+      // agreeing rather than a second rule.
+      disabled: selected === null || isLive,
+      run: cleanUp,
+    },
+    {
       id: 'run.fork',
       group: 'Run',
       title: 'Fork at the hovered message — ⌘⇧F',
@@ -525,6 +622,7 @@ export default function App() {
             live={isLive}
             onEnd={() => steer('end')}
             onInterrupt={() => steer('interrupt')}
+            onCleanUp={cleanUp}
           />
         </Dock>
       </div>
@@ -542,6 +640,13 @@ export default function App() {
         busy={starting || !listening}
         onClose={() => setDialogOpen(false)}
         onStart={start}
+      />
+      <ConfirmCleanUpDialog
+        run={pendingCleanup?.runId ?? null}
+        worktreePath={pendingCleanup?.worktreePath ?? ''}
+        busy={forcing}
+        onCancel={() => setPendingCleanup(null)}
+        onConfirm={forceCleanUp}
       />
       <CommandPalette
         open={paletteOpen}

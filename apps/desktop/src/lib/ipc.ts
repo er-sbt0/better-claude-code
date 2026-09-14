@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { BootReport } from '@agent-workspace/shared-types/BootReport'
+import type { CleanUpReport } from '@agent-workspace/shared-types/CleanUpReport'
 import type { Feed } from '@agent-workspace/shared-types/Feed'
 import type { RawEvent } from '@agent-workspace/shared-types/RawEvent'
 import type { Run } from '@agent-workspace/shared-types/Run'
@@ -102,6 +103,22 @@ export const sendTurn = (runId: RunId, text: string) =>
 export const endRun = (runId: RunId) => invoke<void>('end_run', { runId })
 
 export const interruptRun = (runId: RunId) => invoke<void>('interrupt_run', { runId })
+
+// Take a finished run's worktree and its `agent/<run_id>` branch away again
+// (§13). The only call in this file that destroys anything, and nothing calls
+// it but a person: no timer, no eviction, no sweep at exit — so until it is
+// pressed every run keeps a tree and a branch inside the user's own repository.
+//
+// The shadow ref `refs/agent-workspace/runs/<id>` survives it, deliberately and
+// load-bearingly: a cleaned-up run is still forkable and Review still has its
+// attribution (§13.1).
+//
+// `force` is one specific confirmation and not a general override: a tree with
+// uncommitted changes comes back as `{ outcome: 'dirty' }` rather than a
+// rejection, because §13 says the answer there is to ask. A live run is refused
+// outright and no `force` lifts it — end or interrupt it first.
+export const cleanUpRun = (runId: RunId, force: boolean) =>
+  invoke<CleanUpReport>('clean_up_run', { runId, force })
 
 // Every live run's events, on one channel for all of them, in stream order.
 //

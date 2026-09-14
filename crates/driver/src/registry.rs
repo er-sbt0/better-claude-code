@@ -358,6 +358,45 @@ impl Registry {
         self.with_session(run, Session::interrupt)
     }
 
+    /// Remove a finished run's worktree and branch (§13). The only entry point
+    /// there is, and the only thing in this workspace that removes anything.
+    ///
+    /// **Nothing is ever cleaned up automatically.** Not on a timer, not when a
+    /// run ends, not at app exit. The module doc above prices an idle run and
+    /// says the worktree "is on disk and outlives the run either way"; this is
+    /// the lever that changes that, and it is pulled by a person. The reason is
+    /// §13's own rule — never delete a worktree with uncommitted changes
+    /// without confirmation — which nothing running on a timer can honour,
+    /// since there is nobody there to confirm. So the growth is real and
+    /// bounded only by the user: a tree and an `agent/<run_id>` branch per run,
+    /// inside their own repository, until they say otherwise.
+    ///
+    /// It lives on the registry because of the one thing the registry knows and
+    /// the git half in `lib.rs` cannot: **whether a process is still holding
+    /// that directory open**. A cleanup of a live run is refused with
+    /// [`Error::RunIsLive`] and there is no `force` that lifts it — the agent's
+    /// cwd cannot be changed after spawn, so removing the tree under it does
+    /// not stop the run, it detaches the run's writes from git. Routing every
+    /// caller through here is what makes that check unskippable; the function
+    /// it delegates to is private for exactly that reason.
+    ///
+    /// `force` is the *other* refusal's answer, and only that one: it is the
+    /// user's confirmation that a tree with uncommitted changes may go. Without
+    /// it a dirty tree comes back as [`Cleanup::Dirty`](crate::Cleanup::Dirty)
+    /// — a value rather than an error, because "ask the user" is an outcome the
+    /// caller renders and not a failure it reports.
+    ///
+    /// `log` is the caller's connection, taken by `&mut` rather than by value:
+    /// unlike [`start`](Self::start) there is no process to hand it to and
+    /// nothing to give it back from, so the UI's own connection is the right
+    /// one to use.
+    pub fn clean_up(&self, log: &mut EventLog, run: &RunId, force: bool) -> Result<crate::Cleanup> {
+        if self.is_live(run) {
+            return Err(Error::RunIsLive { run: run.0.clone() });
+        }
+        crate::clean_up(log, run, force)
+    }
+
     /// The runs this process is holding open, in no particular order.
     pub fn live(&self) -> Vec<RunId> {
         self.lock()

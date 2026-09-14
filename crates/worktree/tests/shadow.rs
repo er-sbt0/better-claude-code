@@ -348,6 +348,107 @@ fn snapshotting_never_touches_the_users_head_index_or_worktree() {
     );
 }
 
+/// Cleaning a run up takes its branch with the tree, and leaves the shadow ref.
+///
+/// The branch half is the one that was missing for a long time and is invisible
+/// on disk: `Worktree::remove` alone leaves `run/N` in the repository forever,
+/// so a user who has run a few hundred agents has a few hundred run ids in
+/// every branch picker they own. The test asserts the *absence*, which is the
+/// only way that failure ever shows up.
+///
+/// The shadow ref half is asserted in the same breath on purpose. The two live
+/// one `git` command apart and the tempting tidy-up deletes both;
+/// `the_history_outlives_the_worktree_and_a_prune` below proves the ref
+/// survives a removal, and this proves the removal that also deletes a branch
+/// has not quietly started taking it.
+#[test]
+fn removing_a_worktree_with_its_branch_leaves_the_shadow_ref() {
+    let f = Fixture::new("remove-with-branch");
+    let run = RunId::from("run_7");
+    let wt = Worktree::create(&f.repo, &run, "run/7", "HEAD").unwrap();
+    let (mut shadow, _) = ShadowHistory::begin(&wt, &run, 0).unwrap();
+    append(wt.path(), "src/auth.ts", "// edited by the agent\n");
+    shadow
+        .snapshot(&Cause::tool(4, "Edit", "toolu_01"))
+        .unwrap();
+    let tip = shadow.tip().unwrap().expect("a tip");
+    let ref_name = shadow.ref_name().to_owned();
+    let path = wt.path().to_path_buf();
+
+    assert!(git(&f.repo, &["branch", "--list", "run/7"]).contains("run/7"));
+
+    // Forced, because the agent's edit is uncommitted — which is the state
+    // every run's tree is actually in when a user comes to clean it up. The
+    // refusal that `force` is answering has its own test below.
+    wt.remove_with_branch(true).unwrap();
+
+    assert!(!path.exists(), "the checkout is still on disk");
+    assert_eq!(
+        git(&f.repo, &["branch", "--list", "run/7"]),
+        "",
+        "the run's branch outlived its worktree — invisible on disk, and in \
+         every branch picker the user has"
+    );
+    assert_eq!(
+        git(&f.repo, &["rev-parse", &format!("{tip}^{{commit}}")]),
+        tip,
+        "the shadow history went with the branch: a cleaned-up run must stay \
+         forkable and reviewable (§13.1)"
+    );
+    assert_eq!(git(&f.repo, &["rev-parse", &ref_name]), tip);
+}
+
+/// Cleanup is safe to repeat: a branch that is already gone is not an error.
+///
+/// A run half-cleaned by a crash, or one whose branch the user deleted by hand,
+/// is an ordinary state. Failing the second attempt would leave the *worktree*
+/// behind over a branch that was already how the user wanted it.
+#[test]
+fn removing_a_worktree_whose_branch_is_already_gone_succeeds() {
+    let f = Fixture::new("branch-already-gone");
+    let run = RunId::from("run_8");
+    let wt = Worktree::create(&f.repo, &run, "run/8", "HEAD").unwrap();
+    let path = wt.path().to_path_buf();
+
+    // Detach first: git refuses to delete a branch that a worktree is on, which
+    // is also why `remove_with_branch` deletes it second rather than first.
+    git(&path, &["checkout", "-q", "--detach"]);
+    git(&f.repo, &["branch", "-qD", "run/8"]);
+
+    wt.remove_with_branch(false).unwrap();
+    assert!(!path.exists());
+}
+
+/// §13: a worktree with uncommitted changes is not removed without
+/// confirmation, and `force` is how the confirmation arrives.
+///
+/// Both halves matter. Without the refusal the rule is a comment; without the
+/// force the rule is a dead end, and a user who has confirmed still cannot
+/// reclaim the directory.
+#[test]
+fn a_dirty_worktree_is_refused_until_it_is_forced() {
+    let f = Fixture::new("dirty-refused");
+    let run = RunId::from("run_9");
+    let wt = Worktree::create(&f.repo, &run, "run/9", "HEAD").unwrap();
+    let path = wt.path().to_path_buf();
+
+    assert!(!wt.is_dirty().unwrap(), "a fresh checkout is clean");
+    append(&path, "src/auth.ts", "// the agent's unfinished work\n");
+    assert!(wt.is_dirty().unwrap());
+
+    let refused = Worktree::open(&path).unwrap().remove_with_branch(false);
+    assert!(
+        refused.is_err(),
+        "a worktree with uncommitted changes was removed without confirmation"
+    );
+    assert!(path.exists(), "and the refusal left the work where it was");
+    assert!(git(&f.repo, &["branch", "--list", "run/9"]).contains("run/9"));
+
+    wt.remove_with_branch(true).unwrap();
+    assert!(!path.exists());
+    assert_eq!(git(&f.repo, &["branch", "--list", "run/9"]), "");
+}
+
 /// §13.1's durability claim: Review keeps its attribution after cleanup.
 #[test]
 fn the_history_outlives_the_worktree_and_a_prune() {

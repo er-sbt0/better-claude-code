@@ -33,6 +33,14 @@
 //! and reap it, so [`Registry`] owns those runs and the threads that end them.
 //! It is in this crate rather than in the shell because it decides when a run
 //! is over, and a decision has to be somewhere a test reaches without a window.
+//!
+//! The same rule puts [`Registry::clean_up`] here: undoing §13's first bullet —
+//! taking a run's worktree and branch away again — is the one operation in this
+//! workspace that destroys something, so every guard on it (a live run refused,
+//! a dirty tree refused until the user confirms, the shadow ref kept) is a
+//! decision, and none of them may live in a window. It is also the only thing
+//! here that is never automatic: nothing evicts a tree on a timer or at exit,
+//! because §13's confirmation has nobody to ask at three in the morning.
 
 mod error;
 mod launch;
@@ -780,6 +788,108 @@ pub fn reconcile_after_restart(log: &mut EventLog, now: &str) -> Result<Vec<RunI
         out.push(run.id);
     }
     Ok(out)
+}
+
+/// What cleaning a run up did, or why it did nothing.
+///
+/// Three outcomes and only one of them is an error, which is the decision this
+/// type exists to record. A refusal to touch a **dirty** tree is not a failure:
+/// §13 says the answer there is *ask the user*, so it is an answer the caller
+/// has to render rather than an exception it has to report. A run this process
+/// is still holding open *is* an error ([`Error::RunIsLive`]) — there is nothing
+/// to ask about, because no confirmation makes pulling a tree out from under a
+/// running agent correct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cleanup {
+    /// The worktree and the `agent/<run_id>` branch are gone, and the run row
+    /// no longer names a tree. The shadow ref is not in this list on purpose:
+    /// cleanup never removes it.
+    Removed {
+        /// Where the tree was. Worth returning because the row no longer says.
+        worktree_path: PathBuf,
+        branch: String,
+    },
+    /// There was nothing on disk to remove — the row named no tree, or named
+    /// one that is not there.
+    ///
+    /// Not an error, and it is the state a *second* cleanup lands in, which is
+    /// the one that matters: a user who clicks twice, or two windows that clean
+    /// the same run, must not see a git failure about a directory that is
+    /// already the way they asked for.
+    AlreadyGone,
+    /// Refused: the tree has uncommitted changes and `force` was not set.
+    ///
+    /// §13: "never delete a worktree with uncommitted changes without
+    /// confirmation". This is that sentence as a return value — the caller asks,
+    /// and calls again with `force` if the user says yes.
+    Dirty { worktree_path: PathBuf },
+}
+
+/// Remove a finished run's worktree and branch. Nothing else in this workspace
+/// removes anything.
+///
+/// **Explicit only.** No timer, no eviction, no cleanup at exit, and that is a
+/// position rather than an omission: a worktree is where an agent's unmerged
+/// work lives, and §13's rule about uncommitted changes would be unenforceable
+/// against a sweep that runs while nobody is looking. The cost of the position
+/// is stated plainly — every run leaves a tree and a branch until somebody says
+/// otherwise — and the alternative costs work the user cannot get back.
+///
+/// Three things are checked, in this order, because each would make the next
+/// one's failure unreadable:
+///
+/// 1. **A live run is refused.** Not by this function — it cannot know — but by
+///    [`Registry::clean_up`], which is the only caller and the only place that
+///    holds the map of processes. That is why this is private.
+/// 2. **A tree that is not there is a no-op**, and the row is repaired on the
+///    way past. Reaching `Worktree::open` on a path that no longer exists would
+///    raise `NotARepo` about the user's own repository, which is a true
+///    sentence about a question nobody asked.
+/// 3. **A dirty tree is refused unless forced** ([`Cleanup::Dirty`]).
+///
+/// What it does **not** do is delete `refs/agent-workspace/runs/<run_id>`, and
+/// this is the single most important line in the function — it is the line that
+/// is not there. The shadow ref is in the shared ref namespace and outlives the
+/// checkout by design (§13.1, verified against `gc --prune=now`);
+/// [`branch_point_commit`] reads it to place a fork whose parent's tree is gone,
+/// and [`ShadowHistory::is_available`] reads it to tell Review "no attribution"
+/// apart from "nothing attributed here". Tidying it away with the rest would
+/// leave a cleaned-up run that looks fine, reads fine, and cannot be forked or
+/// reviewed — with nothing anywhere saying why.
+fn clean_up(log: &mut EventLog, run_id: &RunId, force: bool) -> Result<Cleanup> {
+    let run = log
+        .run(run_id)?
+        .ok_or_else(|| Error::NoSuchRun(run_id.clone()))?;
+
+    let Some(path) = run.worktree_path.as_deref().map(PathBuf::from) else {
+        return Ok(Cleanup::AlreadyGone);
+    };
+    if !path.exists() {
+        // The column outlived what it pointed at — a tree removed by hand, or a
+        // cleanup that died between the two writes below. Squaring the row with
+        // the disk here is what makes this operation safe to repeat.
+        log.clear_worktree_path(run_id)?;
+        return Ok(Cleanup::AlreadyGone);
+    }
+
+    let worktree = Worktree::open(&path)?;
+    if !force && worktree.is_dirty()? {
+        return Ok(Cleanup::Dirty {
+            worktree_path: path,
+        });
+    }
+
+    let branch = worktree.branch().to_owned();
+    worktree.remove_with_branch(force)?;
+    // After the removal, never before. A row that stopped naming a tree which
+    // is still on disk is the one state nothing else here can recover from:
+    // `clean_up` would then call it `AlreadyGone` forever and the directory
+    // would never be removed by anything.
+    log.clear_worktree_path(run_id)?;
+    Ok(Cleanup::Removed {
+        worktree_path: path,
+        branch,
+    })
 }
 
 fn run_hook(cwd: &Path, hook: &[String]) -> Result<()> {

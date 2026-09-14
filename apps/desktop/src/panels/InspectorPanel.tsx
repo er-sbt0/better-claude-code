@@ -4,8 +4,8 @@ import { DockEmpty, DockSection } from '../shell/Dock'
 import { STATUS, elapsed, money } from '../lib/format'
 
 // The right dock: everything true about the selected run that is not its
-// events. §10's "Run #1842·b" panel — identity, provenance, cost, and the two
-// controls that end it.
+// events. §10's "Run #1842·b" panel — identity, provenance, cost, the two
+// controls that end it, and the one control that takes its worktree away.
 
 export function InspectorPanel({
   run,
@@ -13,6 +13,7 @@ export function InspectorPanel({
   live,
   onEnd,
   onInterrupt,
+  onCleanUp,
 }: {
   run: Run | null
   metrics: RunMetrics | null
@@ -20,6 +21,15 @@ export function InspectorPanel({
   live: boolean
   onEnd: () => void
   onInterrupt: () => void
+  /**
+   * Remove this run's worktree and branch (§13).
+   *
+   * Offered only on a run nothing is supervising, and the driver refuses a live
+   * one anyway — this is the affordance agreeing with the rule, not enforcing
+   * it. Confirming a dirty tree happens in `App.tsx`, where the answer the
+   * command came back with is.
+   */
+  onCleanUp: () => void
 }) {
   if (run === null) {
     return (
@@ -96,6 +106,31 @@ export function InspectorPanel({
               steer.
             </p>
           )}
+        </div>
+      </DockSection>
+
+      <DockSection title="Worktree">
+        {/* The one control in this app that destroys something. Nothing here is
+            ever cleaned up on a timer or at exit, so a repository accumulates a
+            tree and an `agent/<id>` branch per run until this is pressed — the
+            cost of §13's rule that uncommitted changes are never deleted
+            without confirmation, which nothing unattended can honour.
+
+            Disabled while this process supervises the run: the agent's cwd is
+            that directory and cannot be changed after spawn, so removing it
+            would not stop the run, it would detach its writes from git. The
+            driver refuses it too; this is the button agreeing. */}
+        <div className="flex flex-col gap-1.5 px-3 pb-3">
+          <Action onClick={onCleanUp} disabled={live || run.worktree_path === null} danger>
+            Clean up — remove the worktree and the branch
+          </Action>
+          <p className="text-micro text-faint">
+            {live
+              ? 'End or interrupt the run first: its agent is working in this directory.'
+              : run.worktree_path === null
+                ? 'This run has no worktree on disk — it has been cleaned up already.'
+                : 'The shadow history survives: this run stays forkable, and Review keeps its attribution.'}
+          </p>
         </div>
       </DockSection>
     </div>

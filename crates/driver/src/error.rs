@@ -59,6 +59,18 @@ pub enum Error {
     #[error("run {run} cannot be forked: {reason}")]
     CannotFork { run: String, reason: String },
 
+    /// Cleanup asked for on a run this process is still holding open.
+    ///
+    /// The exact inverse of [`Error::NotLive`], and unlike almost every other
+    /// refusal here there is no `force` that lifts it. A live run's agent has
+    /// that directory as its working directory and absolute paths under it
+    /// already computed; removing it does not stop the run, it makes the run
+    /// write into a tree that git has forgotten. End or interrupt the run
+    /// first — which is a thing the user can see happening, rather than a
+    /// consequence they would discover afterwards.
+    #[error("run {run} is live in this process, so its worktree is in use — end it first")]
+    RunIsLive { run: String },
+
     #[error(transparent)]
     WorkspaceMcp(#[from] workspace_mcp::Error),
 

@@ -245,6 +245,60 @@ fn a_run_that_is_resumed_is_running_again_with_no_finish_time() {
     );
 }
 
+/// A tree removed after the fact: the column stops naming it, and nothing else
+/// on the row moves.
+///
+/// `worktree_path` is nullable for this one reason — §13 creates every run with
+/// a tree, so it is never empty at the start — and `driver::Registry::clean_up`
+/// is the only thing that empties it. The column is *dereferenced*
+/// (`driver::resume` opens it to find the run's git dir and shadow index), so
+/// leaving it pointing at a directory that is gone is a resume that fails
+/// inside git some weeks later.
+///
+/// The three assertions about what did *not* change are the point. `shadow_ref`
+/// in particular survives a cleanup on disk and must survive it here: it lives
+/// in the shared ref namespace, outlives the checkout (§13.1), and is what a
+/// fork of a cleaned-up run is placed from. Clearing it alongside would be the
+/// tidy-looking change that silently makes every cleaned-up run unforkable.
+#[test]
+fn clearing_a_worktree_path_leaves_the_rest_of_the_row_alone() {
+    let run = RunId::from("cleaned");
+    let mut log = open_with_run("cleaned");
+    let before = log.run(&run).unwrap().unwrap();
+    assert!(before.worktree_path.is_some());
+
+    log.clear_worktree_path(&run).unwrap();
+
+    let after = log.run(&run).unwrap().unwrap();
+    assert_eq!(after.worktree_path, None);
+    assert_eq!(
+        after.shadow_ref, before.shadow_ref,
+        "the shadow ref outlives the checkout, so a cleanup must not clear it"
+    );
+    assert_eq!(after.branch, before.branch);
+    assert_eq!(after.status, before.status);
+    assert_eq!(
+        Run {
+            worktree_path: before.worktree_path.clone(),
+            ..after.clone()
+        },
+        before,
+        "exactly one column moved"
+    );
+
+    // Idempotent, because cleanup is: a second click lands here.
+    log.clear_worktree_path(&run).unwrap();
+    assert_eq!(log.run(&run).unwrap().unwrap().worktree_path, None);
+
+    let err = log
+        .clear_worktree_path(&RunId::from("never-existed"))
+        .expect_err("there is no row to clear");
+    assert!(
+        err.to_string().contains("never-existed"),
+        "clearing a run that is not here says which one: {err}"
+    );
+}
+
 /// §14: a resumed stream replays events we already hold. They must deduplicate
 /// rather than double.
 #[test]

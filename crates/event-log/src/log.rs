@@ -233,6 +233,41 @@ impl EventLog {
         Ok(())
     }
 
+    /// Forget where a run's worktree was, because it is not there any more.
+    ///
+    /// [`Run::worktree_path`](crate::Run::worktree_path) is nullable for
+    /// exactly this: §13 creates every run with a tree, so the column is never
+    /// empty at the start, and the only way it comes to be empty is a tree
+    /// removed after the fact (`driver::Registry::clean_up`). Writing that down
+    /// is not bookkeeping — the path is *dereferenced*: `driver::resume` opens
+    /// it to find the run's git dir and its shadow index, and
+    /// `Registry::resume` hands it back as the woken run's cwd. Left in place
+    /// after a cleanup it is a resume that fails somewhere inside git, some
+    /// weeks later, with a message about a directory nobody remembers.
+    ///
+    /// **`shadow_ref` and `branch` are deliberately not touched.** The shadow
+    /// ref is still there and still load-bearing: it lives in the shared ref
+    /// namespace, outlives the checkout (§13.1, verified against
+    /// `gc --prune=now`), and is what `driver::branch_point_commit` reads to
+    /// fork a run whose tree is gone — so clearing it would silently convert
+    /// "cleaned up" into "unforkable". `branch` is the opposite case: nothing
+    /// dereferences it, the inspector only prints it, and what it records —
+    /// the name this run's work was done on — stays true of the history the
+    /// shadow ref holds.
+    ///
+    /// `raw_events` is append-only by trigger; `runs` is not, and this is one
+    /// of the four statements that rely on it.
+    pub fn clear_worktree_path(&mut self, id: &RunId) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE runs SET worktree_path = NULL WHERE id = ?1",
+            params![id.0],
+        )?;
+        if n == 0 {
+            return Err(Error::NoSuchRun(id.clone()));
+        }
+        Ok(())
+    }
+
     /// Record the provider's session id once we have it.
     ///
     /// §14 prefers *assigning* it at launch, in which case this is never
