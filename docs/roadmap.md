@@ -303,7 +303,7 @@ four that are screens.
 
 | Feature | § | State |
 |---|---|---|
-| **Agent** — Claude Code only via `stream-json`, no adapter abstraction | §5, §16 | **done** — detect, launch, prompt, interrupt, resume; fixtures replay in CI |
+| **Agent** — Claude Code only via `stream-json`, no adapter abstraction | §5, §16 | **done** — detect, launch, prompt, interrupt, resume; fixtures replay in CI. Resume was **broken in every build until it was probed live**: the argv carried `--session-id X --resume X`, which the provider refuses unless `--fork-session` is there too, and a stub-agent test cannot reject what a real CLI rejects (§7, `claude-code-resume-session-id.md`) |
 | **Forking** — `--fork-session` + `--session-id`, `--resume-session-at` for a mid-conversation branch point | §19 | **done, driver to gesture** — `driver::fork` spawns `--fork-session` with a `--session-id` we assign and a `--resume-session-at` resolved from `raw_events.idempotency_key` (`ForkPoint::resolve`, stripped at the `#`), writes the child's row with both halves of the graph edge, and creates the child's worktree from the parent's shadow commit at the branch-point `seq` — its own branch, its own tree, its own `shadow_ref`, so its writes are snapshotted and attributable like any other run's. A parent with no shadow ref is refused rather than placed against the repo's `HEAD` or the parent's tree. `Registry::fork` supervises the child through the same map, supervisor and reaper as any other run, and the `fork_run` command puts ⌘⇧F behind it. A fork now inherits its parent's **whole launch** — model, allow-list, disallow-list, permission mode, turn and budget bounds, appended system prompt, `extra` argv — off the parent's row (migration V4), so a branch off a run from any earlier session runs under the policy that conversation was had under. It used to inherit only what the *window* remembered launching the parent with, which for a run from a previous session was nothing, and under §12's `DenyPrompts` that is a denial rather than a prompt: the child was refused the `Read` its parent had and worked around it silently. A caller that names a field still wins, which is how a branch differs. The one thing a fork still cannot inherit is a post-create hook — there is no hook anywhere in the shell to inherit (see §8) |
 | **Worktrees** — run-per-worktree, create/list/clean up | §13 | **done**, fork-at-`seq` included — `ShadowHistory::commit_at` resolves a branch-point `seq` to the newest snapshot at or before it (§13.1 never commits an unchanged tree, so most `seq` values have no commit of their own and `<=` is the correct rule, not a lenient one), and a test forks a parent mid-edits and asserts the child's tree holds the parent's content *as of that seq* rather than as of its tip |
 | **Persistence** — SQLite, `runs` + `raw_events` only; projections recomputed on load | §14 | **done** — the whole graph edge is now in the schema: `parent_run_id` plus `branch_point_seq` (migration V2), the only record the graph will ever have, since the provider records no parentage. A root run has neither half and a fork has both; the pairing is enforced in `Run::check_fork_pairing`, not in SQL, so a test reaches it without a database. `driver::fork` writes both halves, and a fork's tree is checked out from the parent's shadow commit at that `seq`. V3 adds `model` — the second thing the log cannot recompute, since what a run was *launched* with is not what the stream reports: `run.started` names one only sometimes and `turn.finished` names what a turn billed. V4 adds the rest of the launch, `launch_flags`, as one JSON column: the log records what the agent *did* and never what it was *permitted* to do — a denial arrives as a refused tool call that does not name the allow-list it failed — so this is as unrecomputable as the branch point, and losing it made every fork and every resume pre-grant nothing. One column rather than seven because nothing will ever query these, and because `row_to_run` reads the column list positionally, so a column is an edit in five places and a mis-ordering hazard; the blob survives the struct changing by `#[serde(default)]` on the container rather than by a version tag. A fork and a resume both inherit by copy, so a branch can differ from it. Each migration has a test that an existing database of the previous version keeps its rows |
@@ -531,7 +531,35 @@ produces, since the driver always passes `--replay-user-messages`. That last one
 also corrects the fork-address record's "the user's own prompt entries never
 reach stdout": true of a `-p` run, false of ours.
 
+**Also discharged, and it found a live bug: the argv a plain resume may take**
+(`claude-code-resume-session-id.md`). `LaunchSpec::argv` pushed `--session-id`
+unconditionally and `driver::resume` set `--resume` to the same uuid, so every
+resumed run launched with `--session-id X --resume X`. The provider refuses that
+outright — *"--session-id can only be used with --continue or --resume if
+--fork-session is also specified"* — which means "a conversation outlives the
+window that started it" had **never worked** against a real CLI. It passed
+review and passed its test because the only test on that path drives a stub
+agent binary, which accepts whatever it is handed. The gap in the records was
+narrow and exact: session forking verified `--session-id` on a *fresh* session,
+and `--session-id` composed with `--fork-session`; the combination in between
+was never run. Fixed by emitting `--session-id` everywhere except a resume that
+is not a fork — the provider's own rule, so the fork path is untouched — with
+`validate` refusing a non-forking resume that names some *other* session, since
+suppression is lossless only while the id it drops is the id the session already
+has. The finding worth carrying: **this refusal is the opposite shape to the
+fork one.** A bad fork address is a normally-exiting process with
+`error_during_execution` and even a fresh `session_id`; a bad flag combination
+is exit 1 with nothing on stdout at all — no `init`, no `result`, no subtype to
+read. Checking only `subtype` misses this one; checking only the exit code
+misses that one; stderr is the only place either names itself.
+
 **Remaining:**
+- **Whether the rest of the launch survives a resume.** The spike above ran the
+  driver's argv minus the workspace MCP flags, because there is no server to
+  point them at outside the app. `--mcp-config`, `--permission-prompt-tool` and
+  the appended system prompt are each verified, but none of them *on a resume* —
+  and §6's snapshot trap lives exactly there. The resume path has now been wrong
+  once for want of a live run, which is the argument for spending one.
 - **Whether an address outlives a long conversation or a compaction.** Both fork
   spikes used short trunks — three assistant entries and five turns. The chain
   lives in a file the provider owns and rewrites, and nothing has checked that a

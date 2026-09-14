@@ -76,6 +76,11 @@ fork is a new run with a parent pointer.
   mid-run, after edits, must pair with a worktree forked at the same `seq` — the
   §13.1 shadow history makes that possible, and nothing has exercised the two
   together.
+- **`--session-id` on a resume that is not a fork.** Row one of the table above
+  is a *fresh* session and row seven pairs the flag with `--fork-session`. The
+  combination in between — an already-existing id on a plain resume — was never
+  run here, and the driver shipped it for months: it is refused outright
+  (`claude-code-resume-session-id.md`).
 - **Codex.** Unknown, as everything about Codex is. If its session model has no
   equivalent, the graph is a Claude-Code-tier capability and must degrade (§5).
 - **`--resume-session-at`'s safety interlock.** `--resume-drops-turn` exists to

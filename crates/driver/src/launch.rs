@@ -63,6 +63,12 @@ pub struct LaunchSpec {
     pub cwd: PathBuf,
     /// We assign it rather than reading it back out of the stream, so the run
     /// row can be resumed before the process has said anything (§14).
+    ///
+    /// Reaches argv on a fresh start and on a fork, but **not** on a plain
+    /// resume, where the provider refuses the flag outright — see
+    /// [`argv`](LaunchSpec::argv). It is not dead there: a resume is still
+    /// driven by an id, and [`validate`](LaunchSpec::validate) requires this to
+    /// be the one being resumed.
     pub session_id: SessionId,
     pub permission: Permission,
     pub model: Option<String>,
@@ -235,6 +241,29 @@ impl LaunchSpec {
                 });
             }
         }
+        // The provider's rule, quoted from its own refusal: "--session-id can
+        // only be used with --continue or --resume if --fork-session is also
+        // specified." [`argv`](LaunchSpec::argv) therefore drops the flag on a
+        // plain resume, and that is lossless only while the id it drops is the
+        // id the session already has — verified live: a resume keeps its id
+        // (`docs/verification/claude-code-resume-session-id.md`). A caller
+        // naming a *different* one is asking to rename a session on resume,
+        // which the provider does not offer in any spelling. Refused here
+        // rather than swallowed by the suppression, or the run would come back
+        // under an id nobody chose and the row would point at the wrong
+        // conversation for every resume after it.
+        if let Some(r) = &self.resume {
+            if self.fork_at.is_none() && self.session_id != *r {
+                return Err(Error::LaunchSpec {
+                    reason: format!(
+                        "a resume that is not a fork cannot rename the session: \
+                         --resume {r} with session_id {}; \
+                         set session_id to the session being resumed, or fork",
+                        self.session_id
+                    ),
+                });
+            }
+        }
         if let Some(at) = &self.fork_at {
             // `--fork-session` is documented "use with --resume or --continue",
             // and the fork spike only ever ran it that way: without a session
@@ -281,6 +310,25 @@ impl LaunchSpec {
     /// `-p` comes last and carries **no value**: with
     /// `--input-format stream-json` the prompt arrives over stdin as a `user`
     /// message, which is what turns a one-shot into a live session.
+    ///
+    /// `--session-id` is the one flag here that is not always emitted, and the
+    /// rule is the provider's, quoted from its own refusal:
+    ///
+    /// > `--session-id can only be used with --continue or --resume if
+    /// > --fork-session is also specified.`
+    ///
+    /// So it is emitted on a fresh start, and on a fork — where it is the whole
+    /// point, naming the child before the process speaks (§14) — and suppressed
+    /// on a plain resume, the one shape the provider will not take. Suppressing
+    /// it costs nothing: a resumed session comes back under the id it already
+    /// had, so there was never anything to assign
+    /// (`docs/verification/claude-code-resume-session-id.md`).
+    ///
+    /// Worth knowing how that refusal arrives, because it is not the shape the
+    /// fork records trained us to look for: exit 1 with **nothing on stdout**,
+    /// no `system/init` and no `result` line at all. Reading acceptance off
+    /// `subtype` — right for a refused fork address — would have read nothing
+    /// here.
     pub fn argv(&self) -> Vec<String> {
         let mut a: Vec<String> = Vec::new();
         macro_rules! push {
@@ -296,8 +344,12 @@ impl LaunchSpec {
         // was ingested rather than guessing.
         push!("--replay-user-messages");
         push!("--strict-mcp-config");
-        push!("--session-id");
-        push!(self.session_id.0);
+        // Every shape but a plain resume; the doc comment above quotes the
+        // provider's own refusal.
+        if self.resume.is_none() || self.fork_at.is_some() {
+            push!("--session-id");
+            push!(self.session_id.0);
+        }
 
         if self.partial_messages {
             push!("--include-partial-messages");
@@ -363,10 +415,11 @@ impl LaunchSpec {
             push!("--resume");
             push!(r.0);
         }
-        // `--session-id` is already above and unconditional, which is the half
-        // of forking §14 had built before §19 asked for it: the child is named
-        // by us, so its run row is resumable before the process has spoken.
-        // These two say which conversation it starts from.
+        // `--session-id` is already above, and a fork is the one resuming shape
+        // that keeps it — which is the half of forking §14 had built before §19
+        // asked for it: the child is named by us, so its run row is resumable
+        // before the process has spoken. These two say which conversation it
+        // starts from.
         if let Some(at) = &self.fork_at {
             push!("--fork-session");
             push!("--resume-session-at");

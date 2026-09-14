@@ -227,6 +227,67 @@ fn forking_argv_names_the_child_and_the_branch_point() {
     );
 }
 
+/// The two resuming shapes, pinned against each other: a fork keeps
+/// `--session-id`, a plain resume must not carry it.
+///
+/// Bought live rather than reasoned about, because the code shipped the wrong
+/// one — `--session-id X --resume X`, which the provider refuses outright with
+/// "--session-id can only be used with --continue or --resume if
+/// --fork-session is also specified" (exit 1, empty stdout, no `result` line to
+/// read a subtype off). Every resumed run was dead on arrival
+/// (`claude-code-resume-session-id.md`). The fork half is here so the fix
+/// cannot be generalised into "drop it whenever resuming": that combination is
+/// verified to work and is how §19 names a child.
+#[test]
+fn a_plain_resume_drops_the_session_id_a_fork_keeps_it() {
+    let sid = agent_protocol::SessionId::from("uuid-1");
+    let mut resume = LaunchSpec::new("/wt", sid.clone(), Permission::DenyPrompts);
+    resume.resume = Some(sid.clone());
+    resume.validate().unwrap();
+    let joined = resume.argv().join(" ");
+
+    assert!(
+        joined.contains("--resume uuid-1"),
+        "a resume names the session it continues: {joined}"
+    );
+    assert!(
+        !joined.contains("--session-id"),
+        "the provider refuses --session-id alongside --resume without \
+         --fork-session, and the id is the resumed session's own anyway: {joined}"
+    );
+    assert!(
+        !joined.contains("--fork-session"),
+        "continuing a conversation is not branching it: {joined}"
+    );
+
+    // The suppression is only lossless while the dropped id is the one being
+    // resumed. Renaming a session on resume is not something the provider
+    // offers, so it is a refused launch rather than a silently different run.
+    let mut renaming = resume.clone();
+    renaming.session_id = agent_protocol::SessionId::from("uuid-2");
+    assert!(
+        renaming.validate().is_err(),
+        "a non-forking resume cannot give the session a new id"
+    );
+
+    // A fork resumes too, and keeps the flag: we name the child (§19).
+    let mut forked = renaming.clone();
+    forked.fork_at = Some("93e6a054-0e51-4425-a90b-b46f7e28dc1c".to_owned());
+    forked.validate().unwrap();
+    let joined = forked.argv().join(" ");
+    for required in [
+        "--session-id uuid-2",
+        "--resume uuid-1",
+        "--fork-session",
+        "--resume-session-at 93e6a054-0e51-4425-a90b-b46f7e28dc1c",
+    ] {
+        assert!(
+            joined.contains(required),
+            "a fork is the resuming shape that keeps `{required}`: {joined}"
+        );
+    }
+}
+
 /// The `{uuid}#{i}` fan-out is ours, and an unkeyed block has no address at all.
 ///
 /// Both halves were bought live (`claude-code-fork-address.md`): the suffixed
