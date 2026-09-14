@@ -1627,6 +1627,119 @@ fn an_existing_v3_database_migrates_and_keeps_its_runs() {
     assert!(reopened.run(&RunId::from("after")).unwrap().is_some());
 }
 
+/// A migration that dies part-way leaves the database exactly as it found it.
+///
+/// This is the one that decides whether a bad day costs a user their log. The
+/// migrations are a dozen-odd statements and `user_version` is bumped after the
+/// last of them, so applied bare they have a window in which some of the schema
+/// is on disk and the version still says it is not: the next `open` re-runs the
+/// same batch, collides with what the last attempt left, and fails — every
+/// time, for good, with nothing in the crate able to undo it. §8's promise that
+/// the log outlives the code is exactly the promise that state breaks.
+///
+/// Making a migration fail on purpose takes a collision, and the honest one to
+/// plant is a column a later migration adds: a V1 database that somehow already
+/// has V3's `model` gets through V2's `ALTER` and dies on V3's. That is the
+/// interesting shape rather than a failure on the first statement, because V2's
+/// column is then *already written* when the failure arrives — it is the
+/// partial schema, and asserting it is absent afterwards is asserting the
+/// rollback happened rather than that nothing was attempted.
+///
+/// Both halves are checked because both brick the log on their own: the version
+/// must still be 1 (a bumped version would skip migrations this database has
+/// not had) and `branch_point_seq` must be gone (a left-behind column makes
+/// V2's `ALTER` fail forever on the next open). Then the collision is removed
+/// and the log opens, which is the property that does not hold without the
+/// transaction: before it, this last `open` died on
+/// `duplicate column name: branch_point_seq` no matter what was cleaned up.
+#[test]
+fn a_failed_migration_leaves_the_database_at_its_old_version() {
+    use rusqlite::Connection;
+
+    let dir = tempdir();
+    let path = dir.join("log.sqlite");
+
+    {
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(V1_AS_SHIPPED).unwrap();
+        old.pragma_update(None, "user_version", 1u32).unwrap();
+        old.execute(
+            "INSERT INTO runs (id, agent, workspace_path, status, started_at)
+             VALUES ('before', 'claude-code', '/home/u/my-app', 'finished',
+                     '2026-09-12T14:22:00.000Z')",
+            [],
+        )
+        .unwrap();
+        // The collision. Whatever put it there — a crashed migration, a
+        // hand-edited log — the database now asks for V2, V3 and V4 and can
+        // only be given the first of the three.
+        old.execute_batch("ALTER TABLE runs ADD COLUMN model TEXT;")
+            .unwrap();
+    }
+
+    let Err(err) = EventLog::open(&path) else {
+        panic!("V3's ALTER must collide with the planted column");
+    };
+    assert!(
+        err.to_string().contains("duplicate column name: model"),
+        "the failure must be the planted collision, not something else: {err}"
+    );
+
+    {
+        let after = Connection::open(&path).unwrap();
+        assert_eq!(
+            after
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
+                .unwrap(),
+            1,
+            "a migration that did not finish must not claim a version it did not reach"
+        );
+        assert_eq!(
+            after
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('runs') \
+                     WHERE name = 'branch_point_seq'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0,
+            "V2's column was applied before V3 failed; it must have gone back with it"
+        );
+        assert_eq!(
+            after
+                .query_row("SELECT status FROM runs WHERE id = 'before'", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap(),
+            "finished",
+            "the rollback is of the migration, not of the log"
+        );
+
+        // Clear the collision, which is the only thing that was ever actually
+        // wrong with this file.
+        after
+            .execute_batch("ALTER TABLE runs DROP COLUMN model;")
+            .unwrap();
+    }
+
+    // And now it opens, migrates the whole way, and keeps the run it had.
+    let mut log = EventLog::open(&path).expect("the failed attempt left nothing in the way");
+    assert_eq!(
+        log.run(&RunId::from("before")).unwrap().unwrap().status,
+        RunStatus::Finished
+    );
+    log.create_run(&run_row("after")).unwrap();
+    log.append(&ev(
+        "after",
+        1,
+        None,
+        Event::TurnStarted(TurnStarted { index: 0 }),
+    ))
+    .unwrap();
+    assert_eq!(log.events(&RunId::from("after")).unwrap().len(), 1);
+}
+
 /// A blob written by an older build decodes, and so does one written by a newer.
 ///
 /// This is the price of choosing one JSON column over seven columns, and the

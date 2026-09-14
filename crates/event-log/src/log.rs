@@ -110,7 +110,7 @@ impl EventLog {
         Self::from_conn(Connection::open_in_memory()?)
     }
 
-    fn from_conn(conn: Connection) -> Result<Self> {
+    fn from_conn(mut conn: Connection) -> Result<Self> {
         // First, so that it covers the migration below as well as every later
         // write: `migrate` runs on whichever connection opens the file next,
         // which may well be the second one.
@@ -129,7 +129,7 @@ impl EventLog {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
-        schema::migrate(&conn)?;
+        schema::migrate(&mut conn)?;
         Ok(Self { conn })
     }
 

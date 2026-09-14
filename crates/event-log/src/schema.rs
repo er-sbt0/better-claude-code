@@ -3,7 +3,7 @@
 //! The log outlives the code (design §8), so the schema is versioned in
 //! SQLite's own `user_version` and migrations are forward-only.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 
 use crate::Result;
 
@@ -12,25 +12,87 @@ use crate::Result;
 pub const SCHEMA_VERSION: u32 = 4;
 
 /// Apply every migration the database has not seen.
-pub fn migrate(conn: &Connection) -> Result<()> {
-    let current: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+///
+/// **All of it in one transaction, including the `user_version` bump**, because
+/// the alternative is a log that can be bricked. V1 alone is a dozen statements
+/// — two tables, three indexes, two triggers — and applied bare, a failure or a
+/// crash part-way through leaves those objects on disk while `user_version` is
+/// still what it was. The next [`EventLog::open`](crate::EventLog::open) then
+/// re-runs the same batch and dies on `table runs already exists`, every time,
+/// with no way for the user to tell what happened and nothing in the crate to
+/// undo it. §8 says the log outlives the code; a migration with a state that
+/// only a deleted database recovers from does not honour that.
+///
+/// SQLite makes this available because its DDL is transactional, so a rollback
+/// takes the `CREATE TABLE`s with it. **`PRAGMA user_version` is transactional
+/// too** — it writes the database header inside the open transaction rather
+/// than out of band, so a failed migration rolls back to exactly the version it
+/// started at, schema and version together. That is not assumed: see
+/// `a_failed_migration_leaves_the_database_at_its_old_version` in
+/// `tests/log.rs`, which plants a collision, watches the open fail, and asserts
+/// both halves reverted.
+///
+/// Forward-only stays forward-only (§8). This is a rollback of a migration that
+/// never committed, not a down-migration: nothing here can move a database to a
+/// version it has already left.
+///
+/// `Immediate` for [`append_all`](crate::EventLog::append_all)'s reason, which
+/// applies here more sharply. This reads `user_version` and then writes, and a
+/// deferred transaction that reads first cannot upgrade to a write while
+/// another connection is writing — SQLite refuses without consulting the busy
+/// handler, so `log.rs`'s `BUSY_TIMEOUT` would not apply and the loser would
+/// fail instantly with "database is locked". A migration *is* a write, it
+/// happens at open, and `from_conn` runs it on whichever connection opens the
+/// file next —
+/// which, with the shell holding one `EventLog` and the driver taking another,
+/// is routinely the second one while the first is live. Taking the write lock
+/// up front is the case the busy handler covers.
+///
+/// Takes `&mut Connection` because a transaction borrows the connection
+/// exclusively; `from_conn` owns it at this point, so the cost is a keyword.
+pub fn migrate(conn: &mut Connection) -> Result<()> {
+    // Outside the transaction on purpose: the overwhelmingly common open is of
+    // an up-to-date log, and starting a write transaction on every one of those
+    // would take the database's write lock — blocking a live run's appends for
+    // as long as the open takes — to discover there is nothing to do.
+    if user_version(conn)? >= SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+    // Read again, now that the write lock makes the answer stable. Two
+    // processes can open a stale log at the same moment — the shell and a
+    // driver at startup — and the loser waits out `BUSY_TIMEOUT` here, by
+    // which time the winner has committed. Without this it would then apply
+    // migrations the database already has and fail on the first `ALTER`.
+    let current = user_version(&tx)?;
     if current >= SCHEMA_VERSION {
         return Ok(());
     }
     if current < 1 {
-        conn.execute_batch(V1)?;
+        tx.execute_batch(V1)?;
     }
     if current < 2 {
-        conn.execute_batch(V2)?;
+        tx.execute_batch(V2)?;
     }
     if current < 3 {
-        conn.execute_batch(V3)?;
+        tx.execute_batch(V3)?;
     }
     if current < 4 {
-        conn.execute_batch(V4)?;
+        tx.execute_batch(V4)?;
     }
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()?;
     Ok(())
+}
+
+/// The schema version this database is at, per SQLite's own header field.
+///
+/// Takes `&Connection` so it serves both reads above: a `Transaction` derefs to
+/// one, and the answer inside the transaction is the one that decides.
+fn user_version(conn: &Connection) -> Result<u32> {
+    Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
 }
 
 const V1: &str = r#"
