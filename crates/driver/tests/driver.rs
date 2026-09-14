@@ -141,7 +141,8 @@ fn argv_is_the_verified_launch_shape() {
         // Turns a one-shot into a live session.
         "--input-format stream-json",
         "--replay-user-messages",
-        // Keeps the user's own MCP servers out of a run we describe.
+        // Keeps the user's own MCP servers out of a run we describe -- every
+        // scope of them, and nothing else of theirs. See the assertion below.
         "--strict-mcp-config",
         // Assigned, not captured (§14).
         "--session-id uuid-1",
@@ -173,6 +174,22 @@ fn argv_is_the_verified_launch_shape() {
         assert!(
             !joined.contains(absent),
             "a normal start must not carry `{absent}`: {joined}"
+        );
+    }
+
+    // The other half of `--strict-mcp-config`, pinned so that the asymmetry is
+    // a decision rather than an oversight. MCP servers are the *only* thing
+    // §5's "What users keep" list gives up; hooks, both `CLAUDE.md`s, skills,
+    // subagents, commands, plugins, the output style and the user's own
+    // `permissions` block all reach the run, verified against 2.1.270 in
+    // `docs/verification/claude-code-user-config-inheritance.md`. These three
+    // flags are what would shut them out, and `--bare` would take the user's
+    // OAuth credentials with them. If one of them ever belongs here it belongs
+    // here on an argument, in a diff someone reads.
+    for absent in ["--setting-sources", "--restricted", "--bare"] {
+        assert!(
+            !joined.contains(absent),
+            "a run inherits the user's configuration except MCP: `{absent}`: {joined}"
         );
     }
 }

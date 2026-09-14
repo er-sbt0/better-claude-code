@@ -550,13 +550,67 @@ method set that pretends otherwise lies about half the agents.
 
 Process integration lets users keep their existing:
 
-- credentials
-- CLI installation
-- configuration
-- MCP servers
-- skills
-- permissions
-- project setup
+- credentials — the OAuth login already on the machine; a run reports
+  `apiKeySource: "none"`, meaning nobody handed it a key
+- CLI installation — whatever `claude` is on `PATH`
+- configuration — `settings.json` at all three scopes (user, project, local),
+  including the `env` blocks and the `permissions` block
+- skills, subagents, slash commands and plugins — user scope, project scope and
+  plugin-contributed alike
+- `CLAUDE.md` — user and project
+- hooks — user, project and local, all of which run on our runs
+- permissions — a user's own `deny` narrows a run's tool list before it starts
+- project setup — the run works in a worktree of the user's repository (§13)
+
+**Except MCP servers, which are deliberately excluded.** Every launch passes
+`--strict-mcp-config`, so the only servers a run can reach are the ones we
+injected with `--mcp-config`. That is not a partial exclusion: user scope
+(`~/.claude.json`), project scope (`.mcp.json`), local scope, plugin-contributed
+servers and the account's claude.ai connectors are all gone, and the CLI offers
+no spelling that keeps some of them. Measured, both directions, in
+`docs/verification/claude-code-user-config-inheritance.md`.
+
+Three reasons, and the third is the one that decides it:
+
+1. **§6's premise.** The workspace claims to describe the run. An MCP server
+   does not change the run's environment, it changes its *action space* — every
+   server adds tools the agent may call, under names we have never seen, which
+   the normalizer must map, the feed must render and §13.1 must attribute.
+2. **§15 treats what the agent can reach as a boundary.** A user MCP server is
+   arbitrary third-party code, reachable at the agent's discretion, inside a
+   product whose §15 threat model starts from "agent output is untrusted input".
+   §18 already says a workspace-surfaced server needs explicit approval; a
+   server inherited by accident has had none.
+3. **Under §12's shipped posture their tools would not work anyway.** V1 runs
+   with `--permission-prompts none`, where anything not on `--allowed-tools` is
+   denied silently — and we cannot pre-grant a tool name we have never seen. So
+   inheriting the user's servers today buys an agent that is *told* about the
+   user's tools and refused every one of them: worse than not being told, because
+   it plans around capabilities it does not have.
+
+**The tension is real and is not resolved by this.** A user whose everyday
+Claude Code depends on their own MCP servers gets an agent here that silently
+cannot reach any of them, and a plugin installed *for* its MCP tools loads its
+commands and skills and quietly drops its server. Nothing on the screen says so
+yet; that is a gap, not a feature.
+
+It is also not the shape of the promise that the first three reasons argue for.
+They argue against *inheriting* servers, not against *having* them: the route
+out is §18's inbound direction — read the user's MCP configuration, show it,
+let them approve servers per workspace, and inject the approved ones through our
+own `--mcp-config`. That keeps `--strict-mcp-config`, keeps the run
+describable, and makes the allow-list constructible because by then we know the
+tool names. Until that exists, the honest statement is the one above: users keep
+everything on this list except their MCP servers.
+
+And note what the exclusion does *not* buy: the run is not hermetic. Hooks are
+arbitrary user code, `CLAUDE.md` is unbounded instruction text, and a user's
+`permissions.deny` narrows the tool surface — none of which we exclude, all of
+which §5 wants. 2.1.270 has the flags that would (`--setting-sources`,
+`--restricted`, `--bare`) and the driver passes none of them; `--bare` in
+particular would cost the credentials in the first bullet. So this is one
+deliberate exception inside an integration that is otherwise, and intentionally,
+the user's own.
 
 ### Deeper integrations
 
@@ -1558,6 +1612,11 @@ Two things the recording exposed about the method itself:
   `--strict-mcp-config` does not suppress them; `--setting-sources` or `--bare`
   would. Left in deliberately — a real driver sees this noise too — but a
   fixture is a recording of an environment, not just of a version.
+  **This is a product fact as well as a testing one**, and it was filed here
+  first: §5's "What users keep" list and the unconditional
+  `--strict-mcp-config` disagree about exactly this, and which of them was right
+  per item went unmeasured until
+  (`docs/verification/claude-code-user-config-inheritance.md`).
 - **Negative results are fixtures too.** `Bash("echo hello")` is auto-allowed by
   Claude Code's own safe-command classification even under
   `--permission-prompts none`, so the first attempt at a denial fixture recorded
@@ -1627,6 +1686,19 @@ tools. Here the app must distinguish:
 
 The exact boundary should be kept configurable because different agents manage
 MCP differently.
+
+**Today the boundary is "none of the user's, all of ours."** Claude Code runs
+launch with `--strict-mcp-config`, which excludes the user's servers in every
+scope — §5's "What users keep" states the exception and argues it, and
+`docs/verification/claude-code-user-config-inheritance.md` measures it. That
+makes category 1 above currently empty, which is a gap rather than a position:
+the way it closes is category 2, not by relaxing the flag. Read the user's MCP
+configuration, show the servers, let them be approved per workspace, and inject
+the approved ones through our own `--mcp-config`. Approval is what §15 already
+requires of a surfaced server, and it is also the only thing that makes a user
+server *usable* under §12's `DenyPrompts` posture, where an un-allow-listed tool
+is denied without a prompt — approving a server is what tells us the tool names
+to pre-grant.
 
 ---
 

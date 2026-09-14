@@ -307,6 +307,25 @@ impl LaunchSpec {
     /// - `--strict-mcp-config`, so the user's own MCP servers do not leak into
     ///   a run we are claiming to describe.
     ///
+    /// That third one is the only place this launch overrides something §5
+    /// promises users they keep, so it is worth knowing exactly what it costs
+    /// and what it does not. Measured both directions against 2.1.270
+    /// (`docs/verification/claude-code-user-config-inheritance.md`): it drops
+    /// MCP servers from *every* scope — user, project `.mcp.json`, local,
+    /// plugin-contributed and the account's claude.ai connectors, with no
+    /// spelling that keeps some — and it changes **nothing else**. Hooks at all
+    /// three scopes still fire, both `CLAUDE.md`s still apply, and skills,
+    /// subagents, commands, plugins, the output style and the user's own
+    /// `permissions` block are byte-identical with the flag and without it.
+    ///
+    /// So a run is not hermetic and is not trying to be; the exception is
+    /// argued per-reason in §5's "What users keep", and the short version is
+    /// §12: under `DenyPrompts` a user MCP tool we cannot pre-grant is denied
+    /// silently, so inheriting their servers would advertise capabilities the
+    /// run would then refuse. 2.1.270's `--setting-sources`, `--restricted` and
+    /// `--bare` are the knobs that *would* shut the rest out, deliberately not
+    /// passed — `--bare` alone would cost the user's OAuth credentials.
+    ///
     /// `-p` comes last and carries **no value**: with
     /// `--input-format stream-json` the prompt arrives over stdin as a `user`
     /// message, which is what turns a one-shot into a live session.
