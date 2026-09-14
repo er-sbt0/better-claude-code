@@ -3,12 +3,46 @@
 //! Threads rather than an async runtime: the driver needs exactly three tasks —
 //! read stdout, drain stderr, write stdin — and adding a runtime to the
 //! workspace to express that would be the largest dependency in it.
+//!
+//! # The agent is a tree, not a process
+//!
+//! `claude` is never the only process a run owns. It spawns
+//! `workspace-mcp-relay` for the MCP server we inject (§12), and a child per
+//! `Bash` tool call — `npm test`, a dev server, anything the agent was asked to
+//! run. Killing the `claude` pid alone reparents every one of them to init,
+//! where they keep running, keep holding the run's worktree, and are no longer
+//! reachable from anything that knows about the run.
+//!
+//! That is not the failure path, it is the *ordinary* one: nothing closes a
+//! run's stdin on its behalf (`registry`), so [`Registry::shutdown`] interrupts
+//! every live run at app exit, healthy ones included. Every app exit and every
+//! `tauri dev` reload leaked a tree per run.
+//!
+//! So [`spawn`] gives the child a process group of its own and
+//! [`Session::interrupt`] signals the *group*. The group is exactly the run's
+//! descendants: a child inherits its parent's group, and nothing outside the
+//! tree can join one it does not know the id of.
+//!
+//! [`Registry::shutdown`]: crate::Registry::shutdown
+//!
+//! # Why this file is Unix-only, and says so with `libc`
+//!
+//! The workspace already is — `workspace_mcp::Listener` is a `UnixListener`
+//! with no `cfg` around it — so there is no portability being given up here,
+//! only a dependency to justify. `libc` is the platform's own header rather
+//! than a reimplementation of it, so it is not the kind of dependency
+//! `workspace_mcp`'s "why it is hand-rolled" argues against: the alternative is
+//! declaring `kill` ourselves and writing down signal numbers, which is a
+//! reimplementation of a header that is already in this workspace's build graph
+//! (`rusqlite` pulls it) and costs nothing to name.
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use event_log::EventLog;
 
@@ -16,6 +50,30 @@ use crate::error::{Error, Result};
 use crate::launch::{user_message, LaunchSpec};
 use crate::pipeline::{Ingested, Pipeline};
 use crate::sink::{EventSink, StreamEnd};
+
+/// How long a run gets to stop politely before it is killed outright.
+///
+/// It is bounded and short because it is the one thing app exit waits for, and
+/// the rule recorded on [`Registry::shutdown`](crate::Registry::shutdown) is
+/// that waiting for an agent to finish is a hang rather than a courtesy. The
+/// number is a measurement with room in it: Claude Code 2.1.270 takes ~0.6s to
+/// leave on `SIGTERM` (`docs/verification/claude-code-signals.md`), and a
+/// machine under load, or a run with a long transcript to flush, is allowed to
+/// be three times slower before we stop being polite.
+const GRACE: Duration = Duration::from_secs(2);
+
+/// Signal a process group, and do not care whether anything was there.
+///
+/// `kill(2)` with a negated pid addresses the group, which is the whole point:
+/// the agent's descendants are the group, and they are what the plain
+/// [`Child::kill`] this replaced could never reach. `ESRCH` — an already-empty
+/// group — is the normal ending, not an error.
+fn signal_group(group: libc::pid_t, signal: libc::c_int) {
+    // Safe: `kill` touches no memory of ours, and `group` is the pid of a child
+    // that has not been reaped, so the kernel has not reused it. Both callers
+    // hold the `killer` lock to establish that second half.
+    unsafe { libc::kill(-group, signal) };
+}
 
 /// What the caller can do to a running agent.
 enum Control {
@@ -70,15 +128,76 @@ impl Session {
         self.control.send(Control::Close).map_err(|_| Error::Closed)
     }
 
-    /// Stop the agent now.
+    /// Stop the agent now — it, and everything it started.
     ///
     /// The log keeps everything received up to this point — that is the whole
     /// point of writing per line rather than at the end.
+    ///
+    /// **`SIGTERM` to the group, then `SIGKILL` to the group**, and each half
+    /// of that is a measured fact rather than a convention
+    /// (`docs/verification/claude-code-signals.md`).
+    ///
+    /// *The group*, because the run is a tree and `SIGKILL` to the `claude` pid
+    /// alone orphans the rest of it — see the module docs.
+    ///
+    /// *`SIGTERM` first*, because the provider owns the session transcript that
+    /// `--resume` later reads, and it writes the tail of a turn to that file
+    /// *after* the `result` line has already reached our stdout. `SIGKILL`
+    /// inside that window drops whatever had not been written — observed once,
+    /// the assistant half of a completed turn missing and never arriving, and
+    /// not reproducible on demand, which is the honest version: a real window
+    /// of tens of milliseconds rather than a certainty. Claude Code 2.1.270
+    /// handles `SIGTERM` — it spends ~0.6s leaving, then re-raises it — and the
+    /// window closes. Half a second against a silent loss is a cheap trade.
+    ///
+    /// Because it re-raises rather than exiting, the run still has **no exit
+    /// code**, which is what [`Registry::finish`] reads to file it as
+    /// `Interrupted`. `SIGINT` would have broken that quietly: the same CLI
+    /// answers it by exiting `0`, and every interrupted run would have been
+    /// filed as `Finished`.
+    ///
+    /// [`Registry::finish`]: crate::Registry
     pub fn interrupt(&self) -> Result<()> {
-        if let Some(child) = self.killer.lock().expect("not poisoned").as_mut() {
-            let _ = child.kill();
-        }
+        let guard = self.killer.lock().expect("not poisoned");
+        // `None` once the reader thread has reaped: there is nothing left to
+        // stop, and signalling a negated pid that the kernel has since handed
+        // to somebody else is how a bug like this gets worse rather than fixed.
+        let Some(child) = guard.as_ref() else {
+            return Ok(());
+        };
+        let group = child.id() as libc::pid_t;
+        signal_group(group, libc::SIGTERM);
+        drop(guard);
+
+        // The escalation is detached on purpose. `Registry::shutdown` signals
+        // every live run before waiting on any of them, precisely so the grace
+        // periods overlap; a blocking wait here would serialize app exit behind
+        // one grace period per run.
+        let killer = Arc::clone(&self.killer);
+        thread::spawn(move || {
+            thread::sleep(GRACE);
+            let guard = killer.lock().expect("not poisoned");
+            if let Some(child) = guard.as_ref() {
+                signal_group(child.id() as libc::pid_t, libc::SIGKILL);
+            }
+        });
         Ok(())
+    }
+
+    /// The agent's process group id, or `None` once it has been reaped.
+    ///
+    /// It is the child's pid — [`spawn`] makes the child a group leader — and
+    /// it exists for the one caller that cannot use [`interrupt`](Self::interrupt):
+    /// a signal handler, which may not take a lock. `examples/run.rs` latches
+    /// this into a static while the run is live and signals the group from its
+    /// `SIGINT` handler, where `kill(2)` is one of the few calls it is allowed
+    /// to make. Anything that is not a signal handler should call `interrupt`.
+    pub fn process_group(&self) -> Option<i32> {
+        self.killer
+            .lock()
+            .expect("not poisoned")
+            .as_ref()
+            .map(|c| c.id() as i32)
     }
 
     /// Block until the agent exits, and take back the log.
@@ -121,6 +240,15 @@ pub fn spawn(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // A group of its own, so the run's whole tree is addressable by one
+        // signal (module docs). `0` means "a new group led by the child", so
+        // the group id is the child's pid and nothing else can ever be in it.
+        //
+        // The cost is that the child no longer shares this process's foreground
+        // group, so a Ctrl-C at a terminal reaches us and not the agent. Only
+        // `examples/run.rs` is a terminal program, and it handles `SIGINT`
+        // itself for exactly this reason.
+        .process_group(0)
         .spawn()
         .map_err(|source| Error::Spawn {
             binary: spec.binary.display().to_string(),
@@ -152,13 +280,16 @@ pub fn spawn(
         // Reap before joining the helpers: the writer is blocked on a channel
         // that stays open until the caller drops the Session, and stderr does
         // not close until the process does.
-        let status = {
-            let mut guard = reader_killer.lock().expect("not poisoned");
-            match guard.as_mut() {
-                Some(child) => child.wait().ok(),
-                None => None,
-            }
-        };
+        //
+        // Taken out rather than borrowed, and the lock released before the
+        // wait. Both halves matter now that `interrupt` signals a *group*: a
+        // reaped pid can be handed to an unrelated process, and negating it
+        // would then aim a `SIGKILL` at a stranger's group. `None` is how
+        // `interrupt` and its escalation thread know to do nothing, and holding
+        // the lock across the wait would instead make `interrupt` block behind
+        // the exit it is trying to cause.
+        let child = reader_killer.lock().expect("not poisoned").take();
+        let status = child.and_then(|mut c| c.wait().ok());
         let mut outcome = outcome?;
         outcome.exit_code = status.and_then(|s| s.code());
         outcome.stderr = errors.join().unwrap_or_default();

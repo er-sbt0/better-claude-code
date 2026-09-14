@@ -36,6 +36,7 @@ docs/verification/claude-code-cli-2.1.270.md   every CLI flag: what was checked
 docs/verification/claude-code-session-forking.md  §19: can one session become a graph
 docs/verification/claude-code-fork-address.md  §19: the stdout uuid IS the fork address
 docs/verification/claude-code-fork-anchor-types.md  which keyed blocks the provider will branch at
+docs/verification/claude-code-signals.md       how a run leaves when it is signalled, and which signal lies
 docs/verification/webkitgtk-feed-budget.md     §4's budget, re-measured for N feeds — memory half still open
 docs/verification/git-shadow-attribution.md    §13.1: what was checked, and the spike
 fixtures/claude-code/2.1.269/                  13 recorded streams + record.sh + MANIFEST.md
@@ -767,6 +768,39 @@ misses that one; stderr is the only place either names itself.
   it was written buys a tidier canvas and costs the one property that makes the
   log worth having. The rows stay; the log beside them already disagrees, and
   anyone who looks can see which is right.
+- **A `Child` handle addresses one process; the thing it is holding is a
+  tree.** `Session::interrupt` was `Child::kill()` — `SIGKILL` to the `claude`
+  pid — and `claude` spawns `workspace-mcp-relay` for our injected MCP server
+  plus a child per `Bash` tool call. All of them were reparented to init and
+  kept running, still holding the run's worktree. What made it expensive is
+  that this is the **ordinary** path: nothing closes a run's stdin for it, so
+  `Registry::shutdown` interrupts every live run at app exit, healthy ones
+  included — one leaked tree per run, on every quit and every `tauri dev`
+  reload. It was worse than a stray process, too. The orphans inherited the
+  agent's stdout pipe, so the read loop never saw EOF and the session could not
+  be reaped at all; the regression test fails on the *reap* before it fails on
+  the orphan. `spawn` now asks for `process_group(0)` and `interrupt` signals
+  the negated group. The general shape: **whenever you hold a child you did not
+  write, ask what that child spawns — the handle names a process and the
+  resource is the tree.** Both corollaries had to be bought back and are easy to
+  forget again: a process in a group of its own is no longer in the terminal's
+  foreground group, so Ctrl-C stops reaching it (`examples/run.rs` forwards it
+  by hand), and a pid that has been `wait`ed on can be reused, so negating one
+  is safe only while the `Child` is unreaped — which is why the reader thread
+  takes it *out* of the mutex before waiting on it.
+- **Which signal you send is a decision about the database.** `Registry::finish`
+  reads the exit status, so the signal is an input to the row. `SIGINT` is the
+  one that looks polite, and Claude Code 2.1.270 answers it by exiting `0` —
+  every run the app stopped would have been filed as `Finished`. `SIGTERM` is
+  handled *and* re-raised, so the run still has no exit code and is still
+  `Interrupted`, and it buys the ~0.6s the CLI spends flushing the session
+  transcript that `--resume` depends on. None of that is guessable from the
+  outside: `docs/verification/claude-code-signals.md` measured it, and §16's
+  rule applies — it can change without semver. The general shape: **when a
+  process's exit status feeds a stored status, changing how you end it changes
+  what you record.** The escalation to `SIGKILL` is bounded and short for the
+  reason on `Registry::shutdown` — a grace period is the one thing app exit
+  waits for, and waiting for an agent is a hang, not a courtesy.
 - **Events produced at process exit must reach the live view, not just the
   log.** `run.finished` is not a line of stdout. The first real run against
   Claude Code showed every run looking unfinished because of this; there is a

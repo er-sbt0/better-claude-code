@@ -239,6 +239,52 @@ while read -r line; do
 done
 "#;
 
+/// A run that started something of its own, which is what every real run does:
+/// `claude` spawns `workspace-mcp-relay` for our injected MCP server and a
+/// child per `Bash` tool call — `npm test`, a dev server, whatever the agent
+/// was asked to run.
+///
+/// The grandchild is the whole point. It inherits the agent's process group and
+/// nothing else, so a signal aimed at the agent's pid never reaches it: it is
+/// reparented to init and keeps running, still holding the run's worktree.
+/// Writing its pid where a test can read it is the only way to ask the question
+/// from outside, since the test is not its parent and cannot wait for it.
+///
+/// Written to a temporary and renamed, because a half-written pid file read at
+/// the wrong moment is a flake rather than a failure.
+fn spawns_a_grandchild(pidfile: &Path) -> String {
+    format!(
+        r#"#!/usr/bin/env bash
+read -r _prompt
+( while true; do sleep 0.05; done ) &
+echo $! > {p}.tmp && mv {p}.tmp {p}
+printf '%s\n' '{{"type":"system","subtype":"init","uuid":"u0","session_id":"s","cwd":"'"$PWD"'","tools":[],"mcp_servers":[],"model":"claude-sonnet-5","permissionMode":"default"}}'
+printf '%s\n' '{{"type":"result","uuid":"u1","subtype":"success","result_index":0,"is_error":false,"num_turns":1,"duration_ms":10,"total_cost_usd":0.01,"modelUsage":{{}},"permission_denials":[]}}'
+while read -r _line; do :; done
+"#,
+        p = pidfile.display()
+    )
+}
+
+/// Is that pid still a process we could signal?
+///
+/// `kill(pid, 0)` asks the kernel and answers for a process the caller did not
+/// start, which `Child::try_wait` cannot do. An orphan is reparented to init
+/// and reaped there, so a dead grandchild is gone rather than a zombie.
+fn alive(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Read the pid the stub wrote, or fail loudly rather than hang.
+fn grandchild_pid(pidfile: &Path) -> i32 {
+    eventually("the agent to start a child of its own", || pidfile.exists());
+    fs::read_to_string(pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("the stub wrote a pid")
+}
+
 /// A `Decider` that says yes and remembers what it was asked — which is the
 /// shape §12's dialog will have, minus the person.
 struct Answers {
@@ -451,6 +497,57 @@ fn interrupting_a_run_reaps_it_and_records_that_it_did_not_finish() {
         types.contains(&"turn.finished".to_owned()),
         "the interrupt took the log with it: {types:?}"
     );
+}
+
+/// **An interrupt has to reach the run's whole tree, not just its root.**
+///
+/// The agent is never one process. Killing the `claude` pid alone — which is
+/// what `Session::interrupt` did, with `SIGKILL`, on the *ordinary* path
+/// through `shutdown` — reparented the relay and every `Bash` tool call to
+/// init, where they kept running and kept holding the worktree. One leaked tree
+/// per live run, on every app exit and every `tauri dev` reload.
+///
+/// The stub stands in for that faithfully: a long-lived background child, and a
+/// parent that then waits on stdin like the real one. The assertion is about
+/// the grandchild and nothing else, because the parent died either way and that
+/// is exactly what made the leak invisible.
+///
+/// Run against the old code this fails one line earlier, at "the run to be
+/// reaped", and that is worth knowing: the orphan inherited the agent's stdout
+/// pipe, so the read loop never saw EOF and the run was never reaped either.
+/// The leak was not only a stray process — it was a session that could not end.
+#[test]
+fn interrupting_a_run_takes_the_processes_it_started_with_it() {
+    let home = TempDir::new("tree");
+    let repo = repo(home.path());
+    let pidfile = home.path().join("grandchild.pid");
+    let bin = stub_agent(home.path(), "spawns", &spawns_a_grandchild(&pidfile));
+    let run = RunId::from("run_tree");
+    let db = home.path().join("log.sqlite");
+
+    let registry = registry();
+    let (on_event, rx) = events();
+    registry
+        .start(
+            EventLog::open(&db).unwrap(),
+            spec(&repo, &bin, &run),
+            on_event,
+        )
+        .unwrap();
+    wait_for_event(&rx, "turn.finished");
+
+    let grandchild = grandchild_pid(&pidfile);
+    assert!(
+        alive(grandchild),
+        "the control case: there is a descendant to orphan"
+    );
+
+    registry.interrupt(&run).unwrap();
+    eventually("the run to be reaped", || !registry.is_live(&run));
+    // Bounded, like everything else here: before the fix this was never true,
+    // and an unbounded wait would have made that a CI timeout instead of a red
+    // test.
+    eventually("the agent's child to go with it", || !alive(grandchild));
 }
 
 /// App exit. Without this, a `tauri dev` reload leaves one `claude` per run

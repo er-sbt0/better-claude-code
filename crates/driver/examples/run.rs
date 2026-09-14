@@ -24,6 +24,7 @@
 //!     --keep              do not remove the worktree afterwards
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 
@@ -70,6 +71,34 @@ impl Decider for Fixed {
             }
         }
     }
+}
+
+/// The agent's process group, for the `SIGINT` handler below. `0` until a run
+/// exists, which is also what a handler that fires too early must see.
+static AGENT_GROUP: AtomicI32 = AtomicI32::new(0);
+
+/// Ctrl-C has to be forwarded now, and that is a direct cost of the fix it pays
+/// for.
+///
+/// The agent runs in a process group of its own so that interrupting a run
+/// reaches everything it started (`driver::process`). The same group is why the
+/// terminal's `SIGINT` no longer reaches it: Ctrl-C goes to the foreground
+/// group, which is now this process alone. Without this handler, Ctrl-C would
+/// kill the example and leave `claude` running with the worktree — the exact
+/// leak the process group exists to prevent, reintroduced through the one
+/// program a person actually types Ctrl-C at.
+///
+/// Only `kill(2)` and an atomic load happen here; nothing else is
+/// async-signal-safe. It sends `SIGTERM` rather than `SIGINT` for the reason
+/// `Session::interrupt` documents — `SIGINT` makes Claude Code exit `0`, which
+/// would file the run as finished — and then restores the default disposition,
+/// so a second Ctrl-C takes this process down even if the agent is wedged.
+extern "C" fn forward_sigint(_signal: libc::c_int) {
+    let group = AGENT_GROUP.load(Ordering::SeqCst);
+    if group > 0 {
+        unsafe { libc::kill(-group, libc::SIGTERM) };
+    }
+    unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
 }
 
 /// The relay lives beside whatever binary is running this example.
@@ -195,6 +224,19 @@ fn main() {
     println!("worktree {}", started.tree.worktree.path().display());
     println!("shadow   {}\n", started.tree.shadow_ref);
     let wt_path = started.tree.worktree.path().to_path_buf();
+
+    // From here a Ctrl-C stops the agent rather than orphaning it. The stream
+    // then ends the way it ends for any other interrupt, so the loop below,
+    // the metrics and the worktree cleanup all still run.
+    if let Some(group) = started.session.process_group() {
+        AGENT_GROUP.store(group, Ordering::SeqCst);
+        unsafe {
+            libc::signal(
+                libc::SIGINT,
+                forward_sigint as *const () as libc::sighandler_t,
+            )
+        };
+    }
 
     for ev in rx {
         println!("{:>4}  {}", ev.seq, describe(&ev.event));

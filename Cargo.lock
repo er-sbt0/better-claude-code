@@ -722,6 +722,7 @@ version = "0.0.0"
 dependencies = [
  "agent-protocol",
  "event-log",
+ "libc",
  "normalizer",
  "serde_json",
  "thiserror 2.0.20",
