@@ -104,11 +104,39 @@ pub struct Outcome {
     pub stderr: String,
 }
 
+/// What can be asked of a running agent without owning its [`Session`].
+///
+/// Both fields are already shared handles, so a clone is a channel sender and
+/// an `Arc` bump. That is what this type is for: [`Registry`] keeps the
+/// `Session` in its map — taking it out is what reaping a run means — and
+/// cannot lend a `&Session` without holding the map lock for as long as the
+/// borrow lives. Handing out a `Controls` instead lets it release the lock
+/// first, so no call into a run can freeze every other run's registry
+/// operation behind it (`Registry::controls`).
+///
+/// **Crate-private, and the `Sender` is why.** Every handle here is meant to be
+/// taken under the map lock, used, and dropped inside one statement. The
+/// `killer` half would survive longer harmlessly — the child is `None` once the
+/// reader thread has reaped it, and a handle that finds `None` does nothing —
+/// but the `control` half would not: a clone that outlives its session holds
+/// `write_loop` parked on `recv()` forever, and with it the dead child's stdin
+/// and the thread waiting on it. That is `sink.rs`'s lesson in the other
+/// direction, where a stray sender made the *end of a run* a fact about
+/// reference counting; here it makes a leak per run. Keeping this out of the
+/// public API is what bounds the lifetime to the one shape that is sound,
+/// rather than a comment asking callers to be careful.
+///
+/// [`Registry`]: crate::Registry
+#[derive(Clone)]
+pub(crate) struct Controls {
+    control: Sender<Control>,
+    killer: Arc<Mutex<Option<Child>>>,
+}
+
 /// A running agent.
 pub struct Session {
-    control: Sender<Control>,
+    controls: Controls,
     reader: JoinHandle<Result<Outcome>>,
-    killer: Arc<Mutex<Option<Child>>>,
     /// Shared, because the stream is no longer the only writer: the workspace
     /// MCP server appends `permission.requested` from the thread serving the
     /// provider's call (§6, §12). The log is still single-writer in the sense
@@ -120,7 +148,7 @@ pub struct Session {
     mcp: Option<workspace_mcp::Listener>,
 }
 
-impl Session {
+impl Controls {
     /// Send a follow-up user turn.
     ///
     /// This is what `--input-format stream-json` buys: one process, many turns
@@ -207,6 +235,36 @@ impl Session {
             .as_ref()
             .map(|c| c.id() as i32)
     }
+}
+
+impl Session {
+    /// A handle on this run that outlives a borrow of the session.
+    ///
+    /// [`Registry`](crate::Registry) steers its runs through these: it takes
+    /// one under its map lock and releases the lock before using it.
+    pub(crate) fn controls(&self) -> Controls {
+        self.controls.clone()
+    }
+
+    /// See [`Controls::send`].
+    pub fn send(&self, text: &str) -> Result<()> {
+        self.controls.send(text)
+    }
+
+    /// See [`Controls::close_input`].
+    pub fn close_input(&self) -> Result<()> {
+        self.controls.close_input()
+    }
+
+    /// See [`Controls::interrupt`].
+    pub fn interrupt(&self) -> Result<()> {
+        self.controls.interrupt()
+    }
+
+    /// See [`Controls::process_group`].
+    pub fn process_group(&self) -> Option<i32> {
+        self.controls.process_group()
+    }
 
     /// Block until the agent exits, and take back the log.
     pub fn wait(mut self) -> Result<(Outcome, EventLog)> {
@@ -275,8 +333,11 @@ pub fn spawn(
     let writer = thread::spawn(move || write_loop(stdin, control_rx));
     let errors = thread::spawn(move || drain(stderr));
 
-    let killer = Arc::new(Mutex::new(Some(child)));
-    let reader_killer = Arc::clone(&killer);
+    let controls = Controls {
+        control: control_tx,
+        killer: Arc::new(Mutex::new(Some(child))),
+    };
+    let reader_killer = Arc::clone(&controls.killer);
     let reader_pipeline = Arc::clone(&pipeline);
     let reader = thread::spawn(move || {
         // `stream` is moved in and never leaves: the run's live channel closes
@@ -338,9 +399,8 @@ pub fn spawn(
     });
 
     Ok(Session {
-        control: control_tx,
+        controls,
         reader,
-        killer,
         pipeline,
         mcp,
     })

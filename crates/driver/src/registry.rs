@@ -62,7 +62,7 @@ use event_log::{EventLog, RunStatus};
 use normalizer::{Clock, SystemClock};
 
 use crate::error::{Error, Result};
-use crate::process::{Outcome, Session};
+use crate::process::{Controls, Outcome, Session};
 use crate::RunSpec;
 
 /// What a caller gets back for a run that is now under supervision.
@@ -324,7 +324,7 @@ impl Registry {
 
     /// Send a follow-up user turn to a live run (§5: one process, many turns).
     pub fn send(&self, run: &RunId, text: &str) -> Result<()> {
-        self.with_session(run, |session| session.send(text))
+        self.controls(run)?.send(text)
     }
 
     /// End a run: close its stdin and let the agent finish the turn it is in.
@@ -342,7 +342,7 @@ impl Registry {
     /// pulling it is paid on the next turn, not now: about 1.3s more before the
     /// first token, and the user's session hooks run again.
     pub fn end(&self, run: &RunId) -> Result<()> {
-        self.with_session(run, Session::close_input)
+        self.controls(run)?.close_input()
     }
 
     /// Stop a run now, mid-turn.
@@ -355,7 +355,7 @@ impl Registry {
     /// failure already in the log still outranks it — see
     /// [`finish`](Self::finish).
     pub fn interrupt(&self, run: &RunId) -> Result<()> {
-        self.with_session(run, Session::interrupt)
+        self.controls(run)?.interrupt()
     }
 
     /// Remove a finished run's worktree and branch (§13). The only entry point
@@ -553,13 +553,20 @@ impl Registry {
         Ok(outcome)
     }
 
-    fn with_session<T>(&self, run: &RunId, f: impl FnOnce(&Session) -> Result<T>) -> Result<T> {
-        let live = self.lock();
-        let session = live
+    /// The handle for steering a live run, lifted out from under the map lock.
+    ///
+    /// Returned rather than lent, so that nothing a caller does with it runs
+    /// with the map held. That is [`shutdown`](Self::shutdown)'s rule — nothing
+    /// that can block on a run may touch the map — and lending a `&Session`
+    /// kept it only by the accident that all three callers happen not to block.
+    /// A [`Controls`] is two cloned handles; the session stays in the map,
+    /// where taking it out is what [`reap`](Self::reap) means.
+    fn controls(&self, run: &RunId) -> Result<Controls> {
+        self.lock()
             .get(run)
             .and_then(|e| e.session.as_ref())
-            .ok_or_else(|| Error::NotLive { run: run.0.clone() })?;
-        f(session)
+            .map(Session::controls)
+            .ok_or_else(|| Error::NotLive { run: run.0.clone() })
     }
 
     /// The map is only ever held across operations that cannot block on a run.
