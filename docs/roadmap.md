@@ -7,8 +7,8 @@ person's head rather than in the code. The design is
 of the design's ideas are real, which are next, and which must not be
 relitigated without new information.
 
-**Updated:** 2026-09-13 · **Branch:** `main`
-**Code:** six crates plus the desktop shell · CI green · 164 tests.
+**Updated:** 2026-09-14 · **Branch:** `main`
+**Code:** six crates plus the desktop shell · CI green · 167 tests.
 **The headless spine is complete, and the semantic channel now exists:** a real
 run has both asked us for permission and reported a finding to us.
 **The thesis is on screen:** ⌘⇧F in the window has branched a real conversation
@@ -554,6 +554,13 @@ is exit 1 with nothing on stdout at all — no `init`, no `result`, no subtype t
 read. Checking only `subtype` misses this one; checking only the exit code
 misses that one; stderr is the only place either names itself.
 
+*That last clause was, at the time it was written, a statement about a channel
+the driver read and threw away.* `process::drain` accumulated stderr into a
+`String` that reached `Outcome.stderr`, which `examples/run.rs` printed and the
+desktop shell dropped — so in the product the refusal above reached nobody. It
+is now an event: see §8's row, and the trap under it about vocabulary entries
+with no producer.
+
 **Remaining:**
 - **Whether the rest of the launch survives a resume.** The spike above ran the
   driver's argv minus the workspace MCP flags, because there is no server to
@@ -651,6 +658,7 @@ misses that one; stderr is the only place either names itself.
 | **`Listener::shutdown` ends its open connections rather than waiting for them** | `crates/workspace-mcp/src/listener.rs` | new, and the same argument one layer down: `Session::wait` reclaims the run's event-log connection by unwrapping the `Arc` the workspace is behind, so a connection thread still running makes that a race — and a run that lost it would sit in the database saying `Running` forever. Waiting for the peer is not an option, since a relay holds its connection for the life of its agent; so each open socket is half-closed under its own thread, which turns a blocking read into an EOF and makes the join that follows bounded by one line of output |
 | **A run the app ended is `Interrupted`, a fifth status — and a failure already in the log outranks it** | `crates/event-log/src/run.rs`, `crates/driver/src/registry.rs` | new. Nothing closes a run's stdin on its behalf (a run is a conversation and the user decides when it is over), so `Registry::shutdown` interrupts *every* live run at app exit — and a process killed by a signal has no exit code, which the old `Some(0) => Finished, _ => Failed` read as failure. Ordinary use therefore filed healthy runs as `failed`, over logs ending in `run.finished` with no `run.failed` in them, and `failed` is a claim about the agent's work that the canvas, the runs list and the inspector all repeat. Not `Abandoned`, which is the neighbouring case and a different fact: abandoned is *we lost track of it* — the row still said `running` at boot, nobody watched the process go, the log may stop anywhere — while interrupted is *we ended it*, at a known moment, with the run's last events already written; telling a user who pressed stop that their run was abandoned describes neglect that did not happen. The ordering is the other half of the decision: a `run.failed` in the log wins over the missing exit code, because a run that failed a turn and then sat waiting is killed at shutdown like any other and filing it `Interrupted` would hide the failure exactly as the old rule invented one. The cost is one corner — a run killed before its init message reads `Failed`, since the log says it never started — and that is the cheaper mistake. Rows already written as `failed` are left alone: see the trap below |
 | **What a run was launched with is stored on its row, and a fork or a resume inherits the whole launch** | `crates/event-log/src/schema.rs` (V4), `crates/driver/src/launch.rs` | new, and the second exception to §8's no-storing-what-is-recomputable rule for the same reason as the first: **the log records what the agent *did*, never what it was *permitted* to do.** A denial arrives as a refused tool call that does not name the allow-list it failed, so nothing in `raw_events` can reconstruct a launch. V3 stored the model only, and two features had already recorded the hole as a known gap — `fork_run` pre-granted whatever the *window* remembered launching the parent with, in this session, so a branch off a run from any earlier session pre-granted nothing, and `send_turn`'s resume path handed a woken run its model and an empty allow-list. Under §12's `DenyPrompts` posture that is not a prompt, it is a denial: the child of a run that could `Read` could not, with nothing on the screen saying why, and the agent worked around it silently. Stored as **one JSON column rather than seven**, because the cost of a column here is not the column — every `SELECT` in `log.rs` names the whole list and `row_to_run` reads it back positionally, so each one is an edit in five places and a mis-ordering hazard the migration tests exist to catch, and that is the price of a column you can *query*, which none of these will ever be. It survives the struct changing by `#[serde(default)]` on the container rather than by a version tag: a field added later is absent from every blob on disk and takes its default, a field removed is ignored on read, and there is one attribute to not forget instead of one per field. **Excluded deliberately**, each for a reason of its own: the binary (a property of *this machine* — resuming against a path that no longer exists is worse than resuming against whatever `claude` is now), the cwd and the session id (already columns, and §13 overwrites the cwd at every launch anyway), `resume` and `fork_at` (not properties of the run — they *are* the resume and the fork), `mcp_config` (a socket that dies with the process that made it), the permission posture (which of §12's arrangements *this process* hosted, rewritten at every launch by `wire_workspace_mcp`), and `thinking`/`partial_messages` (how the watcher watches, not what the run may do). The rule for restoring it is the one `driver::fork` already used for the model, applied to every field: **the caller wins wherever it said anything**, which is what lets a branch differ from its parent at all |
+| **A run's stderr enters the log only where the log has no other account of the run** | `crates/driver/src/process.rs` (`unexplained`, `drain`) | new, and it is §8's transient-progress rule applied per *run* rather than per channel, because the channel is both things depending on the run. §8's test is whether replaying the log without the message loses anything. For a run that exited 1 having written nothing to stdout it loses everything: the log holds a `runs` row and a `run.failed` reading *"the agent never emitted an init message"* — a restatement of the absence, not an account of it — while the one line that said why (`--session-id can only be used with --continue or --resume if --fork-session is also specified`) went into a `String` and onto the floor. For a run that streamed a hundred turns and wrote a deprecation warning it loses nothing, and with `-d/--debug` on (2.1.270 record) the channel is a progress log whose every line is the present moment of a turn — §8 is unambiguous about those. So the condition is **a non-zero exit, or no stored events at all**, the second being the quiet shape: a process that exits 0 saying nothing is equally unexplained. One `process.output` event, `stream: "stderr"`, written *before* `finish` so the explanation is ordered ahead of the failure it explains and `run.finished`/`run.failed` stays the last thing a run says, and emitted to the sink as well as the log for the trap below about events produced at process exit. **Rejected: one event per stderr line through `ingest_external`**, which is the truthful interleaving and a live error the moment it appears — it writes an unbounded number of rows into an append-only log for a channel whose volume the *user* chooses with a flag, and takes the mutex that serializes `seq` once per line from a thread that is not the reader. The price is stated rather than hidden: the log gets one blob at the end, so nothing says which stdout line each stderr line was concurrent with — and in the case this exists for there are no stdout lines. **Rejected: a column on `runs`**, which needs a migration and a migration test for a value nothing will query, and which a resume would overwrite, erasing the launch failure that is the reason to keep it. **Rejected: the first stderr line in `run.failed.reason`**, because every rule in `normalizer` is a pure function of the stream and that is what lets all of them be tested by replaying a fixture. Bounded twice, in both directions the agent controls: a per-line cap (4 KiB) because a tail of N lines is only bounded if a line is, and a tail (200 lines / 16 KiB) that says out loud how many lines it dropped |
 
 ### What building decided that the design had not
 
@@ -806,6 +814,26 @@ misses that one; stderr is the only place either names itself.
   Claude Code showed every run looking unfinished because of this; there is a
   regression test now, and the same shape of bug is available to anything else
   that emits outside the read loop.
+- **A vocabulary entry with no producer is a feature that looks finished from
+  every angle except the one that matters.** `agent-protocol` had
+  `Event::ProcessOutput` from the first commit. It was in the `Event` enum and
+  in `type_name`, it round-tripped through `serde`, ts-rs exported a
+  `ProcessOutput.ts` the frontend imported, `document-model` had a test proving
+  it degrades to a `Raw` block, `normalizer::claude_code::is_addressable` listed
+  it by name as never-forkable, `examples/run.rs` had a printer for it, and
+  `docs/roadmap.md` and the design's §8 table both named it. Nine places agreed
+  it existed. **Nothing constructed one**, and so the one channel it was the
+  vocabulary for — the agent's stderr — was read into a `String` and dropped,
+  which is why a run that failed at launch reached the log as a row, no events
+  and no explanation. The reason it survives review is that every *consumer* is
+  correct: a grep finds the type everywhere, a test exercises it, and the
+  absence is a negative — nothing anywhere says "and here is where one is
+  made". The general shape: **a type is not wired up until something
+  constructs it, and consumers, tests and generated bindings are all evidence
+  that it *can* exist rather than that it *does*.** Worth asking of any event
+  type, any error variant, and any status the code can read but nothing writes
+  — `Event::Unclassified` is the counter-example to keep in mind, since it has
+  a producer and is *expected* to be non-empty.
 - **Never benchmark durability on `/tmp`** — it is tmpfs here, and the first
   `synchronous` measurement reported FULL and NORMAL as identical because
   nothing was ever fsynced. Real numbers: 1.2ms vs 0.04ms per commit on

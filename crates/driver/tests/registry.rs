@@ -22,7 +22,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agent_protocol::{RawEvent, RunId};
+use agent_protocol::{Event, RawEvent, RunId};
 use driver::{Error, LaunchSpec, Permission, Registry, RunSpec, Thinking};
 use event_log::{EventLog, RunStatus};
 
@@ -299,6 +299,50 @@ impl driver::Decider for Answers {
         }
     }
 }
+
+/// A launch the provider refuses outright: one line on stderr, nothing at all
+/// on stdout, exit 1.
+///
+/// Not invented. It is what `claude` 2.1.270 does to a malformed resume —
+/// `--session-id can only be used with --continue or --resume if
+/// --fork-session is also specified`, found while recording `f5ba282` — and
+/// the shape is the point: a `runs` row, no events, and the only sentence that
+/// said why on a channel nothing read.
+///
+/// Distinct from `REFUSED` above, which is the *other* silent failure: a
+/// process that exits 0 with a full stream and says `error_during_execution`.
+/// Neither check covers both, which is why stderr is not redundant with the
+/// subtype.
+const REFUSES_TO_START: &str = r#"#!/usr/bin/env bash
+cat > /dev/null &
+echo 'Error: --session-id can only be used with --continue or --resume if --fork-session is also specified.' >&2
+exit 1
+"#;
+
+/// A healthy single turn that also writes a deprecation warning to stderr.
+///
+/// The noise case: this run's log explains itself perfectly well, and the
+/// warning must not be in it.
+const ONE_TURN_NOISY: &str = r#"#!/usr/bin/env bash
+cat > /dev/null &
+echo 'warning: --thinking is deprecated' >&2
+printf '%s\n' '{"type":"system","subtype":"init","uuid":"u0","session_id":"s","cwd":"'"$PWD"'","tools":[],"mcp_servers":[],"model":"claude-sonnet-5","permissionMode":"default"}'
+printf '%s\n' '{"type":"result","uuid":"u1","subtype":"success","result_index":0,"is_error":false,"num_turns":1,"duration_ms":10,"total_cost_usd":0.01,"modelUsage":{},"permission_denials":[]}'
+"#;
+
+/// A run that fails while shouting: 500 lines, then one 200 KB line with no
+/// newline in it.
+///
+/// Both halves are the shapes `-d/--debug` produces, and each defeats a
+/// different bound. Neither is hypothetical — debug output is a user-controlled
+/// variable, so "how much stderr may this run cost us" is a question the agent
+/// would otherwise answer.
+const SHOUTS_THEN_FAILS: &str = r#"#!/usr/bin/env bash
+cat > /dev/null &
+for i in $(seq 1 500); do echo "line $i" >&2; done
+head -c 200000 /dev/zero | tr '\0' 'x' >&2
+exit 1
+"#;
 
 // -------------------------------------------------------------------- tests --
 
@@ -1132,4 +1176,152 @@ fn resuming_a_run_with_no_provider_session_is_refused() {
         "the refusal says why: {err}"
     );
     assert!(!registry.is_live(&run), "and it started no process");
+}
+/// The motivating failure, end to end: a run whose only account of itself was
+/// on a channel nothing read.
+///
+/// Three assertions, and the first is the one that was missing for the whole
+/// life of the `process.output` vocabulary entry — that anything produces one
+/// at all.
+///
+/// The ordering is deliberate and is asserted rather than observed: the
+/// explanation is written *before* the failure it explains, so
+/// `run.failed` stays the last thing a run says.
+#[test]
+fn a_run_that_only_wrote_to_stderr_says_why() {
+    let home = TempDir::new("stderr-says-why");
+    let repo = repo(home.path());
+    let bin = stub_agent(home.path(), "refuses-to-start", REFUSES_TO_START);
+    let run = RunId::from("run_refused_launch");
+    let db = home.path().join("log.sqlite");
+
+    let registry = registry();
+    let (on_event, rx) = events();
+    registry
+        .start(
+            EventLog::open(&db).unwrap(),
+            spec(&repo, &bin, &run),
+            on_event,
+        )
+        .unwrap();
+
+    assert_eq!(
+        drain_to_end(&rx),
+        vec!["process.output", "run.failed"],
+        "the explanation has to reach the live view too, not only the log"
+    );
+    eventually("the run to be reaped", || !registry.is_live(&run));
+
+    let log = EventLog::open(&db).unwrap();
+    assert_eq!(status(&log, &run), RunStatus::Failed);
+
+    let stderr = log.events_of_type(&run, "process.output").unwrap();
+    let [event] = &stderr[..] else {
+        panic!("one stderr event for the run, got {}", stderr.len());
+    };
+    let Event::ProcessOutput(p) = &event.event else {
+        panic!("process.output carries a ProcessOutput");
+    };
+    assert_eq!(p.stream, "stderr");
+    assert!(
+        p.text.contains("--fork-session"),
+        "the line that said why is in the log verbatim: {:?}",
+        p.text
+    );
+
+    let failed = log.events_of_type(&run, "run.failed").unwrap();
+    assert!(
+        event.seq < failed[0].seq,
+        "the explanation is ordered before the failure it explains"
+    );
+}
+
+/// The other half of the policy, which is the half that keeps the log small: a
+/// run the log can already account for keeps its stderr out of it.
+#[test]
+fn a_run_the_log_explains_keeps_its_stderr_out_of_it() {
+    let home = TempDir::new("stderr-noise");
+    let repo = repo(home.path());
+    let bin = stub_agent(home.path(), "noisy", ONE_TURN_NOISY);
+    let run = RunId::from("run_noisy");
+    let db = home.path().join("log.sqlite");
+
+    let registry = registry();
+    let (on_event, rx) = events();
+    registry
+        .start(
+            EventLog::open(&db).unwrap(),
+            spec(&repo, &bin, &run),
+            on_event,
+        )
+        .unwrap();
+    let seen = drain_to_end(&rx);
+    assert!(
+        !seen.contains(&"process.output".to_owned()),
+        "a deprecation warning on a run that streamed a full turn is noise: {seen:?}"
+    );
+    eventually("the run to be reaped", || !registry.is_live(&run));
+
+    let log = EventLog::open(&db).unwrap();
+    assert!(log
+        .events_of_type(&run, "process.output")
+        .unwrap()
+        .is_empty());
+}
+
+/// A chatty or debug-enabled run must not decide how much of the log, or of
+/// our memory, it takes.
+///
+/// Both bounds at once, because they are different bounds: a tail of N lines
+/// is only bounded if a line is, and `-d/--debug` produces both shapes.
+#[test]
+fn stderr_is_bounded_in_both_directions_the_agent_controls() {
+    let home = TempDir::new("stderr-bounded");
+    let repo = repo(home.path());
+    let bin = stub_agent(home.path(), "shouts", SHOUTS_THEN_FAILS);
+    let run = RunId::from("run_shouts");
+    let db = home.path().join("log.sqlite");
+
+    let registry = registry();
+    let (on_event, rx) = events();
+    registry
+        .start(
+            EventLog::open(&db).unwrap(),
+            spec(&repo, &bin, &run),
+            on_event,
+        )
+        .unwrap();
+    drain_to_end(&rx);
+    eventually("the run to be reaped", || !registry.is_live(&run));
+
+    let log = EventLog::open(&db).unwrap();
+    let stderr = log.events_of_type(&run, "process.output").unwrap();
+    let [event] = &stderr[..] else {
+        panic!("one stderr event, however much was written");
+    };
+    let Event::ProcessOutput(p) = &event.event else {
+        panic!("process.output carries a ProcessOutput");
+    };
+    assert!(
+        p.text.len() < 32 * 1024,
+        "200 KB of stderr became {} bytes in the log",
+        p.text.len()
+    );
+    assert!(
+        p.text.contains("earlier stderr lines dropped"),
+        "a tail presented as the whole channel is a lie: {:?}",
+        &p.text[..p.text.len().min(120)]
+    );
+    assert!(
+        !p.text.contains("line 1\n"),
+        "the head is what a tail drops"
+    );
+    assert!(
+        p.text.contains("line 500"),
+        "and the last thing said before the exit is what it keeps"
+    );
+    assert!(
+        p.text.trim_end().ends_with('…'),
+        "the 200 KB line is clipped, and says so"
+    );
 }
